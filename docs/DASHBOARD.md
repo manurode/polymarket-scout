@@ -7,7 +7,7 @@ Arquitectura Visual y Flujo de Usuario
 Documento de Diseño UI/UX  
 Autor: Arquitecto de Frontend Senior — Plataformas de Trading Institucional HFT  
 Fecha: Mayo 2026  
-Versión: 1.0-draft  
+Versión: 1.1 — Incluye: Cirugía por Mercado (§4.3.3, §5.3.1), DOM Chart (§4.3.2), Wallet Monitor On-Chain (§2.3.7), Sound Design (§6.4)  
 Stack propuesto: React 19 + TypeScript + D3.js/Canvas + WebSockets (SSE) + Tailwind CSS
 
 ---
@@ -27,6 +27,7 @@ Reglas de oro:
 - Tipografía monoespaciada para números: JetBrains Mono o Fira Code. Los traders leen tablas numéricas — la alineación importa. Las fuentes proporcionales destruyen la scanability vertical.
 - Motion reservado para alertas: La animación continua cansa y distrae. Solo animar transiciones de alerta (pulso rojo en emergencias, fade-in de nuevas filas).
 - Latencia visible: Los números de latencia se muestran en ms con 1 decimal. Son ciudadanos de primera clase, no letra pequeña.
+- Sonido = información, no decoración: El dashboard habla. Cada evento tiene su firma acústica (click metálico = fill, campana = profit, sirena = peligro). El oído es más rápido que el ojo y funciona sin mirar la pantalla. Las alertas críticas suenan aunque el audio esté en mute (ver §6.4).
 
 0.2 Jerarquía de Atención (Heat Map de la Mirada)
 
@@ -45,6 +46,8 @@ Alertas de emergencia
 • Categoría: Alertas de emergencia
 
 • Método: Push (Toast + sonido + Telegram)
+
+• Sonido: Sirena/Sonar (500ms, 300→1200Hz). Crítico.
 
 • Justificación: RECONCILING, FROZEN, Toxicidad > 1.5, Kill Switch activado. No pueden esperar ni 1 segundo.
 
@@ -97,14 +100,14 @@ Backtest e histórico
 │                                                                           │
 ├──────────────────────────────────────────────────────────────────────────┤
 │ BARRA DE ESTADO INFERIOR (sticky)                                          │
-│ 📡 WS: 50/50 CLEAN | ⚡ RL: recon 70% avail | 🧠 MAB epoch 3/6h | 🐋 12α │
+│ 📡 WS: 50/50 CLEAN | ⚡ RL: recon 70% | 🧠 MAB 3/6h | 🐋 12α | 💰 $1,247 | ⛽ 4.2 POL │
 └──────────────────────────────────────────────────────────────────────────┘
 
 
 Notas de navegación:
 - Las 5 pestañas superiores son la navegación primaria. El badge numérico en rojo (⬤) indica alertas activas en esa pestaña.
 - El Kill Switch en la toolbar es un botón físico. Un clic = pausa total de trading en todos los mercados. Confirmación requerida. Se muestra en rojo pulsante cuando está activo.
-- La barra de estado inferior es omnipresente — visible en todas las pestañas. Contiene los 4 indicadores más vitales del sistema destilados en una línea.
+- La barra de estado inferior es omnipresente — visible en todas las pestañas. Contiene los 6 indicadores más vitales del sistema destilados en una línea: WebSocket health, Rate-Limit, Bandit epoch, Alpha Whales activas, **USDC libre** (💰), y **Gas POL** (⛽). El indicador de POL parpadea en rojo si el balance baja de 2 POL (el bot se paralizaría sin gas para transacciones).
 - El modo (LIVE PAPER / BACKTEST / DRY RUN) se muestra en la toolbar con un indicador de color: verde = live paper, azul = backtest, gris = dry run.
 
 ---
@@ -166,6 +169,21 @@ Monitorizar la integridad operativa del sistema. Este panel responde a la pregun
 │  │ Allowed: MM, ARB, CORR, MOM │  │                                   │  │
 │  │ Price source: CLOB L2       │  │ Last Global Snapshot: 2.1s ago    │  │
 │  └──────────────────────────────┘  └──────────────────────────────────┘  │
+│                                                                           │
+│  ┌─────────────────────────────────────────────────────────────────────┐ │
+│  │ W A L L E T   M O N I T O R   (Realidad On-Chain — Polygon)        │ │
+│  │                                                                     │ │
+│  │  ┌───────────────────┐  ┌──────────────────┐  ┌─────────────────┐  │ │
+│  │  │ USDC              │  │ POL (Gas Token)  │  │ Allowance CTF   │  │ │
+│  │  │                   │  │                  │  │                 │  │ │
+│  │  │ Libre:  $1,247.50 │  │ Balance: 4.2 POL │  │ ✅ APROBADO     │  │ │
+│  │  │ En Col:   $892.30 │  │ USD:      $3.44  │  │    ilimitado    │  │ │
+│  │  │ Total:  $2,139.80 │  │                   │  │                 │  │ │
+│  │  │                   │  │ ⚠ MIN OPERATIVO: │  │ Contrato:       │  │ │
+│  │  │ ████████████░░░░  │  │    2.0 POL       │  │ CTFExchange     │  │ │
+│  │  │  58% libre         │  │ ██████████████░░ │  │ 0x4D97DC...     │  │ │
+│  │  └───────────────────┘  └──────────────────┘  └─────────────────┘  │ │
+│  └─────────────────────────────────────────────────────────────────────┘ │
 │                                                                           │
 ├──────────────────────────────────────────────────────────────────────────┤
 │  L A T E N C Y   B U D G E T   (Critical Path)                           │
@@ -356,6 +374,45 @@ TOTAL           █████████████████░░░  14
 
 Las barras se colorean según el % de budget consumido: verde < 50%, ámbar 50-80%, rojo > 80%.
 
+2.3.7 Wallet Monitor — Realidad On-Chain (Panel inferior, ancho completo)
+
+Visualización: Tres tarjetas horizontales mostrando el estado real de los tokens en Polygon. Este widget cierra la brecha entre el "equity virtual" del paper trading y la realidad de la wallet que ejecutará las transacciones.
+
+**USDC Balance (tarjeta izquierda):**
+- **Libre:** USDC disponible para trading (no bloqueado en colateral). Número grande en blanco.
+- **En Colateral:** USDC inmovilizado como colateral en el contrato CTF. Número en gris.
+- **Total:** Suma de ambos. Número en blanco con formato "$X,XXX.XX".
+- **Barra de ratio:** Barra de progreso mostrando el % de USDC libre vs total. Verde si > 50% libre, ámbar si 20-50%, rojo si < 20% (capital excesivamente inmovilizado — posible fuga de liquidez).
+
+Fuente: `GET /api/wallet/usdc` (consulta on-chain vía RPC de Polygon — balance del ERC-20 USDC + balance de colateral en CTF). Actualización: cada 30 segundos (polling ligero, no consume rate-limit del CLOB).
+
+**POL Gas Token (tarjeta central):**
+- **Balance:** Cantidad de POL (token nativo de Polygon). Número grande.
+- **Equivalente USD:** Valor en dólares al precio actual de POL.
+- **Indicador de nivel:** Barra de progreso coloreada:
+  - Verde: > 10 POL (gas abundante — cientos de transacciones posibles)
+  - Ámbar: 2-10 POL (operativo pero vigilar)
+  - **Rojo pulsante: < 2 POL** (CRÍTICO — el bot no podrá ejecutar transacciones. Se requieren ~0.01-0.05 POL por tx taker. Con < 2 POL, el colchón es inferior a 40 transacciones.)
+- **Línea de referencia:** Una línea vertical roja etiquetada "MIN OPERATIVO" en 2.0 POL.
+
+Fuente: `GET /api/wallet/pol` (RPC `eth_getBalance` de Polygon). Actualización: cada 30 segundos.
+
+**Alerta push CRÍTICA cuando:** Balance de POL < 2.0 (Toast rojo + sonido de sirena + Telegram). El mensaje: "⛽ CRÍTICO: Solo quedan X.X POL. El bot se paralizará sin gas. Recarga la wallet."
+
+**CTF Allowance (tarjeta derecha):**
+- **Estado:** ✅ APROBADO (verde) o ❌ REVOCADO (rojo pulsante) o ⚠ PARCIAL (ámbar).
+- **Tipo:** "ilimitado" (aprobado para uint256.max) o monto específico.
+- **Contrato:** Dirección del CTFExchange verificada.
+- **Última verificación:** Timestamp de cuándo se comprobó el allowance on-chain.
+
+Fuente: `GET /api/wallet/allowance` (RPC `ctf_exchange.allowance(owner, spender)`). Actualización: cada 5 minutos (o al detectar una transacción de `approve`/`revoke` en los logs).
+
+**Alerta push CRÍTICA cuando:** El allowance es revocado o cae por debajo del tamaño de posición máximo configurado. El bot no podrá ejecutar órdenes taker. Toast rojo: "❌ CTF Allowance REVOCADO. Trading taker IMPOSIBLE. Ejecuta approve()."
+
+**Principio de diseño:** Este widget es el "ancla de realidad" del dashboard. El equity virtual puede mostrar $50,000 de poder de trading, pero si la wallet tiene $200 USDC libre y 0.3 POL, el bot está esencialmente paralizado. El Wallet Monitor expone esta verdad sin filtrar.
+
+**Interacción:** Click en cualquier tarjeta → abre un panel lateral con el historial de transacciones on-chain de la wallet (últimos 30 días), incluyendo depósitos, retiradas, approves, y ejecuciones de trades.
+
 ---
 
 3. Panel 2 — Arena del Portfolio Manager
@@ -539,21 +596,27 @@ Detectar manipulación de mercado y seguir el dinero inteligente. Responde a las
 │  └───────────────────────┘  │  │                                     │    │
 │                              │  │ Action: Ignorar OBI. Size × 0.50   │    │
 │                              │  │ Authoritative Dir: TFI → ▲ BUY     │    │
+│                              │  │                                     │    │
+│                              │  │ ─── CONTROLES QUIRÚRGICOS ───     │    │
+│                              │  │ [HALT TRADING]  [FORCE CLOSE]      │    │
 │                              │  └───────────────────────────────────┘    │
 │                              │                                           │
-│  OBI vs TFI   G A U G E     │  S P O O F   H I S T O R Y  (2h)         │
-│  (mercado seleccionado)     │                                           │
-│  ┌───────────────────────┐  │  ┌───────────────────────────────────┐    │
-│  │   OBI = -0.62         │  │  │ 0.8┤                    ╭─╮       │    │
-│  │   ◀══════════●───────▶│  │  │ 0.6┤    ╭╮  ╭─╮    ╭──╯ ╰╮      │    │
-│  │         -1  0  +1     │  │  │ 0.4┤  ╭─╯╰──╯ ╰────╯     ╰──╮  │    │
-│  │                        │  │  │ 0.2┤──╯                      ╰──│    │
-│  │   TFI = -0.15          │  │  │  0 ┤───────────────────────────│    │
-│  │   ◀════●══════════▶   │  │  │     └───────────────────────────┘    │
-│  │         -1  0  +1     │  │  │      -120m              now           │
-│  │                        │  │  │                                     │
-│  │   DIVERGENCE = 0.47    │  │  │  Stops: 0.3 ── 0.5 ── 0.7          │
-│  │   ⚠ PROBABLE SPOOFING │  │  └───────────────────────────────────┘    │
+│  D E P T H   O F   M A R K  │  S P O O F   H I S T O R Y  (2h)         │
+│  (DOM Cumulativo Bimodal)   │                                           │
+│                              │  ┌───────────────────────────────────┐    │
+│  ┌───────────────────────┐  │  │ 0.8┤                    ╭─╮       │    │
+│  │       BIDS │ ASKS     │  │  │ 0.6┤    ╭╮  ╭─╮    ╭──╯ ╰╮      │    │
+│  │    ████    │    ██    │  │  │ 0.4┤  ╭─╯╰──╯ ╰────╯     ╰──╮  │    │
+│  │   ██████   │   ███    │  │  │ 0.2┤──╯                      ╰──│    │
+│  │  ████████  │  ████    │  │  │  0 ┤───────────────────────────│    │
+│  │ ██████████ │ █████    │  │  │     └───────────────────────────┘    │
+│  │████████████│██████    │  │  │      -120m              now           │
+│  │            │           │  │  │                                     │
+│  │  ▓▓ MURO   │   SPOOF   │  │  │  Stops: 0.3 ── 0.5 ── 0.7          │
+│  │  fantasma  │   real?   │  │  └───────────────────────────────────┘    │
+│  │            │           │  │                                           │
+│  │ OBI:-0.62  │TFI:-0.15  │  │                                           │
+│  │ DIV:0.47 ⚠ │           │  │                                           │
 │  └───────────────────────┘  │                                           │
 │                              │                                           │
 ├──────────────────────────────┴───────────────────────────────────────────┤
@@ -606,10 +669,47 @@ Interacción: Hover sobre una celda → tooltip con OBI, TFI, D_raw, cancel_rate
 
 Valor operativo: Un trader experimentado puede detectar patrones: ¿un mercado tiene spoofing recurrente cada hora en punto? ¿Coincide con horarios de baja liquidez?
 
-4.3.2 OBI vs TFI Gauge (Panel central superior)
-Visualización: Dos gauges horizontales enfrentados + un número de divergencia grande.
+4.3.2 DOM — Depth of Market Chart (Panel central izquierdo)
 
-El gauge de OBI y TFI usan un diseño de "termómetro bipolar":
+Visualización: Gráfico de Profundidad de Mercado (DOM) cumulativo bimodal generado a partir del L2 order book en tiempo real vía WebSocket. Es el instrumento visual definitivo para confirmar spoofing: el trader ve físicamente el "muro fantasma" de órdenes pasivas aparecer y desaparecer.
+
+**Estructura del gráfico:**
+- **Eje X:** Precios (centrado en el mid-price). Los precios de BID crecen hacia la izquierda. Los precios de ASK crecen hacia la derecha.
+- **Eje Y:** Volumen cumulativo en USD (cantidad de tokens × precio). Escala logarítmica opcional.
+- **Lado izquierdo (verde):** Montaña de BIDs — volumen cumulativo de órdenes de compra en cada nivel de precio. Cuanto más se extiende hacia la izquierda, más profundidad de compra existe.
+- **Lado derecho (rojo):** Montaña de ASKs — volumen cumulativo de órdenes de venta en cada nivel de precio. Cuanto más se extiende hacia la derecha, más profundidad de venta existe.
+
+**Lectura visual del spoofing:**
+- **Libro normal:** Las montañas son simétricas o ligeramente asimétricas, con volumen distribuido gradualmente en múltiples niveles. La forma es estable segundo a segundo.
+- **Spoofing detectado:** Una de las montañas desarrolla un "muro vertical" — una acumulación masiva de volumen en UN solo nivel de precio (o 2-3 niveles contiguos), desconectada del resto de la curva. Este muro:
+  1. Aparece repentinamente (el spoofer coloca la orden grande).
+  2. Permanece estático durante segundos (creando la ilusión de soporte/resistencia).
+  3. Desaparece instantáneamente (el spoofer cancela antes de que se ejecute).
+- El DOM chart expone este ciclo visualmente: el muro fantasma "parpadea". Una banda de texto superpuesta marca "MURO FANTASMA DETECTADO" cuando el SpoofDetector confirma S ≥ 0.5.
+
+**Elementos visuales adicionales:**
+- **Mid-price:** Una línea vertical blanca discontinua en el centro del gráfico.
+- **Best Bid/Ask:** Marcadores horizontales en el nivel más alto de BID y más bajo de ASK.
+- **Órdenes propias:** Si el bot tiene órdenes límite abiertas en este mercado, se muestran como pequeñas banderas (🟢 para bid propia, 🔴 para ask propia) en el nivel de precio correspondiente.
+- **OBI numérico:** Valor de OBI actual en la esquina superior (el imbalance que el DOM hace visible).
+- **TFI numérico:** Valor de TFI en la esquina inferior derecha (el contraste con OBI).
+- **Divergencia:** Número grande centrado debajo del gráfico con clasificación textual.
+
+**Interactividad:**
+- Hover sobre un nivel de precio → tooltip con: precio exacto, volumen en USD, número de órdenes individuales, % del volumen total del lado.
+- Scroll + Ctrl = zoom en el eje Y (para examinar niveles profundos del libro).
+- Doble click en el mid-price → resetea el zoom.
+
+**Actualización:** Cada delta del WebSocket CLOB regenera el DOM chart (via Canvas para rendimiento). Latencia target: < 16ms (un frame a 60fps).
+
+**Valor táctico:** Este gráfico convierte al trader en un "cazador de spoofers". En lugar de confiar ciegamente en el Spoof Score numérico, el trader VE el ataque. Un muro de $50K en BIDs que desaparece en el siguiente tick es inconfundible. Esto permite una respuesta más rápida y segura que leer números.
+
+**Reemplaza al anterior OBI/TFI Gauge:** El DOM chart contiene el OBI y TFI como anotaciones numéricas, pero añade la dimensión visual de la profundidad. El antiguo gauge bipolar se elimina — era redundante con la información ya presente en el DOM y en el Spoof Detail.
+
+4.3.3 OBI vs TFI — Referencia Numérica
+
+Los valores de OBI y TFI se muestran ahora como anotaciones compactas dentro del DOM chart y en el panel Spoof Detail. No requieren un widget independiente. La barra de referencia es:
+
 OBI  ◀══════════════●─────────▶  +0.62
      -1              0        +1
  (9/16)
@@ -619,9 +719,11 @@ El número de DIVERGENCE es grande y central — es el foco visual del panel. Se
 
 Pulsación: Si S ≥ 0.7, el número de divergencia pulsa (opacidad alterna 100% ↔ 60% cada 1s) para llamar la atención del trader.
 
-4.3.3 Spoof Detail (Panel superior derecho)
-Visualización: Panel de texto estructurado con métricas y acciones recomendadas.
+4.3.3 Spoof Detail + Controles Quirúrgicos (Panel superior derecho)
 
+Visualización: Panel de información detallada con métricas, acciones recomendadas, y **botones de acción directa de un solo clic**.
+
+**Sección superior — Métricas:**
 - Market name (grande, arriba)
 - OBI y TFI como barras de progreso horizontales (verde/rojo)
 - Divergencia como número grande
@@ -629,6 +731,30 @@ Visualización: Panel de texto estructurado con métricas y acciones recomendada
 - Cancel Rate anómalo (si > 2x la media, se muestra con ⚠)
 - Acción recomendada por el sistema: "Ignorar OBI. Usar solo TFI para señales. Size × 0.50." en un recuadro con fondo coloreado.
 - Dirección autoritativa: una flecha grande ▲ BUY o ▼ SELL basada en TFI (la señal "real").
+
+**Sección inferior — Controles Quirúrgicos (NUEVO):**
+
+Dos botones de acción directa que permiten al trader intervenir quirúrgicamente en UN mercado específico sin afectar al resto del sistema. Estos botones NO activan el Kill Switch global — son instrumentos de precisión.
+
+**[HALT TRADING]** — Botón ámbar con icono ⏸:
+
+- **Qué hace:** Pausa la apertura de NUEVAS posiciones en este mercado específico. Las posiciones ya abiertas se mantienen (no se liquidan). El sistema sigue monitoreando el mercado (WebSocket, OBI, TFI, Spoof Score) pero no ejecutará nuevas órdenes de entrada.
+- **Cuándo usarlo:** Spoof Score entre 0.3 y 0.7 (sospechoso/probable) — el trader quiere esperar a ver si el spoofing se disipa. También cuando una whale entra pero la dirección no está clara.
+- **Indicador visual:** El mercado aparece en la Open Positions Table con un indicador ⏸ y fondo ámbar. El título del mercado en el DOM chart muestra "[PAUSADO]" en ámbar.
+- **Confirmación:** Diálogo modal rápido con texto: "¿Pausar trading en [mercado]? Las posiciones existentes se mantienen. Podrás reactivar manualmente." Botones: [CONFIRMAR HALT] / [CANCELAR].
+- **Duración:** Persiste hasta que el trader lo reactiva manualmente con el botón [RESUME TRADING] que aparece en el mismo lugar cuando el mercado está pausado. No tiene timeout automático — es una decisión humana consciente.
+
+**[FORCE CLOSE]** — Botón rojo con icono ⚡:
+
+- **Qué hace:** Cierra TODAS las posiciones abiertas en este mercado inmediatamente, ejecutando órdenes taker a mercado. Acepta slippage (configurable, default: hasta 2% del spread). Las órdenes límite pasivas del Market Maker en este mercado se cancelan simultáneamente. Después del cierre, el mercado queda en estado HALT (no se abrirán nuevas posiciones).
+- **Cuándo usarlo:** Spoof Score ≥ 0.7 (manipulación confirmada), Markout Toxicity > 1.5 (flujo altamente tóxico), τ > 95% (liquidación forzosa inminente), o cuando el trader detecta visualmente un ataque en el DOM chart.
+- **Indicador visual:** Durante la ejecución (típicamente < 2 segundos), el botón muestra un spinner "CERRANDO...". Al completar, un toast confirma: "✅ Posición cerrada: $XX.XX P&L realizado" o "❌ Cierre parcial: $XX.XX ejecutado, $YY.YY pendiente".
+- **Confirmación:** Diálogo modal con DOBLE confirmación de seguridad:
+  1. Primer diálogo: "⚠ FORCE CLOSE en [mercado]. Se cerrarán X posiciones (total: $XXX.XX). Slippage estimado: $X.XX. ¿Continuar?" Botones: [PROCEDER] / [CANCELAR].
+  2. Si el slippage estimado > 1% del valor de la posición: Segundo diálogo de advertencia reforzada con fondo rojo: "⚠ SLIPPAGE ALTO: El coste estimado de cierre es $XX.XX (X.X% del valor). ¿Forzar igualmente?" Botones: [FORZAR CIERRE (acepto slippage)] / [CANCELAR].
+- **Post-cierre:** El mercado se marca con indicador ⏸ HALT (no se reabrirá automáticamente). El trader debe usar [RESUME TRADING] para reactivarlo si lo desea.
+
+**Principio de diseño:** Estos botones son la "interfaz de último recurso" para situaciones que el sistema automatizado no puede resolver. El bot confía en las señales automatizadas el 95% del tiempo, pero el 5% restante (manipulación coordinada, eventos noticiosos no descontados, fallos de infraestructura) requiere juicio humano. Los controles quirúrgicos dan ese poder sin obligar a usar el Kill Switch global.
 
 4.3.4 Spoof History (Panel inferior derecho)
 Visualización: Gráfico de líneas temporal mostrando la evolución del Spoof Score en las últimas 2 horas.
@@ -766,8 +892,9 @@ Monitorizar posiciones abiertas, riesgo de time-decay, toxicidad de flujo, y cos
 
 5.3 Desglose de Widgets
 
-5.3.1 Open Positions Table (Panel izquierdo)
-Visualización: Tabla compacta de posiciones abiertas.
+5.3.1 Open Positions Table + Acciones Rápidas (Panel izquierdo)
+
+Visualización: Tabla compacta de posiciones abiertas con **controles de acción integrados por fila**. Cada fila es a la vez informativa y operable.
 
 Columnas:
 - # — prioridad (ordenado por riesgo: más cerca de liquidación primero)
@@ -781,6 +908,26 @@ Columnas:
 - τ% — porcentaje de vida del mercado consumida (barra de progreso miniatura)
 - Tox — Markout Toxicity actual (número pequeño, coloreado: verde < 0.3, amarillo 0.3-0.7, rojo > 0.7)
 - Liq — indicador de zona de liquidación (⚠ si τ > 85%, 🔴 si τ > 95%)
+- **⚡ Acción** — columna de acción rápida (NUEVO)
+
+**Columna de Acción Rápida (⚡):**
+
+Cada fila de posición tiene un botón de acción contextual que aparece al hacer hover sobre la fila (para mantener la tabla limpia cuando no se necesita). El botón mostrado depende del estado de la posición:
+
+- **Posición normal (τ < 85%, Tox < 0.7):** Botón pequeño [FC] (Force Close) en gris tenue. Solo visible en hover. Tooltip: "Forzar cierre de esta posición".
+- **Posición en zona de riesgo (τ > 85% o Tox > 0.7):** Botón [FC] en rojo, siempre visible (sin esperar hover). Atrae la atención del trader.
+- **Posición en liquidación forzosa (τ > 95%):** El botón [FC] pulsa en rojo intenso. El texto alterna entre "FC" y "¡YA!" cada 800ms.
+
+Al hacer clic en [FC]:
+1. Se despliega un tooltip de confirmación INLINE (no modal) justo debajo de la fila: "¿Cerrar $XX.XX en [market]? Slippage est. $X.XX | [CONFIRMAR] [CANCELAR]"
+2. Si confirma: la fila se atenúa, muestra un spinner "CERRANDO...", y al completar desaparece con un fade-out de 300ms. Un toast confirma el cierre.
+3. Si cancela: el tooltip desaparece. Sin cambios.
+
+**Atajo de teclado:** Pulsar la tecla 'F' mientras se hace hover sobre una fila = clic directo en [FC] (salta la confirmación si la posición es < $50). Para posiciones > $50, 'F' abre el tooltip de confirmación.
+
+**Doble confirmación de seguridad para posiciones grandes:**
+- Posiciones > $200: Requiere confirmación explícita con clic. La tecla 'F' solo abre el diálogo.
+- Posiciones > $500: Diálogo de doble confirmación con advertencia de slippage (misma lógica que en Spoof Detail §4.3.3).
 
 Codificación de filas:
 - Fondo normal = posición normal
@@ -788,8 +935,9 @@ Codificación de filas:
 - Fondo naranja = τ > 85% (liquidación inminente)
 - Fondo rojo pulsante = τ > 95% (liquidación forzosa en curso)
 - Borde izquierdo coloreado según P&L (verde = ganancia, rojo = pérdida)
+- **Fondo con rayas diagonales tenues** = mercado en estado HALT (no se abrirán nuevas posiciones)
 
-Interacción: Click en una fila → detalle en el panel derecho.
+Interacción: Click en una fila → detalle en el panel derecho. Click en [FC] → acción directa de cierre.
 
 5.3.2 Position Detail Panel (Panel derecho, superior)
 Visualización: Panel de información detallada de la posición seleccionada.
@@ -888,6 +1036,8 @@ CAPA 3: PUSH EXTERNO (Telegram, email, webhook)
 • Color: Rojo pulsante
 
 • Canal: Toast + Alert Strip + Push
+
+• Sonido: Sirena/Sonar — barrido ascendente 300→1200Hz
  (13/16)
 [5/7/2026 8:27 PM] Hermes: • Ejemplos: RECONCILING > 60s, Spoof Score > 0.7, τ > 95%, Kill Switch activado, Markout > 1.5
 
@@ -899,6 +1049,8 @@ CAPA 3: PUSH EXTERNO (Telegram, email, webhook)
 
 • Canal: Toast + Alert Strip
 
+• Sonido: Alarma pulsante (3 pulsos, 600Hz) — se repite cada 30s hasta ACK
+
 • Ejemplos: Estrategia FROZEN tras 3 épocas negativas, Redis caído, Polygon RPC caído, Cluster Alpha detectado
 
 🟡 WARNING****
@@ -908,6 +1060,8 @@ CAPA 3: PUSH EXTERNO (Telegram, email, webhook)
 • Color: Ámbar
 
 • Canal: Toast
+
+• Sonido: Doble tono seco (80ms×2, 400Hz) si involucra pérdida; silencio si es informativo
 
 • Ejemplos: Rate-limit bucket < 10%, τ > 85%, Whale entra en mercado Top 50, Correlación portfolio > 0.7
 
@@ -947,6 +1101,69 @@ POLL (datos que se consultan bajo demanda o cada época):
 - Sortino histórico (cada época)
 - Backtest results (on-demand)
 - Correlation graph completo (cada 6h)
+
+---
+
+6.4 Arquitectura Acústica — Sound Design para HFT
+
+En trading de alta frecuencia, la pantalla a veces pasa a segundo plano. El trader puede estar analizando otro monitor, leyendo una noticia, o simplemente necesita apartar la vista. El oído toma el mando. Un sistema de sonido bien diseñado transmite más información en 200ms que cualquier gráfico.
+
+**Principio rector:** El sonido en un dashboard HFT no es decoración ni "UX delight". Es un canal de información paralelo de misión crítica. Cada sonido debe ser inmediatamente reconocible, distinto de los demás, y portador de significado sin ambigüedad.
+
+6.4.1 Paleta de Sonidos
+
+La paleta se organiza en 4 categorías por prioridad acústica. Los sonidos de mayor severidad interrumpen a los de menor (no se superponen — el más grave silencia al más leve).
+
+| Categoría | Sonido | Trigger | Prioridad |
+|-----------|--------|---------|-----------|
+| **Silencio** | — | Operación normal, sin eventos | Base |
+| **Click metálico** | Tick metálico corto (50ms, 800Hz) | Orden límite ejecutada (spread cobrado). Una orden pasiva del Market Maker ha sido llenada. | Baja |
+| **Campana** | Ding agudo (200ms, 1200Hz, decay rápido) | Posición cerrada en PROFIT. P&L realizado positivo. El tono es más agudo cuanto mayor es el % de ganancia. | Media |
+| **Doble tono seco** | Dos golpes secos (80ms c/u, 400Hz, separados 120ms) | Posición cerrada en LOSS. P&L realizado negativo. El volumen es mayor cuanto mayor es la pérdida. | Media-Alta |
+| **Alarma pulsante** | Pulso repetitivo (3 pulsos, 200ms c/u, 600Hz) | τ > 85% (liquidación inminente), Markout Toxicity > 1.5, Whale entra con > $10K en mercado monitoreado. Se repite cada 30s hasta que el trader hace ACK. | Alta |
+| **Sirena / Sonar** | Barrido de frecuencia ascendente (500ms, 300→1200Hz) repetido 2 veces | RECONCILING (cualquier mercado entra en este estado — el trading se pausa instantáneamente), Spoof Score ≥ 0.7 (manipulación confirmada), Kill Switch global activado. | **Crítica** |
+| **Alerta POL** | Triple pulso grave (100ms, 200Hz, 3 repeticiones) | Balance de POL < 2.0 (el bot se paralizará sin gas). Sonido único y distintivo — inconfundible con eventos de trading. | **Crítica** |
+
+6.4.2 Comportamiento Acústico
+
+**Momento de ejecución vs. cierre:**
+- **Ejecución:** El click metálico suena instantáneamente al recibir la confirmación de fill vía WebSocket. Latencia: < 100ms desde el evento on-chain. Es el sonido más frecuente en operación normal — un Market Maker activo puede generar docenas por minuto. Por eso es corto (50ms) y no intrusivo.
+- **Cierre en profit:** La campana suena al confirmarse el cierre de la posición. El trader asocia este sonido con "dinero ganado". Con el tiempo, desarrolla una respuesta pavloviana positiva.
+- **Cierre en loss:** El doble tono seco es deliberadamente desagradable — corto, grave, sin resonancia. El trader debe SENTIR la pérdida, no solo verla. Esto refuerza la disciplina de riesgo.
+
+**Sonidos informativos (frecuencia base):**
+- Click metálico y campana: se reproducen siempre (no hay rate-limiting). Son sonidos positivos o neutros que el trader quiere escuchar — indican que el bot está trabajando.
+- Doble tono seco: rate-limited a 1 cada 5 segundos. Si hay una cascada de pérdidas, el sonido se emite una vez y las subsiguientes pérdidas se acumulan silenciosamente hasta que pasen 5s. Esto evita la "fatiga de alarma" en una racha perdedora.
+
+**Sonidos de alerta (umbrales y repetición):**
+- Alarma pulsante: Se emite al cruzar el umbral. Se repite cada 30 segundos hasta que el trader hace clic en [ACK] en la alerta correspondiente del Alert Strip. Si el trader no hace ACK en 5 minutos, la alarma escala a Sirena (prioridad Crítica).
+- Sirena/Sonar: Se emite inmediatamente. Se repite cada 15 segundos hasta ACK. Si no hay ACK en 2 minutos, se envía push a Telegram. La sirena NO se puede silenciar globalmente — solo se desactiva haciendo ACK a la alerta específica que la disparó.
+- Alerta POL: Misma lógica que Sirena. Prioridad Crítica porque sin gas el bot muere.
+
+6.4.3 Integración con la UI Visual
+
+**Sincronización audio-visual:**
+- Cuando suena la Sirena por RECONCILING, el mercado afectado en la Reconciliation Matrix (§2.3.3) parpadea en rojo sincronizado con el barrido de frecuencia. El ojo y el oído reciben la misma señal de urgencia.
+- Cuando suena la Alerta POL, el indicador ⛽ en la barra de estado inferior pulsa en rojo al ritmo de los pulsos graves (100ms).
+- El doble tono seco de pérdida coincide con un breve flash rojo de 200ms en el P&L de la posición cerrada.
+
+**Control de volumen y mute:**
+- El dashboard incluye un control de volumen en la toolbar superior (icono 🔈). Tiene 4 niveles: MUTE / BAJO / MEDIO / ALTO.
+- **MUTE NO silencia las alertas Críticas.** Es una decisión de diseño deliberada: el trader puede silenciar clicks y campanas para concentrarse, pero las sirenas y alertas POL siempre suenan. Esto se indica en el tooltip del control: "Mute no aplica a alertas críticas (Sirena, POL)."
+- Las alertas Críticas tienen su propio mute independiente accesible solo desde Config → Audio → "Silenciar alertas críticas (NO RECOMENDADO)". Este toggle requiere confirmación por escrito: el usuario debe teclear "ENTIENDO LOS RIESGOS".
+
+**Audio espacial (opcional, multi-monitor):**
+- Si el trader usa 2+ monitores, el dashboard puede asignar canales de audio izquierdo/derecho:
+  - Canal izquierdo: sonidos de trading (click, campana, doble tono) — el "lado del dinero".
+  - Canal derecho: alertas de sistema (alarma, sirena) — el "lado de la infraestructura".
+- Esto permite al trader identificar la naturaleza del evento sin mirar la pantalla.
+
+6.4.4 Implementación Técnica
+
+- **API:** Web Audio API del navegador. Sonidos generados sintéticamente (no archivos .mp3/.wav) para latencia cero y personalización dinámica de frecuencia/duración.
+- **Generación de tonos:** Oscilador sinusoidal con envolvente ADSR (Attack-Decay-Sustain-Release) para cada sonido. El click metálico usa ataque 2ms + decaimiento exponencial rápido (30ms) para simular un impacto metálico. La campana usa ataque 1ms + decaimiento con resonancia (Q=5) para el timbre característico.
+- **Latencia:** < 10ms desde el evento Redis → oscilador activo. El sonido se dispara en el mismo frame de JavaScript que procesa el mensaje SSE.
+- **Persistencia:** Los parámetros de sonido (frecuencias, duraciones, niveles de mute) se guardan en localStorage. El trader puede personalizar los tonos desde Config → Audio → "Personalizar paleta de sonidos".
 
 ---
 
@@ -1103,11 +1320,13 @@ Endpoints REST (polling):
 
 • Panel: System Health
 
-• Propósito: ¿Puedo confiar en los datos?
+• Propósito: ¿Puedo confiar en los datos? ¿La wallet tiene gas?
 
-• Widgets Clave: Heartbeats, Rate-Limit gauges, Reconciliation Matrix, Latency Budget
+• Widgets Clave: Heartbeats, Rate-Limit gauges, Reconciliation Matrix, Latency Budget, **Wallet Monitor (USDC + POL + Allowance)**
 
-• Push Alerts: RECONCILING > 60s, Degradación FULL→MINIMAL, Rate-limit < 10%
+• Push Alerts: RECONCILING > 60s, Degradación FULL→MINIMAL, Rate-limit < 10%, **POL < 2.0 (Crítico)**, **Allowance revocado**
+
+• Sonidos: Sirena (RECONCILING prolongado), Alerta POL (gas bajo)
 
 **Portfolio Arena**
 
@@ -1119,25 +1338,31 @@ Endpoints REST (polling):
 
 • Push Alerts: Estrategia FROZEN/RETIRED, Correlación portfolio > 0.7
 
+• Sonidos: Campana (cierre de época con profit), Doble tono (cierre con pérdida)
+
 **Oracle Radar**
 
 • Panel: Oracle Radar
 
 • Propósito: ¿Hay manipulación? ¿Qué hacen las whales?
 
-• Widgets Clave: Spoofing Heatmap, OBI/TFI Gauge, Whales Table, Wallet Clusters
+• Widgets Clave: Spoofing Heatmap, **DOM Chart (Depth of Market)**, Spoof Detail + **[HALT TRADING] [FORCE CLOSE]**, Whales Table, Wallet Clusters
 
-• Push Alerts: Spoof Confirmado (S > 0.7), Alpha Whale entra mercado Top 50, Cluster Alpha detectado
+• Push Alerts: Spoof Confirmado (S > 0.7 → Sirena), Alpha Whale entra mercado Top 50, Cluster Alpha detectado
+
+• Sonidos: Sirena (Spoof ≥ 0.7), Click metálico (orden ejecutada en mercado monitoreado)
 
 **Risk Monitor**
 
 • Panel: Risk Monitor
 
-• Propósito: ¿Cuánto riesgo tengo?
+• Propósito: ¿Cuánto riesgo tengo? ¿Qué posiciones debo cerrar YA?
 
-• Widgets Clave: Open Positions Table, Time-Decay Calendar, Markout Matrix, Correlation Heatmap
+• Widgets Clave: Open Positions Table + **[FORCE CLOSE] por fila**, Time-Decay Calendar, Markout Matrix, Correlation Heatmap
 
 • Push Alerts: τ > 85%/95%, Markout > 1.5, Correlación > 0.8 entre posiciones
+
+• Sonidos: Alarma pulsante (τ > 85%), Sirena (τ > 95% o Tox > 1.5), Campana/Doble tono (cierre manual de posición)
 
 ---
 
@@ -1148,8 +1373,26 @@ Endpoints REST (polling):
 3. Implementar el servidor FastAPI bridge que conecta Redis → SSE para el dashboard. (15/16)
 4. Construir el dashboard React panel por panel, empezando por System Health (el más crítico) y Risk Monitor (el más valioso para el trader).
 5. Integrar alertas push (Telegram) con el sistema de notificaciones del dashboard.
+6. Implementar la paleta de sonidos con Web Audio API (síntesis, no archivos) según §6.4.
+7. Desarrollar el componente DOM Chart en Canvas (< 16ms por frame) con datos del WebSocket CLOB L2.
+8. Construir el Wallet Monitor con lecturas on-chain reales (RPC Polygon) para USDC, POL, y CTF Allowance.
 
 ---
 
-Documento de Arquitectura UI/UX — Scout Lab v2.0 Dashboard  
-Preparado para Manu — Mayo 2026
+---
+
+## Índice de Mejoras Tácticas (v1.1)
+
+Este documento ha sido actualizado con 4 mejoras tácticas para operación en condiciones reales de Polygon:
+
+| # | Mejora | Sección(es) afectada(s) | Impacto |
+|---|--------|------------------------|---------|
+| 1 | **Controles Quirúrgicos** — [FORCE CLOSE] y [HALT TRADING] por mercado | §4.3.3, §5.3.1 | Permite intervención manual de precisión sin usar Kill Switch global |
+| 2 | **DOM Chart** — Gráfico de Profundidad de Mercado bimodal | §4.3.2, Layout §4.2 | Visualiza el "muro fantasma" del spoofing en tiempo real |
+| 3 | **Wallet Monitor** — USDC, POL Gas, CTF Allowance on-chain | §2.3.7, Layout §1, §2.2 | Ancla de realidad: el equity virtual no basta si la wallet no tiene gas |
+| 4 | **Sound Design** — Paleta acústica completa para HFT | §6.4, §0.1, §0.3, §6.2 | El oído toma el mando cuando la vista está ocupada; alertas críticas suenan siempre |
+
+---
+
+*Documento de Arquitectura UI/UX — Scout Lab v2.0 Dashboard*  
+*Preparado para Manu — Mayo 2026*
