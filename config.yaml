@@ -1,0 +1,28 @@
+scanner:
+  events_limit: 25
+  markets_per_event: 10
+  min_volume: 5000
+
+tracker:
+  db_path: "data/polymarket.db"
+  retention_days: 90
+
+signals:
+  momentum:
+    threshold: 0.05
+    window_hours: 1
+  volume_spike:
+    threshold: 3.0
+    window_hours: 24
+  spread:
+    tight_threshold: 0.03
+    wide_threshold: 0.10
+  new_interest:
+    min_volume: 10000
+
+scorer:
+  alert_threshold: 60
+  cooldown_minutes: 30
+
+alerter:
+  platform: "telegram"
