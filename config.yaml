@@ -45,3 +45,15 @@ auto_trader:
     trailing_activate_pct: 0.08 # si llega a +8%, activa trailing stop
     trailing_sl_pct: 0.0        # ...y sube el SL a break-even (0%)
     max_hold_hours: 48           # cierra si tras 48h no se ha movido
+
+selection:
+  top_n: 50
+  weights:
+    volume: 0.40
+    liquidity: 0.30
+    recency: 0.20
+    spread: 0.10
+
+rate_limiter:
+  total_rate: 0.4               # tokens/segundo (~4 req CLOB / 10s)
+  max_burst: 2.0                # capacidad máxima de tokens acumulables

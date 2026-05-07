@@ -31,6 +31,8 @@ class Tracker:
 
     def init_db(self):
         """Create tables and indexes if they do not exist."""
+        # Enable WAL mode for concurrent reads (critical for async multi-process)
+        self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS snapshots (
