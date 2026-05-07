@@ -26,5 +26,5 @@ scorer:
 
 alerter:
   platform: "telegram"
-  bot_token: "8410789419:AAGshOdHmLtqlypQoXxlIdFJWIPrLRVMcKg"
+  bot_token: "8784149244:AAFbc2DNhAlAZAs2rNgGR2dMIwJiqIaB1WQ"
   chat_id: "6031819"

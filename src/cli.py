@@ -84,9 +84,11 @@ def run_scan(config_path: str = "config.yaml") -> list[str]:
         if not should_alert(score, alert_threshold):
             continue
 
-        # Persist each signal
+        # Persist signals AND check cooldown — only alert if at least one
+        # signal passes the cooldown gate (prevents spamming same market)
+        saved_any = False
         for signal in signals:
-            tracker.save_signal(
+            was_saved = tracker.save_signal(
                 condition_id=condition_id,
                 signal_type=signal["signal_type"],
                 score=score,
@@ -94,6 +96,12 @@ def run_scan(config_path: str = "config.yaml") -> list[str]:
                 timestamp=snapshot["timestamp"],
                 cooldown_minutes=cooldown_minutes,
             )
+            if was_saved:
+                saved_any = True
+
+        # Skip alert if all signals are within cooldown
+        if not saved_any:
+            continue
 
         # Build momentum string from first momentum signal found
         momentum_str = "—"
