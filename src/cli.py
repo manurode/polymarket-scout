@@ -9,7 +9,7 @@ from src.scanner import PolymarketScanner
 from src.tracker import Tracker
 from src.signals import detect_all
 from src.scorer import calculate_score
-from src.alerter import should_alert, format_alert
+from src.alerter import should_alert, format_alert, send_all_telegram
 
 logger = logging.getLogger(__name__)
 
@@ -128,12 +128,26 @@ def main():
     args = parser.parse_args()
 
     if args.command == "scan":
+        config = load_config(args.config)
         alerts = run_scan(args.config)
+        
+        # Print to stdout
         if alerts:
             print("\n---\n".join(alerts))
             print(f"\n{len(alerts)} alert(s) generated.")
         else:
             print("No alerts generated.")
+        
+        # Auto-send to Telegram if configured
+        alerter_cfg = config.get("alerter", {})
+        bot_token = alerter_cfg.get("bot_token")
+        chat_id = alerter_cfg.get("chat_id")
+        if alerts and bot_token and chat_id:
+            try:
+                sent = send_all_telegram(alerts, bot_token, chat_id)
+                print(f"→ Sent {sent}/{len(alerts)} alerts to Telegram")
+            except Exception as exc:
+                logger.warning("Telegram delivery failed: %s", exc)
     elif args.command in ("report", "backfill"):
         print("Not yet implemented")
 

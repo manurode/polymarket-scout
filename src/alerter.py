@@ -2,6 +2,8 @@
 
 import json
 import logging
+import urllib.request
+import urllib.parse
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +15,8 @@ SIGNAL_EMOJI = {
     "spread_wide": "\U0001f308",    # 🌈
     "new_interest": "\U0001f195",   # 🆕
 }
+
+TELEGRAM_API = "https://api.telegram.org"
 
 
 def should_alert(score: int, threshold: int = 60) -> bool:
@@ -135,3 +139,46 @@ def dispatch_alerts(alerts: list[str], platform: str = "telegram") -> int:
     for alert in alerts:
         logger.info("Dispatching alert via %s:\n%s", platform, alert)
     return len(alerts)
+
+
+def send_telegram(message: str, bot_token: str, chat_id: str) -> bool:
+    """Send a message directly to Telegram via Bot API.
+
+    Returns True if sent successfully, False otherwise.
+    """
+    url = f"{TELEGRAM_API}/bot{bot_token}/sendMessage"
+    data = json.dumps({
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": False,
+    }).encode()
+
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read())
+            if result.get("ok"):
+                logger.info("Alert sent to Telegram chat %s", chat_id)
+                return True
+            else:
+                logger.error("Telegram API error: %s", result.get("description", "unknown"))
+                return False
+    except Exception as e:
+        logger.error("Failed to send Telegram alert: %s", e)
+        return False
+
+
+def send_all_telegram(alerts: list[str], bot_token: str, chat_id: str) -> int:
+    """Send all alerts to Telegram. Returns count of successfully sent messages."""
+    sent = 0
+    for alert in alerts:
+        if send_telegram(alert, bot_token, chat_id):
+            sent += 1
+    return sent

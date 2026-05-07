@@ -9,20 +9,22 @@ tracker:
 
 signals:
   momentum:
-    threshold: 0.05
+    threshold: 0.03
     window_hours: 1
   volume_spike:
-    threshold: 3.0
+    threshold: 2.0
     window_hours: 24
   spread:
-    tight_threshold: 0.03
-    wide_threshold: 0.10
+    tight_threshold: 0.02
+    wide_threshold: 0.08
   new_interest:
     min_volume: 10000
 
 scorer:
-  alert_threshold: 60
+  alert_threshold: 35
   cooldown_minutes: 30
 
 alerter:
   platform: "telegram"
+  bot_token: "8410789419:AAGshOdHmLtqlypQoXxlIdFJWIPrLRVMcKg"
+  chat_id: "6031819"

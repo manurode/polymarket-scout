@@ -240,10 +240,12 @@ def test_run_scan_empty_snapshots():
 
 def test_main_scan_calls_run_scan():
     """main with 'scan' command should delegate to run_scan."""
+    fake_config = {"alerter": {}}
     with patch("sys.argv", ["cli.py", "scan", "--config", "my_config.yaml"]):
-        with patch("src.cli.run_scan", return_value=["alert A", "alert B"]) as mock_run:
-            with patch("builtins.print") as mock_print:
-                main()
+        with patch("src.cli.load_config", return_value=fake_config):
+            with patch("src.cli.run_scan", return_value=["alert A", "alert B"]) as mock_run:
+                with patch("builtins.print") as mock_print:
+                    main()
 
     mock_run.assert_called_once_with("my_config.yaml")
     # Verify something was printed
@@ -252,10 +254,12 @@ def test_main_scan_calls_run_scan():
 
 def test_main_scan_default_command():
     """When no positional command is given, 'scan' is the default."""
+    fake_config = {"alerter": {}}
     with patch("sys.argv", ["cli.py"]):
-        with patch("src.cli.run_scan", return_value=[]) as mock_run:
-            with patch("builtins.print") as mock_print:
-                main()
+        with patch("src.cli.load_config", return_value=fake_config):
+            with patch("src.cli.run_scan", return_value=[]) as mock_run:
+                with patch("builtins.print") as mock_print:
+                    main()
 
     mock_run.assert_called_once_with("config.yaml")
     mock_print.assert_called_once_with("No alerts generated.")
