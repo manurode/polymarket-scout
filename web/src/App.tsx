@@ -6,24 +6,26 @@ import { SystemHealth } from './components/SystemHealth';
 import { PortfolioArena } from './components/PortfolioArena';
 import { OracleRadar } from './components/OracleRadar';
 import { RiskMonitor } from './components/RiskMonitor';
+import { ToastProvider, useToasts } from './components/ToastProvider';
 import { useSystemStatus } from './hooks/useSystemStatus';
 import type { Alert, NavTab, SystemMode } from './types';
 
 const NAV_TABS: NavTab[] = [
-  { id: 'system', label: 'SYSTEM', alertCount: 0 },
+  { id: 'system', label: 'SYSTEM', alertCount: 2 },
   { id: 'portfolio', label: 'PORTFOLIO', alertCount: 0 },
-  { id: 'oracles', label: 'ORACLES', alertCount: 0 },
-  { id: 'risk', label: 'RISK', alertCount: 0 },
+  { id: 'oracles', label: 'ORACLES', alertCount: 1 },
+  { id: 'risk', label: 'RISK', alertCount: 1 },
 ];
 
-export default function App() {
+function AppContent() {
   const [activeTab, setActiveTab] = useState<string>('system');
   const [alerts, setAlerts] = useState<Alert[]>([]);
   const [mode, setMode] = useState<SystemMode>('LIVE PAPER');
 
   const systemStatus = useSystemStatus(1000);
+  const { addToast } = useToasts();
 
-  // ── Simulate alerts for development ──────────────────────────────
+  // ── Simulate alerts + demo toasts on startup ──────────────────
   useEffect(() => {
     const demoAlerts: Alert[] = [
       {
@@ -40,26 +42,61 @@ export default function App() {
       },
     ];
     setAlerts(demoAlerts);
+
+    // Demo toasts to showcase the notification system
+    const timer = setTimeout(() => {
+      addToast({
+        severity: 'critical',
+        title: 'RECONCILING',
+        message: '"Trump wins 2028?" — seq gap detected. Trading paused.',
+        duration: 15000,
+        sound: 'siren',
+      });
+    }, 1000);
+
+    const timer2 = setTimeout(() => {
+      addToast({
+        severity: 'warning',
+        title: 'TIME DECAY',
+        message: 'Oil price > $80? — τ = 91%. Liquidation zone.',
+        duration: 10000,
+        sound: 'alarm',
+      });
+    }, 3000);
+
+    const timer3 = setTimeout(() => {
+      addToast({
+        severity: 'info',
+        title: 'FILL',
+        message: 'Market Making: +$2.15 spread captured on BTC > $100K',
+        duration: 5000,
+        sound: 'click',
+      });
+    }, 5000);
+
+    return () => {
+      clearTimeout(timer);
+      clearTimeout(timer2);
+      clearTimeout(timer3);
+    };
   }, []);
 
   const dismissAlert = useCallback((id: string) => {
     setAlerts(prev => prev.filter(a => a.id !== id));
   }, []);
 
-  // ── Render active panel ──────────────────────────────────────────
   const renderPanel = () => {
     switch (activeTab) {
-      case 'system': return <SystemHealth status={systemStatus} />;
+      case 'system': return <SystemHealth />;
       case 'portfolio': return <PortfolioArena />;
       case 'oracles': return <OracleRadar />;
       case 'risk': return <RiskMonitor />;
-      default: return <SystemHealth status={systemStatus} />;
+      default: return <SystemHealth />;
     }
   };
 
   return (
     <div className="h-screen flex flex-col bg-bg-primary text-text-primary overflow-hidden">
-      {/* ── Top Toolbar (sticky) ────────────────────────────────── */}
       <TopToolbar
         mode={mode}
         onModeChange={setMode}
@@ -68,16 +105,21 @@ export default function App() {
         tabs={NAV_TABS}
       />
 
-      {/* ── Alert Strip (sticky) ─────────────────────────────────── */}
       <AlertStrip alerts={alerts} onDismiss={dismissAlert} />
 
-      {/* ── Main Content (scrollable) ────────────────────────────── */}
       <main className="flex-1 overflow-y-auto overflow-x-hidden">
         {renderPanel()}
       </main>
 
-      {/* ── Status Bar (sticky bottom) ───────────────────────────── */}
       <StatusBar status={systemStatus} />
     </div>
+  );
+}
+
+export default function App() {
+  return (
+    <ToastProvider>
+      <AppContent />
+    </ToastProvider>
   );
 }
