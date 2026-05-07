@@ -1,0 +1,70 @@
+@import "tailwindcss";
+
+/* ── Scout Lab v2.0 Design System ───────────────────────────────────
+ * Dark HFT trading dashboard. Reference: docs/DASHBOARD.md §7
+ */
+
+@theme {
+  /* Background palette */
+  --color-bg-primary: #0B0E14;
+  --color-bg-secondary: #131820;
+  --color-bg-tertiary: #1A212B;
+  --color-bg-hover: #1E2936;
+  --color-bg-active: #2D3A4A;
+
+  /* Text palette */
+  --color-text-primary: #E8ECF1;
+  --color-text-secondary: #8896A6;
+  --color-text-tertiary: #5A6978;
+
+  /* Status colors */
+  --color-profit: #00C853;
+  --color-profit-bright: #00E676;
+  --color-loss: #FF1744;
+  --color-loss-bright: #FF5252;
+  --color-warning: #F59E0B;
+  --color-warning-bright: #FFB74D;
+  --color-info: #2979FF;
+  --color-whale: #7C4DFF;
+
+  /* Fonts */
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  --font-sans: 'Inter', 'SF Pro Display', system-ui, sans-serif;
+
+  --animate-pulse-red: pulse-red 1s ease-in-out infinite;
+}
+
+@keyframes pulse-red {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+/* ── Base styles ──────────────────────────────────────────────────── */
+
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--color-bg-primary);
+  color: var(--color-text-primary);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.4;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--color-bg-primary);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-bg-hover);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-bg-active);
+}
