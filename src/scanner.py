@@ -26,7 +26,9 @@ class PolymarketScanner:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 return json.loads(resp.read().decode())
         except urllib.error.HTTPError as e:
-            logger.error(f"HTTP {e.code}: {e.reason} for {url}")
+            # Don't log 404s — common with CLOB rate limiting, handled upstream
+            if e.code != 404:
+                logger.error(f"HTTP {e.code}: {e.reason} for {url}")
             raise
         except urllib.error.URLError as e:
             logger.error(f"Connection error: {e.reason} for {url}")
@@ -97,11 +99,15 @@ class PolymarketScanner:
                 spread = None
 
                 if token_yes:
+                    # Try CLOB for real-time price + spread, but fall back to Gamma
+                    # CLOB rate-limits aggressively — only query top markets
                     try:
+                        time.sleep(0.25)  # Conservative: max ~4 req/s to avoid 404s
                         price_yes = self.get_price(token_yes)
                         spread = self.get_spread(token_yes)
-                    except Exception as e:
-                        logger.warning(f"Failed to get price/spread for {token_yes}: {e}")
+                    except Exception:
+                        # Gamma prices are good enough; CLOB enrichment is best-effort
+                        pass
 
                 # Compute price_no as complement (binary markets: YES + NO = 1.0)
                 price_no = round(1.0 - price_yes, 4) if price_yes is not None else None

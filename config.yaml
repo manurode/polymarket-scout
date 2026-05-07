@@ -1,6 +1,6 @@
 scanner:
-  events_limit: 25
-  markets_per_event: 10
+  events_limit: 10
+  markets_per_event: 5
   min_volume: 5000
 
 tracker:
