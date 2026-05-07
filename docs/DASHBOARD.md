@@ -1146,3 +1146,10 @@ Endpoints REST (polling):
 1. Validar este diseño contigo — ¿Hay algo que falte, sobre, o deba cambiar?
 2. Crear wireframes interactivos (HTML/CSS estático) de cada panel para validar layout antes de escribir código real.
 3. Implementar el servidor FastAPI bridge que conecta Redis → SSE para el dashboard. (15/16)
+4. Construir el dashboard React panel por panel, empezando por System Health (el más crítico) y Risk Monitor (el más valioso para el trader).
+5. Integrar alertas push (Telegram) con el sistema de notificaciones del dashboard.
+
+---
+
+Documento de Arquitectura UI/UX — Scout Lab v2.0 Dashboard  
+Preparado para Manu — Mayo 2026
