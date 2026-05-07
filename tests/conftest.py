@@ -1,5 +1,4 @@
 import pytest
-import sqlite3
 import tempfile
 import os
 
@@ -7,6 +6,7 @@ import os
 @pytest.fixture
 def temp_db():
     """SQLite DB temporal para tests."""
+    import sqlite3
     fd, path = tempfile.mkstemp(suffix='.db')
     os.close(fd)
     conn = sqlite3.connect(path)
@@ -55,16 +55,10 @@ def mock_clob_spread():
 
 @pytest.fixture
 def config():
-    """Config mínima para tests."""
+    """Config mínima para tests v2.0."""
     return {
         "scanner": {"events_limit": 5, "markets_per_event": 3, "min_volume": 5000},
-        "tracker": {"db_path": ":memory:", "retention_days": 90},
-        "signals": {
-            "momentum": {"threshold": 0.05, "window_hours": 1},
-            "volume_spike": {"threshold": 3.0, "window_hours": 24},
-            "spread": {"tight_threshold": 0.03, "wide_threshold": 0.10},
-            "new_interest": {"min_volume": 10000},
-        },
-        "scorer": {"alert_threshold": 60, "cooldown_minutes": 30},
-        "alerter": {"platform": "telegram", "template": "test template"},
+        "selection": {"top_n": 50},
+        "rate_limiter": {"total_rate": 100.0, "max_burst": 100.0},
+        "radar": {"interval_seconds": 60},
     }
