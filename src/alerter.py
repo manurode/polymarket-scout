@@ -121,7 +121,7 @@ def format_alert(
 
     if slug:
         lines.append("")
-        lines.append(f"[View on Polymarket](https://polymarket.com/event/{slug})")
+        lines.append(f"[View on Polymarket](https://polymarket.com/market/{slug})")
 
     return "\n".join(lines)
 

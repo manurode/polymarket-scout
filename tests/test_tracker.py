@@ -299,3 +299,83 @@ class TestSaveSignal:
             "SELECT detail FROM signals WHERE condition_id='0xF'"
         ).fetchone()[0]
         assert detail == "{}"
+
+
+class TestPaperTradingTracker:
+    """Tests for paper trading methods on Tracker."""
+
+    def test_init_paper_trading(self, temp_db):
+        """init_paper_trading creates the paper_trades table."""
+        t = Tracker(temp_db)
+        t.init_paper_trading()
+
+        tables = temp_db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        ).fetchall()
+        table_names = [r[0] for r in tables]
+        assert "paper_trades" in table_names
+
+    def test_save_and_get_paper_trade(self, temp_db):
+        """Save a trade and retrieve it via get_paper_trades."""
+        t = Tracker(temp_db)
+        t.init_paper_trading()
+
+        now = int(time.time())
+        trade = {
+            "condition_id": "0xTX",
+            "question": "Will it?",
+            "side": "YES",
+            "amount": 100.0,
+            "price": 0.55,
+            "shares": 181.82,
+            "signal_type": "momentum",
+            "score": 80,
+            "status": "open",
+            "entry_timestamp": now,
+            "close_price": None,
+            "close_timestamp": None,
+            "pnl": None,
+            "strategy": "default",
+        }
+        trade_id = t.save_paper_trade(trade)
+        assert trade_id > 0
+
+        trades = t.get_paper_trades(strategy="default")
+        assert len(trades) == 1
+        assert trades[0]["condition_id"] == "0xTX"
+        assert trades[0]["side"] == "YES"
+        assert trades[0]["amount"] == 100.0
+
+    def test_close_position(self, temp_db):
+        """close_position updates status and computes P&L."""
+        t = Tracker(temp_db)
+        t.init_paper_trading()
+
+        trade_id = t.save_paper_trade({
+            "condition_id": "0xCP2",
+            "question": "Close me",
+            "side": "YES",
+            "amount": 50.0,
+            "price": 0.50,
+            "shares": 100.0,
+            "signal_type": None,
+            "score": None,
+            "status": "open",
+            "entry_timestamp": 1000,
+            "close_price": None,
+            "close_timestamp": None,
+            "pnl": None,
+            "strategy": "test",
+        })
+
+        ok = t.close_position(trade_id, 0.75, 2000)
+        assert ok is True
+
+        row = temp_db.execute(
+            "SELECT status, close_price, close_timestamp, pnl FROM paper_trades WHERE id = ?",
+            (trade_id,),
+        ).fetchone()
+        assert row[0] == "closed"
+        assert row[1] == 0.75
+        assert row[2] == 2000
+        assert row[3] == pytest.approx(25.0)  # 100 * (0.75 - 0.50)
