@@ -172,6 +172,13 @@ def _register_routes(app: FastAPI) -> None:
             alpha, flow = _mock_whales()
         return {"alpha_whales": alpha, "whale_flow": flow}
 
+    # ── Risk / Positions ──────────────────────────────────────────
+
+    @app.get("/api/risk/positions")
+    async def risk_positions(request: Request):
+        """Get open positions with risk metrics."""
+        return _mock_positions()
+
     # ── SSE Streams ────────────────────────────────────────────────
 
     @app.get("/stream/health")
@@ -388,6 +395,30 @@ def _mock_whales() -> tuple[list, dict]:
         "avg_conviction_multiplier": 1.18,
     }
     return alpha_whales, whale_flow
+
+
+def _mock_positions() -> list[dict]:
+    """Mock open positions with risk metrics."""
+    return [
+        {"id": 1, "market": "Trump wins 2028?", "strategy": "MOM", "side": "YES",
+         "size": 86, "entry": 0.62, "mark": 0.67, "pnl": 7.12, "pnl_pct": 8.3,
+         "tau_pct": 62, "toxicity": 0.25, "liquidation_zone": False},
+        {"id": 2, "market": "BTC > $100K Dec?", "strategy": "CORR", "side": "NO",
+         "size": 120, "entry": 0.45, "mark": 0.42, "pnl": -4.80, "pnl_pct": -4.0,
+         "tau_pct": 85, "toxicity": 0.65, "liquidation_zone": True},
+        {"id": 3, "market": "Fed cuts rates?", "strategy": "WHL", "side": "YES",
+         "size": 45, "entry": 0.55, "mark": 0.58, "pnl": 2.45, "pnl_pct": 5.4,
+         "tau_pct": 40, "toxicity": 0.18, "liquidation_zone": False},
+        {"id": 4, "market": "Crypto bull market?", "strategy": "MM", "side": "NO",
+         "size": 62, "entry": 0.70, "mark": 0.68, "pnl": -1.24, "pnl_pct": -2.0,
+         "tau_pct": 25, "toxicity": 0.12, "liquidation_zone": False},
+        {"id": 5, "market": "S&P 500 ATH Q3?", "strategy": "MOM", "side": "YES",
+         "size": 38, "entry": 0.35, "mark": 0.39, "pnl": 4.56, "pnl_pct": 12.0,
+         "tau_pct": 15, "toxicity": 0.05, "liquidation_zone": False},
+        {"id": 6, "market": "Oil price > $80?", "strategy": "CNTR", "side": "NO",
+         "size": 28, "entry": 0.80, "mark": 0.85, "pnl": -7.50, "pnl_pct": -26.8,
+         "tau_pct": 91, "toxicity": 1.20, "liquidation_zone": True},
+    ]
 
 
 # ── Main app instance ───────────────────────────────────────────────
