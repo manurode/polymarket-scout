@@ -3,3 +3,5 @@ __pycache__/
 *.pyo
 data/*.db
 .pytest_cache/
+data/polymarket.db-shm
+data/polymarket.db-wal
