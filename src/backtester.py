@@ -220,7 +220,7 @@ class Backtester:
         losses = [t for t in closed if (t.get("pnl") or 0) < 0]
         win_count = len(wins)
         loss_count = len(losses)
-        closed_count = win_count + loss_count
+        closed_count = len(closed)  # includes break-even trades
 
         realized_pnl = sum(t.get("pnl") or 0 for t in closed)
         total_invested = sum(t.get("amount") or 0 for t in trades)
