@@ -39,12 +39,15 @@ auto_trader:
     - contrarian
     - consensus_breakout
     - volume_breakout
+    - market_making
+    - correlation_arb
+    - whale_follow
   exit_strategy:
-    take_profit_pct: 0.10       # +10% → cierra con ganancia
-    stop_loss_pct: 0.20         # -20% → corta pérdidas
-    trailing_activate_pct: 0.08 # si llega a +8%, activa trailing stop
-    trailing_sl_pct: 0.0        # ...y sube el SL a break-even (0%)
-    max_hold_hours: 48           # cierra si tras 48h no se ha movido
+    take_profit_pct: 0.10
+    stop_loss_pct: 0.20
+    trailing_activate_pct: 0.08
+    trailing_sl_pct: 0.0
+    max_hold_hours: 48
 
 selection:
   top_n: 50
@@ -55,5 +58,46 @@ selection:
     spread: 0.10
 
 rate_limiter:
-  total_rate: 0.4               # tokens/segundo (~4 req CLOB / 10s)
-  max_burst: 2.0                # capacidad máxima de tokens acumulables
+  total_rate: 0.4
+  max_burst: 2.0
+
+# ── v2.0 Modules ──────────────────────────────────────────────
+
+radar:
+  interval_seconds: 60           # polling interval for Gamma Radar
+
+websocket:
+  url: "wss://ws-subscriptions-clob.polymarket.com"
+  heartbeat_interval: 30
+  reconnect_delay_base: 1.0
+  reconnect_delay_max: 30.0
+
+market_making:
+  base_multiplier: 1.0
+  max_obi: 0.70
+  reentry_delay_seconds: 30
+
+time_decay:
+  base_inventory_cap: 500         # USD
+  transition_point: 0.70
+  risk_floor: 0.05
+  min_liquidity: 10000
+
+portfolio:
+  k_base: 0.25                    # Quarter Kelly
+  ruin_limit: 0.02                # 2% max loss per trade
+  epoch_hours: 6
+  probation_epochs: 4
+  hurdle_rate: 0.20               # 20% annualized minimum
+
+whale_tracker:
+  alpha_threshold: 0.85
+  min_transactions: 50
+  whale_factor: 0.40
+
+degradation:
+  auto_recover: true
+  recovery_timeout: 300            # 5 minutes
+
+redis:
+  url: "redis://localhost:6379"
