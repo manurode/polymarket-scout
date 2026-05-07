@@ -99,12 +99,13 @@ def test_run_scan_pipeline():
                     with patch("src.cli.detect_all", return_value=[momentum_signal]) as mock_detect:
                         with patch("src.cli.calculate_score", return_value=(75, detail_json)) as mock_score:
                             with patch("src.cli.should_alert", return_value=True) as mock_alert:
-                                alerts = run_scan()
+                                alerts, _summary = run_scan()
 
     mock_scanner.scan_markets.assert_called_once_with(
         events_limit=5, markets_per_event=3, min_volume=5000,
     )
     mock_tracker.init_db.assert_called_once()
+    mock_tracker.init_paper_trading.assert_called_once()
     mock_tracker.save_snapshots.assert_called_once_with(mock_snapshots)
     mock_tracker.get_recent_snapshots.assert_called_once_with(
         "0xabc123", lookback_seconds=24 * 3600, reference_ts=1715000000,
@@ -146,7 +147,7 @@ def test_run_scan_no_signals():
                     MockTracker.return_value = mock_tracker
 
                     with patch("src.cli.detect_all", return_value=[]) as mock_detect:
-                        alerts = run_scan()
+                        alerts, _summary = run_scan()
 
     assert alerts == []
     mock_detect.assert_called_once()
@@ -180,7 +181,7 @@ def test_run_scan_below_threshold():
                     with patch("src.cli.detect_all", return_value=[signal]):
                         with patch("src.cli.calculate_score", return_value=(45, detail)):
                             with patch("src.cli.should_alert", return_value=False) as mock_should:
-                                alerts = run_scan()
+                                alerts, _summary = run_scan()
 
     mock_should.assert_called_once_with(45, 60)
     assert alerts == []
@@ -199,9 +200,10 @@ def test_run_scan_empty_snapshots():
                 mock_scanner.scan_markets.return_value = []
                 MockScanner.return_value = mock_scanner
 
-                alerts = run_scan()
+                alerts, summary = run_scan()
 
     assert alerts == []
+    assert "No se encontraron" in summary
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +216,7 @@ def test_main_scan_calls_run_scan():
                    "scanner": {}, "signals": {}, "scorer": {}}
     with patch("sys.argv", ["cli.py", "scan", "--config", "my_config.yaml"]):
         with patch("src.cli.load_config", return_value=fake_config):
-            with patch("src.cli.run_scan", return_value=["alert A", "alert B"]) as mock_run:
+            with patch("src.cli.run_scan", return_value=(["alert A", "alert B"], "2 trades placed")) as mock_run:
                 with patch("builtins.print") as mock_print:
                     main()
 

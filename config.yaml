@@ -1,6 +1,6 @@
 scanner:
-  events_limit: 10
-  markets_per_event: 5
+  events_limit: 25
+  markets_per_event: 8
   min_volume: 5000
 
 tracker:
@@ -28,3 +28,20 @@ alerter:
   platform: "telegram"
   bot_token: "8784149244:AAFbc2DNhAlAZAs2rNgGR2dMIwJiqIaB1WQ"
   chat_id: "6031819"
+
+auto_trader:
+  enabled: true
+  max_open_positions: 10
+  position_size_pct: 0.05
+  min_score: 30
+  enabled_strategies:
+    - momentum_follow
+    - contrarian
+    - consensus_breakout
+    - volume_breakout
+  exit_strategy:
+    take_profit_pct: 0.10       # +10% → cierra con ganancia
+    stop_loss_pct: 0.20         # -20% → corta pérdidas
+    trailing_activate_pct: 0.08 # si llega a +8%, activa trailing stop
+    trailing_sl_pct: 0.0        # ...y sube el SL a break-even (0%)
+    max_hold_hours: 48           # cierra si tras 48h no se ha movido

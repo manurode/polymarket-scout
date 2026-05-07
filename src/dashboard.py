@@ -75,6 +75,19 @@ st.markdown("""
         background: linear-gradient(180deg, #0f0f1a 0%, #1a1a2e 100%);
         border-right: 1px solid rgba(255,255,255,0.05);
     }
+    section[data-testid="stSidebar"] * {
+        color: #e0e0e0 !important;
+    }
+    section[data-testid="stSidebar"] h3 {
+        color: #f0f0f0 !important;
+    }
+    section[data-testid="stSidebar"] label,
+    section[data-testid="stSidebar"] .stCaption {
+        color: rgba(255,255,255,0.55) !important;
+    }
+    section[data-testid="stSidebar"] [data-testid="stMetricValue"] {
+        color: #fff !important;
+    }
 
     /* Buttons */
     div.stButton > button {
@@ -131,7 +144,7 @@ def load_portfolio_stats():
                 SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
                 SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) as losses,
                 COALESCE(SUM(pnl), 0) as total_pnl,
-                COALESCE(SUM(amount), 0) as total_invested
+                COALESCE(SUM(CASE WHEN status = 'open' THEN amount ELSE 0 END), 0) as total_invested
             FROM paper_trades
         """)
         row = cur.fetchone()
@@ -190,7 +203,7 @@ def load_market_summary():
             FROM snapshots
             WHERE timestamp = (SELECT MAX(timestamp) FROM snapshots)
             ORDER BY volume DESC
-            LIMIT 50
+            LIMIT 500
         """, conn)
     except Exception:
         return pd.DataFrame()
@@ -218,6 +231,12 @@ def load_snapshots_for_backtest(days=7):
 with st.sidebar:
     st.markdown("### 🔬 Scout Lab")
     st.markdown("Laboratorio de estrategias de predicción")
+
+    st.divider()
+
+    # Bot status
+    st.markdown("🤖 **Auto-Trader: ONLINE**")
+    st.caption("Operando cada 5 min • TP: +10% • SL: -20% • Trail: +8%→BE")
 
     st.divider()
 
@@ -315,10 +334,22 @@ with tab_backtest:
     st.header("Backtest de Estrategias")
 
     st.markdown("""
-    El backtest repite tus datos históricos y simula qué habría pasado si hubieras
-    apostado siguiendo cada estrategia. Los resultados te dicen qué estrategia
-    habría sido más rentable.
+    El backtest simula qué habría pasado si hubieras apostado siguiendo cada estrategia
+    usando los datos históricos guardados. **Cada estrategia recibe $1,000 virtuales**
+    y arriesga un 5% por trade. Los resultados te dicen qué estrategia habría sido más rentable.
     """)
+
+    # Strategy explainer
+    with st.expander("📖 ¿Qué hace cada estrategia?", expanded=False):
+        st.markdown("""
+        | Estrategia | Lógica |
+        |---|---|
+        | **momentum_follow** | Si el precio sube rápido → apuesta YES. Si baja rápido → apuesta NO. Sigue la tendencia. |
+        | **contrarian** | Si el precio cae CON volumen alto → apuesta YES (espera rebote). Contrarian. |
+        | **consensus_breakout** | Spread ajustado + momentum alcista → apuesta YES. El mercado se pone de acuerdo. |
+        | **volume_breakout** | Mucho volumen + spread amplio → apuesta YES. El mercado está descubriendo precio. |
+        | **new_market_yes** | Mercado nuevo con volumen inicial alto y precio < 50% → apuesta YES. Entrada temprana. |
+        """)
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -369,15 +400,16 @@ with tab_backtest:
                         "Estrategia": name,
                         "Trades": r["total_trades"],
                         "Cerrados": r["closed_positions"],
-                        "Ganados": r["wins"],
-                        "Perdidos": r["losses"],
+                        "✅ Ganados": r["wins"],
+                        "❌ Perdidos": r["losses"],
                         "Win Rate": f"{r['win_rate']*100:.0f}%",
                         "P&L": f"${r['realized_pnl']:.2f}",
                         "ROI": f"{r['roi']*100:.1f}%",
                         "Invertido": f"${r['total_invested']:.2f}",
                     })
                 summary_df = pd.DataFrame(rows)
-                st.subheader("Resultados por estrategia")
+                st.subheader("📊 Resultados por estrategia")
+                st.caption("P&L = ganancia/pérdida total. ROI = retorno sobre lo invertido. Invertido = suma de todos los trades (abiertos y cerrados).")
                 st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
                 # Bar chart: P&L per strategy
@@ -407,18 +439,29 @@ with tab_backtest:
                     st.plotly_chart(fig2, use_container_width=True)
 
                 # All individual trades
-                st.subheader("Trades individuales")
+                st.subheader("🧾 Trades individuales")
+                st.caption("Cada fila es una apuesta simulada. P&L positivo = ganancia, negativo = pérdida, $0.00 = cerrado al mismo precio (break even).")
                 all_trades = []
                 for name, data in results.items():
                     for t in data.get("trades", []):
+                        pnl = t.get("pnl")
+                        if pnl is not None:
+                            if pnl > 0:
+                                pnl_str = f"🟢 ${pnl:+.2f}"
+                            elif pnl < 0:
+                                pnl_str = f"🔴 ${pnl:+.2f}"
+                            else:
+                                pnl_str = "⚪ $0.00"
+                        else:
+                            pnl_str = "—"
                         all_trades.append({
                             "Estrategia": name,
                             "Lado": t.get("side", "?"),
-                            "Precio": f"{t.get('price', 0)*100:.1f}%" if t.get("price") else "—",
+                            "Precio entrada": f"{t.get('price', 0)*100:.1f}%" if t.get("price") else "—",
                             "Cantidad": f"${t.get('amount', 0):.2f}",
-                            "P&L": f"${t.get('pnl', 0):+.2f}" if t.get("pnl") is not None else "—",
+                            "P&L": pnl_str,
                             "Estado": t.get("status", "?"),
-                            "Mercado": (t.get("question", "") or "")[:60],
+                            "Mercado": (t.get("question", "") or "")[:70],
                         })
                 if all_trades:
                     st.dataframe(pd.DataFrame(all_trades), use_container_width=True, hide_index=True)
@@ -433,11 +476,13 @@ with tab_backtest:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 with tab_portfolio:
-    st.header("Paper Trading Portfolio")
+    st.header("🤖 Paper Trading Portfolio")
 
     st.markdown("""
-    Tu cartera virtual de paper trading. No se usa dinero real — es un simulador
-    para probar estrategias antes de arriesgar capital.
+    El bot opera automáticamente cada 5 minutos. Evalúa señales, decide si apostar,
+    y cierra posiciones con **take-profit +10%**, **stop-loss -20%**,
+    **trailing stop (+8% → break-even)** o por tiempo (48h sin movimiento).
+    **Todo simulado — dinero ficticio.**
     """)
 
     # Portfolio KPIs

@@ -13,6 +13,7 @@ from src.scorer import calculate_score
 from src.alerter import should_alert, format_alert, send_all_telegram
 from src.paper_trader import PaperTrader
 from src.backtester import Backtester
+from src.auto_trader import AutoTrader
 
 logger = logging.getLogger(__name__)
 
@@ -23,11 +24,10 @@ def load_config(path: str = "config.yaml") -> dict:
         return yaml.safe_load(f)
 
 
-def run_scan(config_path: str = "config.yaml") -> list[str]:
-    """Run the full pipeline: scan → track → signal → score → alert.
+def run_scan(config_path: str = "config.yaml") -> tuple[list[str], str]:
+    """Run the full pipeline: scan → track → signal → score → alert → auto-trade.
 
-    Returns a list of formatted alert strings, one per market that
-    exceeded the alert threshold.
+    Returns a tuple of (alerts, cycle_summary).
     """
     config = load_config(config_path)
 
@@ -35,6 +35,7 @@ def run_scan(config_path: str = "config.yaml") -> list[str]:
     tr = config["tracker"]
     sig = config["signals"]
     scr = config["scorer"]
+    auto_cfg = config.get("auto_trader", {})
 
     # 1. Scan markets
     scanner = PolymarketScanner()
@@ -45,12 +46,27 @@ def run_scan(config_path: str = "config.yaml") -> list[str]:
     )
 
     if not snapshots:
-        return []
+        return [], "⚪ No se encontraron mercados."
 
     # 2. Persist snapshots
     tracker = Tracker(tr["db_path"])
     tracker.init_db()
+    tracker.init_paper_trading()
     tracker.save_snapshots(snapshots)
+
+    # 3. Init auto-trader (if enabled)
+    auto_trader = None
+    if auto_cfg.get("enabled", False):
+        pt = PaperTrader(
+            tracker,
+            initial_balance=1000.0,
+            position_size_pct=auto_cfg.get("position_size_pct", 0.05),
+        )
+        auto_trader = AutoTrader(
+            tracker, pt,
+            signal_config=sig,
+            auto_config=auto_cfg,
+        )
 
     # Compute lookback: the larger of the two time‑based signal windows
     lookback_seconds = max(
@@ -62,6 +78,7 @@ def run_scan(config_path: str = "config.yaml") -> list[str]:
     cooldown_minutes = scr.get("cooldown_minutes", 30)
     alerts: list[str] = []
 
+    # 4. Process every market: detect signals → auto-trade + alerts
     for snapshot in snapshots:
         condition_id = snapshot["condition_id"]
 
@@ -80,7 +97,11 @@ def run_scan(config_path: str = "config.yaml") -> list[str]:
         # Composite score
         score, detail_json = calculate_score(signals)
 
-        # Threshold check
+        # ── AUTO-TRADE (usa su propio min_score, independiente de alertas) ──
+        if auto_trader and auto_cfg.get("enabled"):
+            auto_trader.evaluate_and_trade(signals, snapshot, score)
+
+        # ── ALERTS (solo si supera el threshold Y pasa el cooldown) ──
         if not should_alert(score, alert_threshold):
             continue
 
@@ -115,7 +136,17 @@ def run_scan(config_path: str = "config.yaml") -> list[str]:
         alert = format_alert(score, snapshot, detail_json, momentum_str)
         alerts.append(alert)
 
-    return alerts
+    # 5. Check auto-close conditions (take profit / stop loss)
+    if auto_trader and auto_cfg.get("enabled"):
+        auto_trader.check_close_conditions()
+
+    # 6. Build cycle summary
+    if auto_trader:
+        cycle_summary = auto_trader.cycle_summary()
+    else:
+        cycle_summary = f"{len(alerts)} alerta(s) generada(s)."
+
+    return alerts, cycle_summary
 
 
 def cmd_backtest(args) -> None:
@@ -326,7 +357,10 @@ def main():
 
     if args.command == "scan":
         config = load_config(args.config)
-        alerts = run_scan(args.config)
+        alerts, summary = run_scan(args.config)
+
+        # Print to stdout
+        print(summary)
 
         # Print to stdout
         if alerts:
