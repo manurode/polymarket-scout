@@ -1,6 +1,7 @@
 """Tests for the CLI module."""
 
 import json
+import pytest
 from unittest.mock import MagicMock, patch
 
 from src.cli import load_config, run_scan, main
@@ -28,7 +29,6 @@ def test_load_config():
 # run_scan  (pipeline integration)
 # ---------------------------------------------------------------------------
 
-# Reusable minimal config for the run_scan tests
 def _test_config():
     return {
         "scanner": {"events_limit": 5, "markets_per_event": 3, "min_volume": 5000},
@@ -60,14 +60,10 @@ def _mock_snapshot(condition_id="0xabc123"):
 
 
 def test_run_scan_pipeline():
-    """Full pipeline: scan → track → detect → score → alert.
-
-    Heavily mocked dependencies — the *real* run_scan logic is exercised.
-    """
+    """Full pipeline: scan → track → detect → score → alert."""
     config = _test_config()
     mock_snapshots = [_mock_snapshot()]
 
-    # Momentum signal with 20% change  (0.50 → 0.60)
     momentum_signal = {
         "signal_type": "momentum_up",
         "change_pct": 0.20,
@@ -78,7 +74,6 @@ def test_run_scan_pipeline():
         {"signal_type": "momentum_up", "weight": 20, "intensity": 1.0, "contribution": 20},
     ])
 
-    # Two recent snapshots showing price momentum
     recent_snapshots = [
         {"condition_id": "0xabc123", "price_yes": 0.50, "volume": 1000000,
          "timestamp": 1714996400},
@@ -106,48 +101,27 @@ def test_run_scan_pipeline():
                             with patch("src.cli.should_alert", return_value=True) as mock_alert:
                                 alerts = run_scan()
 
-    # --- Assertions ---
-
-    # Scanner was called with correct params
     mock_scanner.scan_markets.assert_called_once_with(
         events_limit=5, markets_per_event=3, min_volume=5000,
     )
-
-    # Tracker lifecycle
     mock_tracker.init_db.assert_called_once()
     mock_tracker.save_snapshots.assert_called_once_with(mock_snapshots)
-
-    # Recent snapshots fetched with correct lookback  (max(1, 24) = 24 h)
     mock_tracker.get_recent_snapshots.assert_called_once_with(
-        "0xabc123",
-        lookback_seconds=24 * 3600,
-        reference_ts=1715000000,
+        "0xabc123", lookback_seconds=24 * 3600, reference_ts=1715000000,
     )
-
-    # Signal detection and scoring
     mock_detect.assert_called_once()
     call_args = mock_detect.call_args[0]
-    assert call_args[0] == recent_snapshots  # snapshots
-    assert call_args[1] == config["signals"]   # signals config
-
+    assert call_args[0] == recent_snapshots
+    assert call_args[1] == config["signals"]
     mock_score.assert_called_once_with([momentum_signal])
     mock_alert.assert_called_once_with(75, 60)
-
-    # Signal was persisted
     mock_tracker.save_signal.assert_called_once_with(
-        condition_id="0xabc123",
-        signal_type="momentum_up",
-        score=75,
-        detail=detail_json,
-        timestamp=1715000000,
-        cooldown_minutes=30,
+        condition_id="0xabc123", signal_type="momentum_up", score=75,
+        detail=detail_json, timestamp=1715000000, cooldown_minutes=30,
     )
-
-    # One alert produced
     assert len(alerts) == 1
     assert "75/100" in alerts[0]
     assert "US Election 2024" in alerts[0]
-    # Momentum string: change_pct 0.20 * 100 = 20.0 → "+20.0"
     assert "+20.0%" in alerts[0]
 
 
@@ -167,8 +141,7 @@ def test_run_scan_no_signals():
                 with patch("src.cli.Tracker") as MockTracker:
                     mock_tracker = MagicMock()
                     mock_tracker.get_recent_snapshots.return_value = [
-                        mock_snapshots[0],
-                        mock_snapshots[0],
+                        mock_snapshots[0], mock_snapshots[0],
                     ]
                     MockTracker.return_value = mock_tracker
 
@@ -176,7 +149,6 @@ def test_run_scan_no_signals():
                         alerts = run_scan()
 
     assert alerts == []
-    # calculate_score and should_alert must NOT have been called
     mock_detect.assert_called_once()
 
 
@@ -201,8 +173,7 @@ def test_run_scan_below_threshold():
                 with patch("src.cli.Tracker") as MockTracker:
                     mock_tracker = MagicMock()
                     mock_tracker.get_recent_snapshots.return_value = [
-                        mock_snapshots[0],
-                        mock_snapshots[0],
+                        mock_snapshots[0], mock_snapshots[0],
                     ]
                     MockTracker.return_value = mock_tracker
 
@@ -213,7 +184,6 @@ def test_run_scan_below_threshold():
 
     mock_should.assert_called_once_with(45, 60)
     assert alerts == []
-    # save_signal must NOT be called when threshold not met
     mock_tracker.save_signal.assert_not_called()
 
 
@@ -235,12 +205,13 @@ def test_run_scan_empty_snapshots():
 
 
 # ---------------------------------------------------------------------------
-# main  (argparse CLI)
+# main  (subparser CLI)
 # ---------------------------------------------------------------------------
 
 def test_main_scan_calls_run_scan():
-    """main with 'scan' command should delegate to run_scan."""
-    fake_config = {"alerter": {}}
+    """main with 'scan' subcommand should delegate to run_scan."""
+    fake_config = {"alerter": {}, "tracker": {"db_path": ":memory:"},
+                   "scanner": {}, "signals": {}, "scorer": {}}
     with patch("sys.argv", ["cli.py", "scan", "--config", "my_config.yaml"]):
         with patch("src.cli.load_config", return_value=fake_config):
             with patch("src.cli.run_scan", return_value=["alert A", "alert B"]) as mock_run:
@@ -248,36 +219,21 @@ def test_main_scan_calls_run_scan():
                     main()
 
     mock_run.assert_called_once_with("my_config.yaml")
-    # Verify something was printed
-    assert mock_print.call_count >= 2  # at least separator + summary
+    assert mock_print.call_count >= 2
 
 
-def test_main_scan_default_command():
-    """When no positional command is given, 'scan' is the default."""
-    fake_config = {"alerter": {}}
+def test_main_scan_default_shows_help():
+    """When no subcommand given, prints help (no default scan anymore)."""
     with patch("sys.argv", ["cli.py"]):
-        with patch("src.cli.load_config", return_value=fake_config):
-            with patch("src.cli.run_scan", return_value=[]) as mock_run:
-                with patch("builtins.print") as mock_print:
-                    main()
+        with patch("builtins.print") as mock_print:
+            main()
 
-    mock_run.assert_called_once_with("config.yaml")
-    mock_print.assert_called_once_with("No alerts generated.")
+    # Should print help message
+    assert mock_print.call_count >= 1
 
 
-def test_main_report_not_implemented():
-    """'report' command prints placeholder."""
+def test_main_unknown_command():
+    """Unknown command exits with error (argparse SystemExit)."""
     with patch("sys.argv", ["cli.py", "report"]):
-        with patch("builtins.print") as mock_print:
+        with pytest.raises(SystemExit):
             main()
-
-    mock_print.assert_called_once_with("Not yet implemented")
-
-
-def test_main_backfill_not_implemented():
-    """'backfill' command prints placeholder."""
-    with patch("sys.argv", ["cli.py", "backfill"]):
-        with patch("builtins.print") as mock_print:
-            main()
-
-    mock_print.assert_called_once_with("Not yet implemented")
