@@ -358,10 +358,8 @@ def _register_routes(app: FastAPI) -> None:
         if orch and hasattr(orch, "paper_trading") and orch.paper_trading:
             positions = orch.paper_trading.get_positions(only_open=True)
             if len(positions) >= 2:
-                # Compute simple correlation matrix from P&L movements
                 n = len(positions)
                 labels = [p["market"][:15] for p in positions]
-                # Build correlation from position side alignment and market category
                 matrix = []
                 for i in range(n):
                     row = []
@@ -371,10 +369,9 @@ def _register_routes(app: FastAPI) -> None:
                         elif i > j:
                             row.append(matrix[j][i])
                         else:
-                            # Estimate correlation based on market similarity and side alignment
                             same_category = _market_similarity(positions[i]["market"], positions[j]["market"])
                             same_side = 1.0 if positions[i]["side"] == positions[j]["side"] else -1.0
-                            corr = same_category * same_side * 0.5  # scale to [-0.5, 0.5]
+                            corr = same_category * same_side * 0.5
                             row.append(round(corr, 2))
                     matrix.append(row)
                 avg_corr = round(sum(matrix[i][j] for i in range(n) for j in range(i)) / max(1, n * (n - 1) // 2), 2)
@@ -391,6 +388,66 @@ def _register_routes(app: FastAPI) -> None:
             "matrix": [],
             "avg_correlation": 0,
             "source": "no_positions",
+        }
+
+    # ── Backtest ─────────────────────────────────────────────────────────────────────
+
+    @app.get("/api/backtest")
+    async def run_backtest(request: Request, days: int = 7, capital: float = 10000):
+        """Run backtest on historical price data.
+
+        Parameters
+        ----------
+        days : int
+            Number of days to backtest (default 7).
+        capital : float
+            Initial capital in USD (default 10000).
+        """
+        from src.backtester import Backtester
+
+        orch = request.app.state.orchestrator
+        if orch and hasattr(orch, "price_history"):
+            store = orch.price_history
+        else:
+            from src.price_history import PriceHistory
+            store = PriceHistory()
+
+        bt = Backtester(store)
+        result = bt.run(
+            days=min(days, 30),
+            initial_capital=capital,
+            max_positions=6,
+            position_size_pct=0.10,
+            tp_pct=0.15,
+            sl_pct=0.10,
+        )
+
+        return {
+            "initial_capital": result.initial_capital,
+            "final_equity": result.final_equity,
+            "total_pnl": result.total_pnl,
+            "total_pnl_pct": result.total_pnl_pct,
+            "total_trades": result.total_trades,
+            "winning_trades": result.winning_trades,
+            "losing_trades": result.losing_trades,
+            "win_rate": result.win_rate,
+            "max_drawdown_pct": result.max_drawdown_pct,
+            "sharpe_ratio": result.sharpe_ratio,
+            "strategy_breakdown": result.strategy_breakdown,
+            "trades": [{
+                "market": t.market[:60],
+                "strategy": t.strategy,
+                "side": t.side,
+                "entry": t.entry_price,
+                "exit": t.exit_price,
+                "size": t.size,
+                "pnl": t.pnl,
+                "pnl_pct": t.pnl_pct,
+                "exit_reason": t.exit_reason,
+            } for t in result.trades[-20:]],  # últimos 20 trades
+            "equity_curve": result.equity_curve[-30:],  # últimos 30 puntos
+            "errors": result.errors,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
     # ── Oracles / Spoofing ───────────────────────────────────────────────────────────────

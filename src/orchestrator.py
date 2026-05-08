@@ -40,6 +40,7 @@ from src.degradation import DegradationManager, SystemMode
 from src.redis_bus import MessageBus, create_message_bus
 from src.paper_trading import PaperTradingEngine
 from src.signal_pipeline import SignalPipeline
+from src.price_history import PriceHistory
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +109,9 @@ class ScoutOrchestrator:
 
         # ── Signal Pipeline ────────────────────────────────────────────────
         self.signal_pipeline = SignalPipeline()
+
+        # ── Price History ───────────────────────────────────────────────────
+        self.price_history = PriceHistory()
 
         # ── Phase 5: Resilience ───────────────────────────────────────────────
         self.degradation = DegradationManager()
@@ -236,6 +240,9 @@ class ScoutOrchestrator:
 
                 # ── Guardar snapshots para el signal pipeline ──
                 self._last_radar_snapshots = snapshots
+
+                # ── Guardar historial persistente de precios ──
+                self.price_history.save_snapshots(snapshots)
 
                 logger.info(
                     "Radar: %d mercados escaneados, Top %d ranked (%dms)",
