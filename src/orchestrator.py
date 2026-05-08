@@ -113,24 +113,7 @@ class ScoutOrchestrator:
         self._tasks: list[asyncio.Task] = []
         self._last_radar_elapsed_ms = 0.0
         self._timings: dict[str, float] = {}
-
-        # ── System Status ──────────────────────────────────────────────────
-
-    def get_system_status(self) -> dict:
-        """Retorna estado completo del sistema para el dashboard."""
-        return {
-            "mode": self.degradation.get_mode().value,
-            "degradation_metrics": self.degradation.get_degradation_metrics(),
-            "tracked_markets_book": len(self.ws_manager.get_tracked_tokens()) if self.ws_manager else 0,
-            "tracked_markets_trades": len(self.ws_manager.get_tracked_tokens()) if self.ws_manager else 0,
-            "portfolio_epoch": self.portfolio_manager.current_epoch,
-            "active_strategies": [
-                name for name, s in self.portfolio_manager._strategies.items()
-                if s.status.value == "active"
-            ] if self.portfolio_manager else [],
-            "alpha_whales": len(self.whale_tracker.get_alpha_whales()) if self.whale_tracker else 0,
-            "websocket_connected": self.ws_manager.is_connected if self.ws_manager else False,
-        }
+        self._market_prices: dict[str, float] = {}  # market_name → price
 
     # ── Lifecycle ─────────────────────────────────────────────────
 
@@ -238,6 +221,14 @@ class ScoutOrchestrator:
 
                 elapsed_ms = (time.monotonic() - t0) * 1000
                 self._last_radar_elapsed_ms = elapsed_ms
+
+                # ── Guardar precios reales para mark-to-market ──
+                for snap in snapshots:
+                    name = snap.get("question", "")
+                    price = snap.get("price_yes")
+                    if name and price is not None:
+                        self._market_prices[name.lower()] = float(price)
+
                 logger.info(
                     "Radar: %d mercados escaneados, Top %d ranked (%dms)",
                     len(snapshots), len(ranked.top), int(elapsed_ms),
@@ -334,11 +325,20 @@ class ScoutOrchestrator:
         logger.info("PaperTrading MTM daemon iniciado")
         while self._running:
             try:
-                # Si tenemos precios reales del WS, los usamos; si no, el engine simula
+                # Construir price_source haciendo fuzzy match con los precios del radar
                 price_source: dict[str, float] = {}
-                if self.ws_manager:
-                    # TODO: extraer mid-price de cada libro trackeado
-                    pass
+                if self._market_prices:
+                    for pos in self.paper_trading._positions:
+                        if pos.closed_at is not None:
+                            continue
+                        # Buscar el mercado en los precios del radar (fuzzy match)
+                        pos_key = pos.market.lower().strip("?")
+                        for radar_name, radar_price in self._market_prices.items():
+                            # Fuzzy match: si comparten keywords significativas
+                            if _fuzzy_market_match(pos_key, radar_name):
+                                price_source[pos.market] = radar_price
+                                break
+
                 await self.paper_trading.mark_to_market(price_source)
             except asyncio.CancelledError:
                 break
@@ -528,18 +528,38 @@ class ScoutOrchestrator:
         """Retorna el estado completo del sistema para monitorización."""
         pt = self.paper_trading
         return {
-            "mode": self.degradation.get_mode().value,
-            "degradation_metrics": self.degradation.get_degradation_metrics(),
-            "tracked_markets_book": len(self.book_analyzer),
-            "tracked_markets_trades": len(self.trade_aggregator),
-            "portfolio_epoch": self.portfolio_manager.current_epoch,
-            "active_strategies": self.portfolio_manager.get_active_strategies(),
-            "alpha_whales": len(self.whale_tracker.get_alpha_whales()),
+            "mode": self.degradation.get_mode().value if self.degradation else "unknown",
+            "degradation_metrics": self.degradation.get_degradation_metrics() if self.degradation else {},
+            "tracked_markets_book": len(self.book_analyzer) if self.book_analyzer else 0,
+            "tracked_markets_trades": len(self.trade_aggregator) if self.trade_aggregator else 0,
+            "portfolio_epoch": self.portfolio_manager.current_epoch if self.portfolio_manager else 0,
+            "active_strategies": self.portfolio_manager.get_active_strategies() if self.portfolio_manager else [],
+            "alpha_whales": len(self.whale_tracker.get_alpha_whales()) if self.whale_tracker else 0,
             "websocket_connected": self.ws_manager.is_connected if self.ws_manager else False,
             "paper_trading": {
-                "open_positions": pt.open_position_count,
-                "total_pnl": round(pt.total_pnl, 2),
-                "unrealized_pnl": round(pt.unrealized_pnl, 2),
-                "wallet_total": round(pt.wallet.usdc_total, 2),
-            },
+                "open_positions": pt.open_position_count if pt else 0,
+                "total_pnl": round(pt.total_pnl, 2) if pt else 0,
+                "unrealized_pnl": round(pt.unrealized_pnl, 2) if pt else 0,
+                "wallet_total": round(pt.wallet.usdc_total, 2) if pt else 0,
+            } if pt else {},
         }
+
+
+def _fuzzy_market_match(pos_name: str, radar_name: str) -> bool:
+    """Check if a position market name matches a radar market name using keyword overlap.
+    Returns True if they share enough significant keywords.
+    """
+    stopwords = {"the", "will", "and", "for", "has", "was", "can", "are", "yes", "no", "or", "in", "at", "on"}
+    
+    def keywords(text: str) -> set:
+        return {w.strip("?!.,:;\"'$") for w in text.lower().split() 
+                if len(w.strip("?!.,:;\"'$")) >= 3 and w not in stopwords}
+    
+    kw1 = keywords(pos_name)
+    kw2 = keywords(radar_name)
+    
+    if not kw1 or not kw2:
+        return False
+    
+    overlap = kw1 & kw2
+    return len(overlap) / len(kw1) > 0.4
