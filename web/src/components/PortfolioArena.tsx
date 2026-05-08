@@ -45,14 +45,19 @@ export function PortfolioArena() {
 
   return (
     <div className="p-4 space-y-4">
-      {/* ── Header ─────────────────────────────────────────────────────────────────── */}
+      {/* ── Header ─────────────────────────────────────────────────────────────────────── */}
       <div className="flex items-center justify-between">
         <h2 className="text-sm font-bold tracking-wider text-text-primary">
           PORTFOLIO ARENA
         </h2>
-        <span className="text-[11px] font-mono text-text-secondary">
-          Epoch {epochNum}/6h █░░
-        </span>
+        <div className="flex items-center gap-3">
+          <span className="text-[10px] px-2 py-0.5 rounded-full font-mono bg-warning/20 text-warning border border-warning/30">
+            📦 PAPER TRADING
+          </span>
+          <span className="text-[11px] font-mono text-text-secondary">
+            Epoch {epochNum}/6h █░░
+          </span>
+        </div>
       </div>
 
       {/* ── Empty state ─────────────────────────────────────────────────── */}
