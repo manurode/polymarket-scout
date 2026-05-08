@@ -11,11 +11,6 @@ interface TopToolbarProps {
 
 export function TopToolbar({ mode, activeTab, onTabChange, tabs }: TopToolbarProps) {
   const { uptime } = useHealth(5000);
-  const modeColors: Record<SystemMode, string> = {
-    'LIVE PAPER': 'text-profit',
-    'BACKTEST': 'text-info',
-    'DRY RUN': 'text-text-tertiary',
-  };
 
   return (
     <header className="flex-shrink-0 bg-bg-secondary border-b border-bg-hover">
@@ -25,8 +20,21 @@ export function TopToolbar({ mode, activeTab, onTabChange, tabs }: TopToolbarPro
           <span className="font-mono text-sm font-bold tracking-wider text-text-primary">
             SCOUT LAB v2.0
           </span>
-          <span className={`text-[11px] font-mono ${modeColors[mode]}`}>
-            ● {mode}
+          {/* Mode indicator - now more explicit about PAPER TRADING */}
+          <span className={`
+            text-[11px] font-mono px-2 py-0.5 rounded-full
+            ${mode === 'LIVE PAPER'
+              ? 'bg-warning/20 text-warning border border-warning/30'
+              : mode === 'BACKTEST'
+                ? 'bg-info/20 text-info border border-info/30'
+                : 'bg-bg-tertiary text-text-tertiary border border-bg-hover'
+            }
+          `}>
+            {mode === 'LIVE PAPER' ? '📦 PAPER TRADING' : mode}
+          </span>
+          {/* Tooltip hint */}
+          <span className="text-[9px] text-text-tertiary hidden sm:inline">
+            (Virtual money - no real funds at risk)
           </span>
         </div>
         <div className="flex items-center gap-3 text-[11px] font-mono text-text-secondary">
