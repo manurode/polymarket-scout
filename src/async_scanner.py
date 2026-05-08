@@ -46,13 +46,19 @@ class AsyncPolymarketScanner:
         self._own_session = session is None
         self._session = session
         self._rate_limiter = rate_limiter or get_default_limiter()
+        self._session_started = False
 
-    async def __aenter__(self):
-        if self._session is None:
+    async def _ensure_session(self) -> None:
+        """Ensure an aiohttp session exists."""
+        if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 headers={"User-Agent": "polymarket-scout/2.0"},
                 timeout=aiohttp.ClientTimeout(total=15),
             )
+            self._own_session = True
+
+    async def __aenter__(self):
+        await self._ensure_session()
         return self
 
     async def __aexit__(self, *args):
@@ -176,6 +182,7 @@ class AsyncPolymarketScanner:
         list[dict]
             Misma estructura que PolymarketScanner.scan_markets().
         """
+        await self._ensure_session()
         events = await self.get_events_async(limit=events_limit, active_only=True)
         snapshots = []
         now = int(time.time())
