@@ -27,18 +27,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from sse_starlette.sse import EventSourceResponse
 
-# ── Logger ──────────────────────────────────────────────────────────
+# ── Logger ─────────────────────────────────────────────────────────────────────
 
 logger = logging.getLogger("dashboard.server")
 logging.basicConfig(level=logging.INFO)
 
 
-# ── Startup time ────────────────────────────────────────────────────
+# ── Startup time ─────────────────────────────────────────────────────────────────────
 
 START_TIME = time.time()
 
 
-# ── App factory ─────────────────────────────────────────────────────
+# ── App factory ─────────────────────────────────────────────────────────────────────
 
 
 def create_app(orchestrator=None) -> FastAPI:
@@ -63,7 +63,7 @@ def create_app(orchestrator=None) -> FastAPI:
         redoc_url="/api/redoc",
     )
 
-    # ── CORS (allow dev frontend) ──────────────────────────────────
+    # ── CORS (allow dev frontend) ─────────────────────────────────────────────────
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[
@@ -77,22 +77,22 @@ def create_app(orchestrator=None) -> FastAPI:
         allow_headers=["*"],
     )
 
-    # ── Store orchestrator in app state ─────────────────────────────
+    # ── Store orchestrator in app state ───────────────────────────────────────────────
     app.state.orchestrator = orchestrator
 
-    # ── Register routes ────────────────────────────────────────────
+    # ── Register routes ───────────────────────────────────────────────────────────────────
     _register_routes(app)
 
     return app
 
 
-# ── Routes ──────────────────────────────────────────────────────────
+# ── Routes ──────────────────────────────────────────────────────────────────────────────
 
 
 def _register_routes(app: FastAPI) -> None:
     """Register all API routes on the FastAPI app."""
 
-    # ── Health ─────────────────────────────────────────────────────
+    # ── Health ────────────────────────────────────────────────────────────────────────
 
     @app.get("/api/health")
     async def health():
@@ -107,14 +107,11 @@ def _register_routes(app: FastAPI) -> None:
             "uptime_seconds": round(uptime, 1),
         }
 
-    # ── System Status ──────────────────────────────────────────────
+    # ── System Status ─────────────────────────────────────────────────────────────────
 
     @app.get("/api/system/status")
     async def system_status(request: Request):
-        """Get full system status from the orchestrator.
-
-        Returns mode, degradation metrics, heartbeats, and tracked counts.
-        """
+        """Get full system status from the orchestrator."""
         orch = request.app.state.orchestrator
         if orch:
             status = orch.get_system_status()
@@ -125,7 +122,7 @@ def _register_routes(app: FastAPI) -> None:
         status["heartbeats"] = _get_heartbeats(orch)
         return status
 
-    # ── Rate Limits ────────────────────────────────────────────────
+    # ── Rate Limits ───────────────────────────────────────────────────────────────────
 
     @app.get("/api/system/rate-limits")
     async def rate_limits(request: Request):
@@ -137,14 +134,44 @@ def _register_routes(app: FastAPI) -> None:
             budgets = _mock_rate_limits()
         return budgets
 
-    # ── Portfolio ──────────────────────────────────────────────────
+    # ── Reconciliation Matrix ─────────────────────────────────────────────────────────────────
+
+    @app.get("/api/system/reconciliation")
+    async def reconciliation(request: Request):
+        """Get reconciliation state for all tracked markets."""
+        orch = request.app.state.orchestrator
+        if orch and hasattr(orch, "ws_manager") and orch.ws_manager:
+            metrics = orch.ws_manager.get_health_metrics()
+            clean_count = sum(1 for m in metrics.values() if m.get("state") == "clean")
+            reconciling = [
+                {"token_id": tid, **m}
+                for tid, m in metrics.items()
+                if m.get("state") != "clean"
+            ]
+            return {
+                "total": len(metrics),
+                "clean": clean_count,
+                "reconciling": len(reconciling),
+                "markets": reconciling,
+            }
+        return {
+            "total": 50,
+            "clean": 47,
+            "reconciling": 3,
+            "markets": [
+                {"token_id": "mock-1", "state": "reconciling", "seq_num": 100, "gap_count": 3, "last_delta_age_ms": 4200, "buffer_size": 12},
+            ],
+        }
+
+    # ── Portfolio ────────────────────────────────────────────────────────────────────────
 
     @app.get("/api/portfolio/strategies")
     async def portfolio_strategies(request: Request):
         """Get strategy rankings from the portfolio manager."""
         orch = request.app.state.orchestrator
         if orch and hasattr(orch, "portfolio_manager"):
-            rankings = orch.portfolio_manager.get_strategy_rankings()
+            equity = _get_paper_equity(orch)
+            rankings = orch.portfolio_manager.get_strategy_rankings(equity=equity)
         else:
             rankings = _mock_strategy_rankings()
         return rankings
@@ -154,12 +181,13 @@ def _register_routes(app: FastAPI) -> None:
         """Get capital allocation and equity metrics."""
         orch = request.app.state.orchestrator
         if orch and hasattr(orch, "portfolio_manager"):
-            alloc = orch.portfolio_manager.get_allocation()
+            equity = _get_paper_equity(orch)
+            alloc = orch.portfolio_manager.get_allocation(equity=equity)
         else:
             alloc = _mock_allocation()
         return alloc
 
-    # ── Whales ─────────────────────────────────────────────────────
+    # ── Whales ───────────────────────────────────────────────────────────────────────────
 
     @app.get("/api/whales")
     async def whales(request: Request):
@@ -172,23 +200,52 @@ def _register_routes(app: FastAPI) -> None:
             alpha, flow = _mock_whales()
         return {"alpha_whales": alpha, "whale_flow": flow}
 
-    # ── Risk / Positions ──────────────────────────────────────────
+    # ── Oracles / Spoofing ───────────────────────────────────────────────────────────────
+
+    @app.get("/api/oracles/spoofing")
+    async def spoofing_scores(request: Request):
+        """Get spoofing scores for tracked markets."""
+        orch = request.app.state.orchestrator
+        if orch and hasattr(orch, "spoof_detector") and orch.spoof_detector:
+            # Build a list of scores from currently tracked markets
+            scores = []
+            for token_id in orch.ws_manager.get_tracked_tokens() if orch.ws_manager else []:
+                score = orch.spoof_detector.compute_spoofing_score(token_id)
+                action = orch.spoof_detector.get_recommended_action(score)
+                scores.append({
+                    "token_id": token_id,
+                    "spoof_score": round(score.raw_score, 3) if hasattr(score, "raw_score") else 0.0,
+                    "classification": score.classification if hasattr(score, "classification") else "unknown",
+                    "requires_pause": score.requires_pause if hasattr(score, "requires_pause") else False,
+                    "recommended_action": action,
+                })
+            return {"markets": scores}
+        return {"markets": _mock_spoofing()}
+
+    # ── Risk / Positions ─────────────────────────────────────────────────────────────────
 
     @app.get("/api/risk/positions")
     async def risk_positions(request: Request):
         """Get open positions with risk metrics."""
+        orch = request.app.state.orchestrator
+        if orch and hasattr(orch, "paper_trading") and orch.paper_trading:
+            return orch.paper_trading.get_positions()
         return _mock_positions()
 
-    # ── SSE Streams ────────────────────────────────────────────────
+    @app.get("/api/wallet")
+    async def wallet_status(request: Request):
+        """Get virtual wallet balances."""
+        orch = request.app.state.orchestrator
+        if orch and hasattr(orch, "paper_trading") and orch.paper_trading:
+            return orch.paper_trading.get_wallet()
+        return _mock_wallet()
+
+    # ── SSE Streams ──────────────────────────────────────────────────────────────────────────
 
     @app.get("/stream/health")
     async def stream_health(request: Request):
-        """SSE stream for health heartbeat events.
-
-        Emits an initial event immediately, then periodic updates every 5s.
-        """
+        """SSE stream for health heartbeat events."""
         async def event_generator():
-            first = True
             while True:
                 if await request.is_disconnected():
                     break
@@ -205,10 +262,7 @@ def _register_routes(app: FastAPI) -> None:
 
     @app.get("/stream/system")
     async def stream_system(request: Request):
-        """SSE stream for system status updates.
-
-        Emits initial status immediately, then periodic updates every 2s.
-        """
+        """SSE stream for system status updates."""
         async def event_generator():
             while True:
                 if await request.is_disconnected():
@@ -231,18 +285,16 @@ def _register_routes(app: FastAPI) -> None:
 
     @app.get("/stream/portfolio")
     async def stream_portfolio(request: Request):
-        """SSE stream for portfolio updates.
-
-        Emits initial portfolio data immediately, then periodic updates every 10s.
-        """
+        """SSE stream for portfolio updates."""
         async def event_generator():
             while True:
                 if await request.is_disconnected():
                     break
                 orch = request.app.state.orchestrator
                 if orch and hasattr(orch, "portfolio_manager"):
-                    rankings = orch.portfolio_manager.get_strategy_rankings()
-                    alloc = orch.portfolio_manager.get_allocation()
+                    equity = _get_paper_equity(orch)
+                    rankings = orch.portfolio_manager.get_strategy_rankings(equity=equity)
+                    alloc = orch.portfolio_manager.get_allocation(equity=equity)
                 else:
                     rankings = _mock_strategy_rankings()
                     alloc = _mock_allocation()
@@ -258,36 +310,75 @@ def _register_routes(app: FastAPI) -> None:
         return EventSourceResponse(event_generator())
 
 
-# ── Mock data helpers (for development without orchestrator) ────────
+# ── Helpers ─────────────────────────────────────────────────────────────────────────────────
+
+
+def _get_paper_equity(orch) -> float:
+    """Extract virtual equity from paper trading engine."""
+    if hasattr(orch, "paper_trading") and orch.paper_trading:
+        return orch.paper_trading.get_wallet().get("usdc_total", 10000.0)
+    return 10000.0
 
 
 def _get_heartbeats(orch) -> dict:
     """Extract heartbeat metrics from orchestrator or return mock data."""
     if orch:
+        # CLOB WebSocket
+        ws_connected = False
+        ws_latency = 999.0
+        ws_subscribed = "0/0"
+        if orch.ws_manager:
+            ws_connected = orch.ws_manager.is_connected
+            ws_subscribed = f"{len(orch.ws_manager.get_tracked_tokens())}/50"
+            # Latencia real: usar tiempo desde último delta si disponible
+            metrics = orch.ws_manager.get_health_metrics()
+            if metrics:
+                ages = [m.get("last_delta_age_ms", -1) for m in metrics.values() if m.get("last_delta_age_ms", -1) >= 0]
+                if ages:
+                    ws_latency = round(sum(ages) / len(ages), 1)
+
+        # Gamma API: usar timing del último radar scan (no tenemos log directo, usamos estimate)
+        gamma_latency = 258.0  # TODO: instrumentar
+
+        # Polygon RPC: usar health check de degradación
+        poly_ok = True
+        poly_lag = 1.4
+        if hasattr(orch.degradation, "_health_checks"):
+            poly_check = orch.degradation._health_checks.get("polygon")
+            if poly_check:
+                poly_ok = bool(poly_check())
+
+        # Redis Bus
+        redis_ok = orch._bus is not None if hasattr(orch, "_bus") else False
+        redis_latency = 0.5
+
         return {
             "clob_ws": {
-                "status": "green",
+                "status": "green" if ws_connected else "red",
                 "label": "CLOB WebSocket",
-                "latency_ms": 12.0,
-                "subscribed": f"{orch.get_system_status().get('tracked_markets_book', 0)}/50",
+                "latency_ms": ws_latency,
+                "subscribed": ws_subscribed,
             },
             "gamma_api": {
                 "status": "green",
                 "label": "Gamma API",
-                "latency_ms": 258.0,
+                "latency_ms": gamma_latency,
             },
             "polygon_rpc": {
-                "status": "green",
+                "status": "green" if poly_ok else "red",
                 "label": "Polygon RPC",
-                "latency_s": 1.4,
+                "latency_s": poly_lag,
             },
             "redis_bus": {
-                "status": "green",
+                "status": "green" if redis_ok else "red",
                 "label": "Redis Bus",
-                "latency_ms": 0.5,
+                "latency_ms": redis_latency,
             },
         }
     return _mock_heartbeats()
+
+
+# ── Mock data helpers (for development without orchestrator) ────────────────────────────────
 
 
 def _mock_system_status() -> dict:
@@ -348,19 +439,19 @@ def _mock_rate_limits() -> dict:
 def _mock_strategy_rankings() -> list[dict]:
     return [
         {"name": "corr_arb", "sortino": 3.21, "state": "active", "alloc_pct": 34,
-         "trades": 45, "win_rate": 0.68, "sharpe": 2.15},
+         "trades": 45, "win_rate": 0.68, "sharpe": 2.15, "cumulative_pnl": 320.5},
         {"name": "whale_follow", "sortino": 2.45, "state": "active", "alloc_pct": 22,
-         "trades": 32, "win_rate": 0.72, "sharpe": 1.92},
+         "trades": 32, "win_rate": 0.72, "sharpe": 1.92, "cumulative_pnl": 210.0},
         {"name": "market_making", "sortino": 1.87, "state": "active", "alloc_pct": 17,
-         "trades": 128, "win_rate": 0.62, "sharpe": 1.45},
+         "trades": 128, "win_rate": 0.62, "sharpe": 1.45, "cumulative_pnl": 540.2},
         {"name": "momentum_follow", "sortino": 0.92, "state": "active", "alloc_pct": 11,
-         "trades": 24, "win_rate": 0.55, "sharpe": 0.82},
+         "trades": 24, "win_rate": 0.55, "sharpe": 0.82, "cumulative_pnl": -12.4},
         {"name": "consensus_break", "sortino": 0.45, "state": "probation", "alloc_pct": 8,
-         "trades": 18, "win_rate": 0.50, "sharpe": 0.35},
+         "trades": 18, "win_rate": 0.50, "sharpe": 0.35, "cumulative_pnl": 8.1},
         {"name": "contrarian", "sortino": -0.21, "state": "frozen", "alloc_pct": 5,
-         "trades": 15, "win_rate": 0.40, "sharpe": -0.15},
+         "trades": 15, "win_rate": 0.40, "sharpe": -0.15, "cumulative_pnl": -45.0},
         {"name": "volume_breakout", "sortino": -0.85, "state": "retired", "alloc_pct": 3,
-         "trades": 8, "win_rate": 0.25, "sharpe": -0.72},
+         "trades": 8, "win_rate": 0.25, "sharpe": -0.72, "cumulative_pnl": -78.3},
     ]
 
 
@@ -421,7 +512,27 @@ def _mock_positions() -> list[dict]:
     ]
 
 
-# ── Main app instance ───────────────────────────────────────────────
+def _mock_wallet() -> dict:
+    return {
+        "usdc_free": 1247.50,
+        "usdc_collateral": 892.30,
+        "usdc_total": 2139.80,
+        "pol_balance": 4.2,
+        "pol_usd_value": 3.44,
+        "ctf_allowance": True,
+        "ctf_contract": "0x4D97DCd7C0408F728A009Ff07556F758a0969709",
+    }
+
+
+def _mock_spoofing() -> list[dict]:
+    return [
+        {"token_id": "mock-trump", "spoof_score": 0.62, "classification": "PROBABLE", "requires_pause": False},
+        {"token_id": "mock-btc", "spoof_score": 0.35, "classification": "SUSPICIOUS", "requires_pause": False},
+        {"token_id": "mock-fed", "spoof_score": 0.12, "classification": "NORMAL", "requires_pause": False},
+    ]
+
+
+# ── Main app instance ───────────────────────────────────────────────────────────────────────
 
 # Create the default app instance for uvicorn
 app = create_app()

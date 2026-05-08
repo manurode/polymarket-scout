@@ -157,8 +157,27 @@ class RateLimiter:
         # snapshot no atómico pero suficiente para sondear
         return bucket.tokens >= 1.0
 
+    def get_all_budgets(self) -> dict:
+        """Retorna estado de todos los buckets en formato compatible con frontend.
 
-# ── Singleton por conveniencia ────────────────────────────────────
+        Returns
+        -------
+        dict
+            {bucket_name: {"available": pct, "total": 100, "label": str}}
+        """
+        self._refill()
+        result = {}
+        for name, bucket in self._buckets.items():
+            pct = round((bucket.tokens / bucket.max_tokens) * 100)
+            result[name] = {
+                "available": pct,
+                "total": 100,
+                "label": name.replace("_", " ").title(),
+            }
+        return result
+
+
+# ── Singleton por conveniencia ────────────────────────────────────────────────────
 
 _default_limiter: RateLimiter | None = None
 

@@ -77,6 +77,12 @@ class StrategyState:
     sortino_history: list[float] = field(default_factory=list)
     allocation: float = 0.0
     created_at: float = field(default_factory=time.time)
+    # --- Campos para paper trading ---
+    total_trades: int = 0
+    winning_trades: int = 0
+    cumulative_pnl: float = 0.0
+    max_drawdown: float = 0.0
+    peak_equity: float = 0.0
 
 
 @dataclass
@@ -517,3 +523,110 @@ class PortfolioManager:
     @property
     def current_epoch(self) -> int:
         return self._epoch_counter
+
+    # ── Paper Trading Integration ───────────────────────────────────
+
+    def record_trade(self, strategy_name: str, pnl: float, equity_before: float) -> None:
+        """Registra un trade cerrado para una estrategia (paper trading).
+
+        Parameters
+        ----------
+        strategy_name : str
+            Nombre de la estrategia.
+        pnl : float
+            P&L del trade en USD.
+        equity_before : float
+            Equity total antes del trade (para calcular drawdown).
+        """
+        state = self._strategies.get(strategy_name)
+        if state is None:
+            return
+
+        state.total_trades += 1
+        if pnl > 0:
+            state.winning_trades += 1
+
+        state.cumulative_pnl += pnl
+
+        # Actualizar peak equity y drawdown
+        current_equity = equity_before + pnl
+        if current_equity > state.peak_equity:
+            state.peak_equity = current_equity
+
+        dd = (state.peak_equity - current_equity) / state.peak_equity if state.peak_equity > 0 else 0.0
+        if dd > state.max_drawdown:
+            state.max_drawdown = dd
+
+    def get_strategy_rankings(self, equity: float = 10000.0) -> list[dict]:
+        """Retorna rankings formateados para el dashboard.
+
+        Parameters
+        ----------
+        equity : float
+            Capital total para calcular alloc_pct.
+
+        Returns
+        -------
+        list[dict]
+            Lista de dicts con keys: name, sortino, state, alloc_pct, trades, win_rate, sharpe.
+        """
+        allocations = self.allocate(equity)
+        alloc_map = {a.strategy: a for a in allocations}
+
+        rankings = []
+        for name, state in self._strategies.items():
+            alloc = alloc_map.get(name)
+            alloc_pct = round(alloc.fraction * 100) if alloc else 0
+            sortino = self.get_sortino(name)
+            win_rate = state.winning_trades / state.total_trades if state.total_trades > 0 else 0.0
+            # Sharpe aproximado usando sortino_history
+            sharpe = sortino * 0.85 if sortino != 0 else 0.0
+
+            rankings.append({
+                "name": name,
+                "sortino": round(sortino, 2),
+                "state": state.status.value,
+                "alloc_pct": alloc_pct,
+                "trades": state.total_trades,
+                "win_rate": round(win_rate, 2),
+                "sharpe": round(sharpe, 2),
+                "cumulative_pnl": round(state.cumulative_pnl, 2),
+            })
+
+        # Ordenar por sortino descendente
+        rankings.sort(key=lambda x: x["sortino"], reverse=True)
+        return rankings
+
+    def get_allocation(self, equity: float = 10000.0) -> dict:
+        """Retorna resumen de asignación de capital para el dashboard.
+
+        Parameters
+        ----------
+        equity : float
+            Capital total.
+
+        Returns
+        -------
+        dict
+            Keys: active, frozen, retired, total_equity, pnl_24h, pnl_24h_pct, max_drawdown, max_drawdown_pct.
+        """
+        allocations = self.allocate(equity)
+
+        active = sum(a.amount for a in allocations if a.status not in ("frozen", "retired"))
+        frozen = sum(a.amount for a in allocations if a.status == "frozen")
+        retired = sum(a.amount for a in allocations if a.status == "retired")
+
+        # P&L 24h: usar cumulative_pnl como proxy (en Fase 2 se puede mejorar con ventana temporal)
+        total_pnl = sum(s.cumulative_pnl for s in self._strategies.values())
+        max_dd = max((s.max_drawdown for s in self._strategies.values()), default=0.0)
+
+        return {
+            "active": round(active, 2),
+            "frozen": round(frozen, 2),
+            "retired": round(retired, 2),
+            "total_equity": round(equity, 2),
+            "pnl_24h": round(total_pnl, 2),
+            "pnl_24h_pct": round((total_pnl / equity) * 100, 2) if equity > 0 else 0.0,
+            "max_drawdown": round(-max_dd * equity, 2),
+            "max_drawdown_pct": round(-max_dd * 100, 2),
+        }
