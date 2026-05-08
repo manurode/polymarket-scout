@@ -39,6 +39,7 @@ from src.whale_tracker import WhaleTracker
 from src.degradation import DegradationManager, SystemMode
 from src.redis_bus import MessageBus, create_message_bus
 from src.paper_trading import PaperTradingEngine
+from src.signal_pipeline import SignalPipeline
 
 logger = logging.getLogger(__name__)
 
@@ -98,12 +99,15 @@ class ScoutOrchestrator:
         self.portfolio_manager = PortfolioManager(strategies=strategies)
         self.whale_tracker = WhaleTracker()
 
-        # ── Phase 6: Paper Trading ───────────────────────────────────────────────
+        # ── Phase 6: Paper Trading ────────────────────────────────────────
         self.paper_trading = PaperTradingEngine(
             portfolio_manager=self.portfolio_manager,
             initial_usdc=config.get("paper_trading", {}).get("initial_usdc", 10000.0),
             initial_pol=config.get("paper_trading", {}).get("initial_pol", 100.0),
         )
+
+        # ── Signal Pipeline ────────────────────────────────────────────────
+        self.signal_pipeline = SignalPipeline()
 
         # ── Phase 5: Resilience ───────────────────────────────────────────────
         self.degradation = DegradationManager()
@@ -114,6 +118,7 @@ class ScoutOrchestrator:
         self._last_radar_elapsed_ms = 0.0
         self._timings: dict[str, float] = {}
         self._market_prices: dict[str, float] = {}  # market_name → price
+        self._last_radar_snapshots: list[dict] = []
 
     # ── Lifecycle ─────────────────────────────────────────────────
 
@@ -228,6 +233,9 @@ class ScoutOrchestrator:
                     price = snap.get("price_yes")
                     if name and price is not None:
                         self._market_prices[name.lower()] = float(price)
+
+                # ── Guardar snapshots para el signal pipeline ──
+                self._last_radar_snapshots = snapshots
 
                 logger.info(
                     "Radar: %d mercados escaneados, Top %d ranked (%dms)",
@@ -361,54 +369,100 @@ class ScoutOrchestrator:
             await asyncio.sleep(PAPER_AUTO_CLOSE_INTERVAL)
 
     async def _paper_signal_loop(self) -> None:
-        """Genera señales de trading periódicas para demostración del paper trading.
+        """Pipeline de señales real: usa el SignalPipeline para generar entradas
+        basadas en datos del radar (momentum, mean reversion, volume breakout).
 
-        En producción real, las señales vienen del pipeline de strategies.
-        Este loop simula un flujo realista de oportunidades.
+        Reemplaza el sistema anterior de señales aleatorias con demo markets.
         """
-        logger.info("PaperTrading signal daemon iniciado")
-
-        # Mercados de demostración
-        demo_markets = [
-            ("Trump wins 2028?", "momentum_follow", 0.62, 0.75, "YES"),
-            ("BTC > $100K Dec?", "correlation_arb", 0.45, 0.60, "NO"),
-            ("Fed cuts rates?", "whale_follow", 0.55, 0.50, "YES"),
-            ("Crypto bull market?", "market_making", 0.70, 0.65, "NO"),
-            ("S&P 500 ATH Q3?", "momentum_follow", 0.35, 0.40, "YES"),
-            ("Oil price > $80?", "contrarian", 0.80, 0.75, "NO"),
-        ]
+        logger.info("PaperTrading signal pipeline iniciado")
 
         while self._running:
             try:
-                # Abrir una posición aleatoria si hay liquidez y pocas posiciones abiertas
-                if self.paper_trading.open_position_count < 6 and self.paper_trading.wallet.usdc_free > 200:
-                    market, strategy, entry, _, side = random.choice(demo_markets)
-                    # Tamaño Kelly simulado
-                    edge = random.uniform(0.02, 0.08)
+                # Esperar a tener suficiente historial de precios
+                if self.signal_pipeline.get_history_size() < 5:
+                    await asyncio.sleep(5)
+                    continue
+
+                # Solo abrir si hay liquidez y margen
+                max_positions = 6
+                if self.paper_trading.open_position_count >= max_positions:
+                    await asyncio.sleep(5)
+                    continue
+
+                if self.paper_trading.wallet.usdc_free < 200:
+                    await asyncio.sleep(10)
+                    continue
+
+                # Generar señales del pipeline (usa el último scan procesado)
+                # El radar loop ya alimenta _market_prices; el pipeline se alimenta
+                # a través de update_history que se llama desde generate()
+                # Necesitamos pasarle los snapshots más recientes
+                snapshots = getattr(self, '_last_radar_snapshots', [])
+                if not snapshots:
+                    await asyncio.sleep(5)
+                    continue
+
+                signals = self.signal_pipeline.generate(snapshots, cooldown_s=300)
+
+                if not signals:
+                    await asyncio.sleep(10)
+                    continue
+
+                # Ejecutar las señales (máximo 2 por ciclo)
+                executed = 0
+                for sig in signals:
+                    if executed >= 2:
+                        break
+
+                    strategy = sig.strategy
+                    market = sig.question[:60]
+                    entry = sig.entry_price
+                    side = sig.side
+
+                    if entry <= 0.01 or entry >= 0.99:
+                        continue  # precio extremo
+
+                    # Kelly position sizing
+                    edge = abs(sig.confidence * 0.08)  # confianza → edge estimado
                     kelly = self.portfolio_manager.position_size(
                         strategy_name=strategy,
                         edge=edge,
                         price=entry,
                         equity=self.paper_trading.wallet.usdc_total,
                     )
-                    size = min(kelly.size_final, self.paper_trading.wallet.usdc_free * 0.15)
-                    if size > 50:
-                        tau = random.uniform(10, 80)
-                        toxicity = random.uniform(0.05, 0.4)
-                        await self.paper_trading.open_position(
-                            strategy=strategy,
-                            market=market,
-                            side=side,
-                            size=size,
-                            entry=entry,
-                            tau_pct=tau,
-                            toxicity=toxicity,
+                    size = min(kelly.size_final, self.paper_trading.wallet.usdc_free * 0.10)
+
+                    if size < 50:
+                        continue  # demasiado pequeño
+
+                    tau = random.uniform(10, 60)
+                    toxicity = random.uniform(0.05, 0.3)
+
+                    pos = await self.paper_trading.open_position(
+                        strategy=strategy,
+                        market=market,
+                        side=side,
+                        size=size,
+                        entry=entry,
+                        tau_pct=tau,
+                        toxicity=toxicity,
+                    )
+
+                    if pos:
+                        executed += 1
+                        logger.info(
+                            "PaperTrade SIGNAL [%s] %s %s %s @ $%.3f size=$%.2f conf=%.2f (%s)",
+                            strategy, side, market[:50], entry, size, sig.confidence, sig.reason,
                         )
-                        logger.info("PaperTrade SIGNAL: %s %s %s size=$%.2f", strategy, side, market, size)
+
+                if executed > 0:
+                    logger.info("PaperTrade: %d señales ejecutadas de %d generadas", executed, len(signals))
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error("Error en paper signal loop: %s", e)
+
             await asyncio.sleep(PAPER_SIGNAL_INTERVAL)
 
     # ── Trading Pipeline ──────────────────────────────────────────────────────────────────────────────
