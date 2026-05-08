@@ -217,13 +217,13 @@ def _register_routes(app: FastAPI) -> None:
                 markets = []
                 for snap in snapshots[:20]:  # Top 20
                     markets.append({
-                        "condition_id": snap.condition_id,
-                        "question": snap.question[:80] + "..." if len(snap.question) > 80 else snap.question,
-                        "volume_24h": snap.volume_24h,
-                        "liquidity": snap.liquidity,
-                        "spread": round(snap.best_ask - snap.best_bid, 4) if snap.best_ask and snap.best_bid else None,
-                        "mid_price": round((snap.best_ask + snap.best_bid) / 2, 4) if snap.best_ask and snap.best_bid else None,
-                        "timestamp": snap.timestamp,
+                        "condition_id": snap.get("condition_id", ""),
+                        "question": (snap.get("question", "")[:80] + "...") if len(snap.get("question", "")) > 80 else snap.get("question", ""),
+                        "volume_24h": snap.get("volume", 0),
+                        "liquidity": snap.get("liquidity", 0),
+                        "spread": snap.get("spread"),
+                        "mid_price": snap.get("price_yes"),
+                        "timestamp": snap.get("timestamp", 0),
                     })
                 return {"markets": markets, "count": len(markets), "source": "gamma_api"}
             except Exception as e:
