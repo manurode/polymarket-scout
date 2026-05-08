@@ -200,6 +200,57 @@ def _register_routes(app: FastAPI) -> None:
             alpha, flow = _mock_whales()
         return {"alpha_whales": alpha, "whale_flow": flow}
 
+    # ── Markets / Radar ─────────────────────────────────────────────────────────────────
+
+    @app.get("/api/markets/radar")
+    async def markets_radar(request: Request):
+        """Get current radar scan results from Gamma API."""
+        orch = request.app.state.orchestrator
+        if orch and hasattr(orch, "scanner") and orch.scanner:
+            # Get markets from the last radar scan
+            try:
+                snapshots = await orch.scanner.radar_scan(
+                    events_limit=50,
+                    markets_per_event=5,
+                    min_volume=1000,
+                )
+                markets = []
+                for snap in snapshots[:20]:  # Top 20
+                    markets.append({
+                        "condition_id": snap.condition_id,
+                        "question": snap.question[:80] + "..." if len(snap.question) > 80 else snap.question,
+                        "volume_24h": snap.volume_24h,
+                        "liquidity": snap.liquidity,
+                        "spread": round(snap.best_ask - snap.best_bid, 4) if snap.best_ask and snap.best_bid else None,
+                        "mid_price": round((snap.best_ask + snap.best_bid) / 2, 4) if snap.best_ask and snap.best_bid else None,
+                        "timestamp": snap.timestamp,
+                    })
+                return {"markets": markets, "count": len(markets), "source": "gamma_api"}
+            except Exception as e:
+                logger.error("Error fetching radar markets: %s", e)
+                return {"markets": [], "count": 0, "error": str(e), "source": "error"}
+        return {"markets": [], "count": 0, "source": "no_scanner"}
+
+    @app.get("/api/markets/tracked")
+    async def markets_tracked(request: Request):
+        """Get WebSocket-tracked markets with live prices."""
+        orch = request.app.state.orchestrator
+        if orch and hasattr(orch, "ws_manager") and orch.ws_manager:
+            tokens = orch.ws_manager.get_tracked_tokens()
+            metrics = orch.ws_manager.get_health_metrics()
+            markets = []
+            for token_id in list(tokens)[:10]:  # First 10
+                m = metrics.get(token_id, {})
+                markets.append({
+                    "token_id": token_id,
+                    "last_delta_age_ms": m.get("last_delta_age_ms", -1),
+                    "buffer_size": m.get("buffer_size", 0),
+                    "seq_num": m.get("seq_num", 0),
+                    "state": m.get("state", "unknown"),
+                })
+            return {"markets": markets, "count": len(markets), "ws_connected": orch.ws_manager.is_connected}
+        return {"markets": [], "count": 0, "ws_connected": False}
+
     # ── Oracles / Spoofing ───────────────────────────────────────────────────────────────
 
     @app.get("/api/oracles/spoofing")
