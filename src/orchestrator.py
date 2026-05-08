@@ -108,9 +108,29 @@ class ScoutOrchestrator:
         # ── Phase 5: Resilience ───────────────────────────────────────────────
         self.degradation = DegradationManager()
 
-        # ── State ────────────────────────────────────────────────────────────────────────────
+        # ── State ────────────────────────────────────────────────────────────────────────────────
         self._running = False
         self._tasks: list[asyncio.Task] = []
+        self._last_radar_elapsed_ms = 0.0
+        self._timings: dict[str, float] = {}
+
+        # ── System Status ──────────────────────────────────────────────────
+
+    def get_system_status(self) -> dict:
+        """Retorna estado completo del sistema para el dashboard."""
+        return {
+            "mode": self.degradation.get_mode().value,
+            "degradation_metrics": self.degradation.get_degradation_metrics(),
+            "tracked_markets_book": len(self.ws_manager.get_tracked_tokens()) if self.ws_manager else 0,
+            "tracked_markets_trades": len(self.ws_manager.get_tracked_tokens()) if self.ws_manager else 0,
+            "portfolio_epoch": self.portfolio_manager.current_epoch,
+            "active_strategies": [
+                name for name, s in self.portfolio_manager._strategies.items()
+                if s.status.value == "active"
+            ] if self.portfolio_manager else [],
+            "alpha_whales": len(self.whale_tracker.get_alpha_whales()) if self.whale_tracker else 0,
+            "websocket_connected": self.ws_manager.is_connected if self.ws_manager else False,
+        }
 
     # ── Lifecycle ─────────────────────────────────────────────────
 
@@ -217,6 +237,7 @@ class ScoutOrchestrator:
                 ranked = self.selection_engine.rank(snapshots)
 
                 elapsed_ms = (time.monotonic() - t0) * 1000
+                self._last_radar_elapsed_ms = elapsed_ms
                 logger.info(
                     "Radar: %d mercados escaneados, Top %d ranked (%dms)",
                     len(snapshots), len(ranked.top), int(elapsed_ms),

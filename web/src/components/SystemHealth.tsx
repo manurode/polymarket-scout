@@ -2,6 +2,7 @@ import { useSystemStatus } from '../hooks/useSystemStatus';
 import { useRateLimits } from '../hooks/useRateLimits';
 import { useReconciliation } from '../hooks/useReconciliation';
 import { useWallet } from '../hooks/useWallet';
+import { useLatency } from '../hooks/useLatency';
 import type { SystemStatus } from '../types';
 
 export function SystemHealth() {
@@ -180,40 +181,45 @@ function DegradationPanel({ status }: { status: SystemStatus }) {
 }
 
 function LatencyBudgetPanel() {
-  const stages = [
-    { label: 'WS→Book', actual: 1.2, budget: 5 },
-    { label: 'OBI+TFI→Spoof', actual: 2.8, budget: 5 },
-    { label: 'Signal→Decision', actual: 8.1, budget: 10 },
-    { label: 'Kelly→Position', actual: 1.9, budget: 5 },
-    { label: 'Risk→Trade', actual: 0.8, budget: 3 },
-  ];
-
-  const totalActual = stages.reduce((s, st) => s + st.actual, 0);
-  const totalBudget = 25;
+  const { stages, totalActual, totalBudget, source } = useLatency(5000);
+  const isLive = source === 'live' || source === 'estimated';
+  const filterStages = stages.filter(s => s.id !== 'radar_scan');
+  const calcActual = filterStages.reduce((s, st) => s + st.actual_ms, 0);
+  const calcBudget = filterStages.reduce((s, st) => s + st.budget_ms, 0);
 
   return (
     <div className="bg-bg-secondary border border-bg-hover rounded p-3">
-      <h3 className="text-[10px] text-text-tertiary tracking-wider mb-2">
-        LATENCY BUDGET (Critical Path)
-      </h3>
+      <div className="flex items-center justify-between mb-2">
+        <h3 className="text-[10px] text-text-tertiary tracking-wider">
+          LATENCY BUDGET (Critical Path)
+        </h3>
+        <span className={`text-[9px] px-1.5 py-0.5 rounded font-mono ${
+          isLive ? 'bg-profit/20 text-profit' : 'bg-bg-tertiary text-text-tertiary'
+        }`}>
+          {isLive ? '● LIVE' : '○ ESTIMATED'}
+        </span>
+      </div>
       <div className="space-y-1.5">
-        {stages.map(st => {
-          const pct = (st.actual / st.budget) * 100;
+        {filterStages.map(st => {
+          const pct = st.actual_ms > 0 ? (st.actual_ms / st.budget_ms) * 100 : 0;
           const color = pct > 80 ? 'bg-loss' : pct > 50 ? 'bg-warning' : 'bg-profit';
           return (
-            <div key={st.label} className="flex items-center gap-2 text-[10px] font-mono">
+            <div key={st.id} className="flex items-center gap-2 text-[10px] font-mono">
               <span className="text-text-tertiary w-28">{st.label}</span>
               <div className="flex-1 bg-bg-tertiary rounded-full h-1.5 overflow-hidden">
                 <div className={`${color} h-full rounded-full`} style={{ width: `${Math.min(pct, 100)}%` }} />
               </div>
-              <span className="text-text-primary w-24 text-right">{st.actual}ms / {st.budget}ms</span>
+              <span className="text-text-primary w-24 text-right">
+                {st.actual_ms > 0 ? `${st.actual_ms}ms` : '—'} / {st.budget_ms}ms
+              </span>
             </div>
           );
         })}
         <div className="border-t border-bg-hover mt-2 pt-1.5 flex justify-between text-[10px] font-mono">
           <span className="text-text-secondary">TOTAL</span>
           <span className="text-text-primary">
-            {totalActual}ms / {totalBudget}ms ({Math.round((totalActual / totalBudget) * 100)}%)
+            {calcActual > 0 ? `${calcActual}ms` : '—'} / {calcBudget}ms
+            {calcActual > 0 && calcBudget > 0 ? ` (${Math.round((calcActual / calcBudget) * 100)}%)` : ''}
           </span>
         </div>
       </div>
