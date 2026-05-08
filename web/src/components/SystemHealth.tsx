@@ -12,14 +12,19 @@ export function SystemHealth() {
 
   return (
     <div className="p-4 space-y-4">
-      {/* ── Section Header ────────────────────────────────────── */}
+      {/* ── Section Header ───────────────────────────────────────────────────────────────────────────── */}
       <div className="flex items-center justify-between">
         <h2 className="text-sm font-bold tracking-wider text-text-primary">
           SYSTEM HEALTH
         </h2>
-        <span className="text-[10px] text-text-tertiary font-mono">
-          WS: {status.websocket_connected ? 'connected' : 'down'} · {status.tracked_markets_book} markets
-        </span>
+        <div className="flex items-center gap-3">
+          <span className="text-[10px] px-2 py-0.5 rounded-full font-mono bg-profit/20 text-profit border border-profit/30">
+            ● LIVE CONNECTIONS
+          </span>
+          <span className="text-[10px] text-text-tertiary font-mono">
+            WS: {status.websocket_connected ? 'connected' : 'down'} · {status.tracked_markets_book} markets
+          </span>
+        </div>
       </div>
 
       {/* ── Heartbeats + Rate Limits ──────────────────────────── */}
