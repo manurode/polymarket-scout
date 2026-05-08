@@ -1,18 +1,91 @@
 import { useWhales } from '../hooks/useWhales';
 import { useSpoofing } from '../hooks/useSpoofing';
+import { useRadarMarkets } from '../hooks/useRadarMarkets';
 
 export function OracleRadar() {
   const { alphaWhales, whaleFlow, loading, error } = useWhales();
   const { data: spoofData } = useSpoofing(10000);
+  const radarData = useRadarMarkets(30000);
 
   // Tomar el primer mercado con spoofing para el detalle, o defaults
   const detailMarket = spoofData.markets[0] || { token_id: 'N/A', spoof_score: 0, classification: 'NORMAL', requires_pause: false };
 
+  const isLiveData = radarData.source === 'gamma_api';
+
   return (
     <div className="p-4 space-y-4">
-      <h2 className="text-sm font-bold tracking-wider text-text-primary">
-        ORACLE RADAR
-      </h2>
+      <div className="flex items-center justify-between">
+        <h2 className="text-sm font-bold tracking-wider text-text-primary">
+          ORACLE RADAR
+        </h2>
+        <div className="flex items-center gap-2">
+          <span className={`text-[10px] px-2 py-0.5 rounded-full font-mono ${
+            isLiveData ? 'bg-profit/20 text-profit' : 'bg-warning/20 text-warning'
+          }`}>
+            {isLiveData ? '● LIVE DATA' : `○ ${radarData.source.toUpperCase()}`}
+          </span>
+        </div>
+      </div>
+
+      {/* ── Live Markets from Radar ──────────────────────────────────────────────────── */}
+      <div className="bg-bg-secondary border border-bg-hover rounded p-3">
+        <div className="flex items-center justify-between mb-2">
+          <h3 className="text-[10px] text-text-tertiary tracking-wider">
+            UPCOMING HEATMAP (Markets from Gamma API)
+          </h3>
+          <span className="text-[9px] text-text-tertiary font-mono">
+            {radarData.count} markets
+          </span>
+        </div>
+        {radarData.count > 0 ? (
+          <div className="overflow-x-auto">
+            <table className="w-full text-[10px] font-mono">
+              <thead>
+                <tr className="text-text-tertiary border-b border-bg-hover">
+                  <th className="text-left py-1 pr-2">Market</th>
+                  <th className="text-right py-1 pr-2">Price</th>
+                  <th className="text-right py-1 pr-2">Spread</th>
+                  <th className="text-right py-1 pr-2">Volume 24h</th>
+                  <th className="text-right py-1">Liquidity</th>
+                </tr>
+              </thead>
+              <tbody>
+                {radarData.markets.slice(0, 8).map((m, i) => (
+                  <tr key={i} className="border-b border-bg-hover/30 hover:bg-bg-hover/30 transition-colors">
+                    <td className="py-1.5 pr-2 text-text-primary truncate max-w-[200px]" title={m.question}>
+                      {m.question}
+                    </td>
+                    <td className="py-1.5 pr-2 text-right text-text-secondary">
+                      {m.mid_price ? `$${m.mid_price.toFixed(3)}` : 'N/A'}
+                    </td>
+                    <td className="py-1.5 pr-2 text-right">
+                      {m.spread ? (
+                        <span className={m.spread < 0.02 ? 'text-profit' : m.spread > 0.05 ? 'text-warning' : 'text-text-secondary'}>
+                          {(m.spread * 100).toFixed(2)}%
+                        </span>
+                      ) : 'N/A'}
+                    </td>
+                    <td className="py-1.5 pr-2 text-right text-text-secondary">
+                      ${(m.volume_24h / 1000).toFixed(1)}K
+                    </td>
+                    <td className="py-1.5 text-right text-text-secondary">
+                      ${m.liquidity.toFixed(0)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="text-center py-6 text-text-tertiary text-[11px]">
+            {radarData.error ? (
+              <span className="text-loss">⚠ {radarData.error}</span>
+            ) : (
+              'No markets available - scanner not connected'
+            )}
+          </div>
+        )}
+      </div>
 
       {/* ── Spoofing Heatmap ─────────────────────────────────────────────────────── */}
       <div className="grid grid-cols-2 gap-4">
