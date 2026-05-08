@@ -1,5 +1,6 @@
 import { usePortfolio } from '../hooks/usePortfolio';
-import type { StrategyRanking, StrategyState } from '../types';
+import { useSystemStatus } from '../hooks/useSystemStatus';
+import type { StrategyState } from '../types';
 
 const STATE_ICONS: Record<StrategyState, string> = {
   active: '●', probation: '◐', frozen: '⊘', retired: '⊗',
@@ -14,6 +15,7 @@ const STATE_CLASSES: Record<StrategyState, string> = {
 
 export function PortfolioArena() {
   const { strategies, allocation, loading, error } = usePortfolio(10000);
+  const status = useSystemStatus(10000);
 
   if (loading && strategies.length === 0) {
     return (
@@ -38,12 +40,12 @@ export function PortfolioArena() {
     );
   }
 
-  const epochNum = 3; // Would come from system status
+  const epochNum = status.portfolio_epoch || 0;
   const hasData = strategies.length > 0;
 
   return (
     <div className="p-4 space-y-4">
-      {/* ── Header ─────────────────────────────────────────────── */}
+      {/* ── Header ─────────────────────────────────────────────────────────────────── */}
       <div className="flex items-center justify-between">
         <h2 className="text-sm font-bold tracking-wider text-text-primary">
           PORTFOLIO ARENA
@@ -53,7 +55,7 @@ export function PortfolioArena() {
         </span>
       </div>
 
-      {/* ── Empty state ────────────────────────────────────────── */}
+      {/* ── Empty state ─────────────────────────────────────────────────── */}
       {!hasData && (
         <div className="bg-bg-secondary border border-bg-hover rounded p-8 text-center text-text-tertiary">
           No strategy data available — backend may be using mock data

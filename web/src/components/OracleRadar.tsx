@@ -1,9 +1,12 @@
 import { useWhales } from '../hooks/useWhales';
-import { useSystemStatus } from '../hooks/useSystemStatus';
+import { useSpoofing } from '../hooks/useSpoofing';
 
 export function OracleRadar() {
   const { alphaWhales, whaleFlow, loading, error } = useWhales();
-  const status = useSystemStatus(5000);
+  const { data: spoofData } = useSpoofing(10000);
+
+  // Tomar el primer mercado con spoofing para el detalle, o defaults
+  const detailMarket = spoofData.markets[0] || { token_id: 'N/A', spoof_score: 0, classification: 'NORMAL', requires_pause: false };
 
   return (
     <div className="p-4 space-y-4">
@@ -11,51 +14,40 @@ export function OracleRadar() {
         ORACLE RADAR
       </h2>
 
-      {/* ── Spoofing Heatmap ──────────────────────────────────── */}
+      {/* ── Spoofing Heatmap ─────────────────────────────────────────────────────── */}
       <div className="grid grid-cols-2 gap-4">
         <div className="bg-bg-secondary border border-bg-hover rounded p-3">
           <h3 className="text-[10px] text-text-tertiary tracking-wider mb-2">
             SPOOFING HEATMAP (Markets × Time)
           </h3>
           <div className="space-y-1.5">
-            <SpoofRow market="Trump wins 2028?" spoofScore={0.62} classification="PROBABLE" />
-            <SpoofRow market="BTC > $100K Dec?" spoofScore={0.35} classification="SUSPICIOUS" />
-            <SpoofRow market="Fed cuts rates?" spoofScore={0.12} classification="NORMAL" />
-            <SpoofRow market="Crypto bull market?" spoofScore={0.48} classification="SUSPICIOUS" />
-            <SpoofRow market="S&P 500 ATH Q3?" spoofScore={0.08} classification="NORMAL" />
-            <SpoofRow market="Oil price > $80?" spoofScore={0.71} classification="CONFIRMED" />
+            {spoofData.markets.length > 0 ? (
+              spoofData.markets.map((m, i) => (
+                <SpoofRow key={i} market={m.token_id} spoofScore={m.spoof_score} classification={m.classification} />
+              ))
+            ) : (
+              <div className="text-center py-4 text-text-tertiary text-[11px]">No spoofing data</div>
+            )}
           </div>
         </div>
 
-        {/* ── Spoof Detail ────────────────────────────────────── */}
+        {/* ── Spoof Detail ─────────────────────────────────────────────────────── */}
         <div className="bg-bg-secondary border border-bg-hover rounded p-3">
           <h3 className="text-[10px] text-text-tertiary tracking-wider mb-2">
-            SPOOF DETAIL — "Trump wins 2028?"
+            SPOOF DETAIL — "{detailMarket.token_id}"
           </h3>
           <div className="space-y-2 text-[11px] font-mono">
             <div className="flex justify-between">
-              <span className="text-text-tertiary">OBI</span>
-              <span className="text-profit">+0.62</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-text-tertiary">TFI</span>
-              <span className="text-text-primary">+0.15</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-text-tertiary">Divergence</span>
-              <span className="text-warning font-bold text-base">0.47</span>
-            </div>
-            <div className="flex justify-between">
               <span className="text-text-tertiary">Spoof Score</span>
-              <span className="text-warning">0.62 ◉ PROBABLE</span>
+              <span className={detailMarket.spoof_score >= 0.5 ? 'text-warning font-bold' : 'text-profit'}>
+                {detailMarket.spoof_score.toFixed(2)} {detailMarket.classification}
+              </span>
             </div>
             <div className="flex justify-between">
-              <span className="text-text-tertiary">Cancel Rate</span>
-              <span className="text-loss">3.2× avg ⚠</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-text-tertiary">Direction</span>
-              <span className="text-profit">▲ BUY (TFI)</span>
+              <span className="text-text-tertiary">Requires Pause</span>
+              <span className={detailMarket.requires_pause ? 'text-loss' : 'text-profit'}>
+                {detailMarket.requires_pause ? 'YES' : 'NO'}
+              </span>
             </div>
 
             {/* Action buttons */}
@@ -71,7 +63,7 @@ export function OracleRadar() {
         </div>
       </div>
 
-      {/* ── DOM Chart ──────────────────────────────────────────── */}
+      {/* ── DOM Chart ────────────────────────────────────────────────────────── */}
       <div className="bg-bg-secondary border border-bg-hover rounded p-3">
         <h3 className="text-[10px] text-text-tertiary tracking-wider mb-2">
           DEPTH OF MARKET (DOM Chart)

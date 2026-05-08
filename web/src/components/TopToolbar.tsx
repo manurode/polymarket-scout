@@ -1,4 +1,5 @@
 import type { SystemMode, NavTab } from '../types';
+import { useHealth } from '../hooks/useHealth';
 
 interface TopToolbarProps {
   mode: SystemMode;
@@ -9,6 +10,7 @@ interface TopToolbarProps {
 }
 
 export function TopToolbar({ mode, activeTab, onTabChange, tabs }: TopToolbarProps) {
+  const { uptime } = useHealth(5000);
   const modeColors: Record<SystemMode, string> = {
     'LIVE PAPER': 'text-profit',
     'BACKTEST': 'text-info',
@@ -28,7 +30,7 @@ export function TopToolbar({ mode, activeTab, onTabChange, tabs }: TopToolbarPro
           </span>
         </div>
         <div className="flex items-center gap-3 text-[11px] font-mono text-text-secondary">
-          <span>UPTIME: 38h 12m</span>
+          <span>UPTIME: {uptime}</span>
           <button
             className="px-2 py-0.5 rounded border border-loss/30 text-loss hover:bg-loss/10 transition-colors"
             title="Kill Switch — Pause all trading"

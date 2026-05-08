@@ -49,6 +49,22 @@ export interface SystemStatus {
     can_trade: boolean;
     component_health: Record<string, boolean>;
   };
+  paper_trading?: {
+    open_positions: number;
+    total_pnl: number;
+    unrealized_pnl: number;
+    wallet_total: number;
+  };
+}
+
+export interface WalletStatus {
+  usdc_free: number;
+  usdc_collateral: number;
+  usdc_total: number;
+  pol_balance: number;
+  pol_usd_value: number;
+  ctf_allowance: boolean;
+  ctf_contract: string;
 }
 
 export interface StrategyRanking {

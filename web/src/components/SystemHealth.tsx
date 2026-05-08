@@ -1,10 +1,14 @@
 import { useSystemStatus } from '../hooks/useSystemStatus';
 import { useRateLimits } from '../hooks/useRateLimits';
+import { useReconciliation } from '../hooks/useReconciliation';
+import { useWallet } from '../hooks/useWallet';
 import type { SystemStatus } from '../types';
 
 export function SystemHealth() {
   const status = useSystemStatus(2000);
   const { budgets: rateLimits } = useRateLimits(5000);
+  const { data: recon } = useReconciliation(5000);
+  const { wallet } = useWallet(5000);
 
   return (
     <div className="p-4 space-y-4">
@@ -14,7 +18,7 @@ export function SystemHealth() {
           SYSTEM HEALTH
         </h2>
         <span className="text-[10px] text-text-tertiary font-mono">
-          last snapshot: 2.1s ago
+          WS: {status.websocket_connected ? 'connected' : 'down'} · {status.tracked_markets_book} markets
         </span>
       </div>
 
@@ -25,7 +29,7 @@ export function SystemHealth() {
       </div>
 
       {/* ── Reconciliation Matrix ──────────────────────────────── */}
-      <ReconciliationPanel status={status} />
+      <ReconciliationPanel data={recon} />
 
       {/* ── Degradation + Latency Budget ───────────────────────── */}
       <div className="grid grid-cols-2 gap-4">
@@ -34,7 +38,7 @@ export function SystemHealth() {
       </div>
 
       {/* ── Wallet Monitor ─────────────────────────────────────── */}
-      <WalletPanel />
+      <WalletPanel wallet={wallet} />
     </div>
   );
 }
@@ -46,7 +50,7 @@ function HeartbeatsPanel({ heartbeats }: { heartbeats: SystemStatus['heartbeats'
     <div className="bg-bg-secondary border border-bg-hover rounded p-3">
       <h3 className="text-[10px] text-text-tertiary tracking-wider mb-2">HEARTBEATS</h3>
       <div className="space-y-2">
-        {Object.entries(heartbeats).map(([key, beat]) => (
+        {Object.entries(heartbeats || {}).map(([key, beat]) => (
           <div key={key} className="flex items-center justify-between text-[11px] font-mono">
             <div className="flex items-center gap-2">
               <span className={`
@@ -103,11 +107,11 @@ function RateLimitsPanel({ budgets }: { budgets: Record<string, { available: num
   );
 }
 
-function ReconciliationPanel({ status }: { status: SystemStatus }) {
-  const cleanCount = status.tracked_markets_book;
-  const totalCount = 50;
-  const reconcilingCount = totalCount - cleanCount;
-  const cleanPct = Math.round((cleanCount / totalCount) * 100);
+function ReconciliationPanel({ data }: { data: { total: number; clean: number; reconciling: number; markets: Array<Record<string, unknown>> } }) {
+  const totalCount = data.total || 50;
+  const cleanCount = data.clean || 0;
+  const reconcilingCount = data.reconciling || 0;
+  const cleanPct = totalCount > 0 ? Math.round((cleanCount / totalCount) * 100) : 0;
 
   return (
     <div className="bg-bg-secondary border border-bg-hover rounded p-3">
@@ -132,13 +136,23 @@ function ReconciliationPanel({ status }: { status: SystemStatus }) {
           All markets CLEAN — no reconciliation needed
         </div>
       )}
+      {data.markets && data.markets.length > 0 && (
+        <div className="mt-2 space-y-1">
+          {data.markets.slice(0, 3).map((m: any, i: number) => (
+            <div key={i} className="flex justify-between text-[10px] font-mono text-text-secondary">
+              <span>{m.token_id}</span>
+              <span className="text-warning">seq={m.seq_num} gaps={m.gap_count}</span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
 
 function DegradationPanel({ status }: { status: SystemStatus }) {
-  const mode = status.degradation_metrics.mode;
-  const canTrade = status.degradation_metrics.can_trade;
+  const mode = status.degradation_metrics?.mode || 'full';
+  const canTrade = status.degradation_metrics?.can_trade ?? true;
   const color = mode === 'full' ? 'border-profit text-profit' :
     mode === 'minimal' ? 'border-warning text-warning' :
     'border-loss text-loss animate-pulse-red';
@@ -151,7 +165,7 @@ function DegradationPanel({ status }: { status: SystemStatus }) {
           <span className="text-xs font-bold uppercase">{mode}</span>
         </div>
         <div className="text-[11px] text-text-secondary space-y-0.5">
-          <div>Active strategies: {status.active_strategies.length}/7</div>
+          <div>Active strategies: {(status.active_strategies || []).length}/7</div>
           <div>Trading: {canTrade ? '✓ ENABLED' : '✗ DISABLED'}</div>
           <div>WebSocket: {status.websocket_connected ? '✓ Connected' : '✗ Down'}</div>
         </div>
@@ -202,42 +216,49 @@ function LatencyBudgetPanel() {
   );
 }
 
-function WalletPanel() {
+function WalletPanel({ wallet }: { wallet: { usdc_free: number; usdc_collateral: number; usdc_total: number; pol_balance: number; pol_usd_value: number; ctf_allowance: boolean; ctf_contract: string } }) {
+  const usdcFreePct = wallet.usdc_total > 0 ? (wallet.usdc_free / wallet.usdc_total) * 100 : 0;
+  const polPct = 100; // Simplified
+
   return (
     <div className="bg-bg-secondary border border-bg-hover rounded p-3">
       <h3 className="text-[10px] text-text-tertiary tracking-wider mb-2">
-        WALLET MONITOR (On-Chain · Polygon)
+        WALLET MONITOR (Paper Trading · Virtual)
       </h3>
       <div className="grid grid-cols-3 gap-4">
         <div className="bg-bg-tertiary rounded p-2.5">
           <div className="text-[10px] text-text-tertiary mb-1">USDC Balance</div>
-          <div className="text-sm font-mono font-bold text-text-primary">$1,247.50</div>
+          <div className="text-sm font-mono font-bold text-text-primary">${wallet.usdc_free.toLocaleString(undefined, {maximumFractionDigits: 2})}</div>
           <div className="flex items-center gap-2 mt-1.5">
             <div className="flex-1 bg-bg-primary rounded-full h-1.5 overflow-hidden">
-              <div className="bg-profit h-full rounded-full" style={{ width: '58%' }} />
+              <div className="bg-profit h-full rounded-full" style={{ width: `${usdcFreePct}%` }} />
             </div>
-            <span className="text-[9px] text-text-tertiary font-mono">58% free</span>
+            <span className="text-[9px] text-text-tertiary font-mono">{usdcFreePct.toFixed(0)}% free</span>
           </div>
-          <div className="text-[10px] text-text-tertiary mt-0.5">$892.30 in collateral · Total: $2,139.80</div>
+          <div className="text-[10px] text-text-tertiary mt-0.5">${wallet.usdc_collateral.toLocaleString(undefined, {maximumFractionDigits: 2})} in collateral · Total: ${wallet.usdc_total.toLocaleString(undefined, {maximumFractionDigits: 2})}</div>
         </div>
         <div className="bg-bg-tertiary rounded p-2.5">
           <div className="text-[10px] text-text-tertiary mb-1">POL (Gas Token)</div>
-          <div className="text-sm font-mono font-bold text-profit">4.2 POL</div>
+          <div className="text-sm font-mono font-bold text-profit">{wallet.pol_balance.toFixed(1)} POL</div>
           <div className="flex items-center gap-2 mt-1.5">
             <div className="flex-1 bg-bg-primary rounded-full h-1.5 overflow-hidden relative">
-              <div className="bg-profit h-full rounded-full" style={{ width: '42%' }} />
+              <div className="bg-profit h-full rounded-full" style={{ width: `${polPct}%` }} />
               {/* MIN line */}
               <div className="absolute top-0 bottom-0 w-0.5 bg-loss" style={{ left: '20%' }} />
             </div>
-            <span className="text-[9px] text-text-tertiary font-mono">$3.44 USD</span>
+            <span className="text-[9px] text-text-tertiary font-mono">${wallet.pol_usd_value.toFixed(2)} USD</span>
           </div>
-          <div className="text-[10px] text-warning mt-0.5">MIN OPERATIVE: 2.0 POL</div>
+          <div className={`text-[10px] mt-0.5 ${wallet.pol_balance < 2 ? 'text-loss animate-pulse-red' : 'text-warning'}`}>
+            MIN OPERATIVE: 2.0 POL
+          </div>
         </div>
         <div className="bg-bg-tertiary rounded p-2.5">
           <div className="text-[10px] text-text-tertiary mb-1">CTF Allowance</div>
-          <div className="text-sm font-mono font-bold text-profit">✓ APPROVED</div>
+          <div className={`text-sm font-mono font-bold ${wallet.ctf_allowance ? 'text-profit' : 'text-loss'}`}>
+            {wallet.ctf_allowance ? '✓ APPROVED' : '✗ NOT APPROVED'}
+          </div>
           <div className="text-[10px] text-text-tertiary mt-0.5">Unlimited · CTFExchange</div>
-          <div className="text-[9px] text-bg-active mt-0.5 font-mono">0x4D97DC...d697</div>
+          <div className="text-[9px] text-bg-active mt-0.5 font-mono">{wallet.ctf_contract.slice(0, 8)}...{wallet.ctf_contract.slice(-6)}</div>
         </div>
       </div>
     </div>
