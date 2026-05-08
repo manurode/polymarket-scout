@@ -10,9 +10,19 @@ const MOCK_POSITIONS: Position[] = [
   { id: 6, market: 'Oil price > $80?', strategy: 'CNTR', side: 'NO', size: 28, entry: 0.80, mark: 0.85, pnl: -7.50, pnl_pct: -26.8, tau_pct: 91, toxicity: 1.20, liquidation_zone: true },
 ];
 
-export function usePositions(pollIntervalMs: number = 5000) {
+interface PositionsData {
+  positions: Position[];
+  loading: boolean;
+  source: 'paper_trading' | 'mock' | 'error';
+  totalPnl: number;
+  totalValue: number;
+  liqCount: number;
+}
+
+export function usePositions(pollIntervalMs: number = 5000): PositionsData {
   const [positions, setPositions] = useState<Position[]>(MOCK_POSITIONS);
   const [loading, setLoading] = useState(false);
+  const [source, setSource] = useState<'paper_trading' | 'mock' | 'error'>('mock');
   const mountedRef = useRef(true);
 
   useEffect(() => {
@@ -24,14 +34,20 @@ export function usePositions(pollIntervalMs: number = 5000) {
         const res = await fetch('/api/risk/positions');
         if (res.ok && mountedRef.current) {
           const data: Position[] = await res.json();
-          if (data.length > 0) setPositions(data);
+          // Check if we got real data or empty/mock
+          if (Array.isArray(data)) {
+            setPositions(data.length > 0 ? data : MOCK_POSITIONS);
+            setSource(data.length > 0 ? 'paper_trading' : 'mock');
+          }
           setLoading(false);
         }
       } catch {
         // Keep mock data if endpoint not available
+        setSource('mock');
       }
     };
 
+    fetchPositions();
     timer = setInterval(fetchPositions, pollIntervalMs);
     return () => {
       mountedRef.current = false;
@@ -43,5 +59,5 @@ export function usePositions(pollIntervalMs: number = 5000) {
   const totalValue = positions.reduce((s, p) => s + p.size, 0);
   const liqCount = positions.filter(p => p.tau_pct > 85).length;
 
-  return { positions, loading, totalPnl, totalValue, liqCount };
+  return { positions, loading, source, totalPnl, totalValue, liqCount };
 }

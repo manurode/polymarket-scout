@@ -1,15 +1,23 @@
 import { usePositions } from '../hooks/usePositions';
 
 export function RiskMonitor() {
-  const { positions, totalPnl, totalValue, liqCount } = usePositions();
+  const { positions, totalPnl, totalValue, liqCount, source } = usePositions();
+  const isPaperTrading = source === 'paper_trading';
 
   return (
     <div className="p-4 space-y-4">
-      <h2 className="text-sm font-bold tracking-wider text-text-primary">
-        EXECUTION & RISK MONITOR
-      </h2>
+      <div className="flex items-center justify-between">
+        <h2 className="text-sm font-bold tracking-wider text-text-primary">
+          EXECUTION & RISK MONITOR
+        </h2>
+        <span className={`text-[10px] px-2 py-0.5 rounded-full font-mono ${
+          isPaperTrading ? 'bg-warning/20 text-warning border border-warning/30' : 'bg-bg-tertiary text-text-tertiary'
+        }`}>
+          {isPaperTrading ? '📦 PAPER POSITIONS' : '🖼 MOCK DATA'}
+        </span>
+      </div>
 
-      {/* ── Open Positions Table ───────────────────────────────── */}
+      {/* ── Open Positions Table ──────────────────────────────────────────────────── */}
       <div className="bg-bg-secondary border border-bg-hover rounded p-3">
         <h3 className="text-[10px] text-text-tertiary tracking-wider mb-2">
           OPEN POSITIONS ({positions.length})
