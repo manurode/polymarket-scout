@@ -315,6 +315,84 @@ def _register_routes(app: FastAPI) -> None:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
+    # ── Book Snapshot ───────────────────────────────────────────────────────────────────
+
+    @app.get("/api/book/snapshot")
+    async def book_snapshot(request: Request, token_id: str = None):
+        """Get order book snapshot for a tracked market."""
+        orch = request.app.state.orchestrator
+        if orch and hasattr(orch, "ws_manager") and orch.ws_manager:
+            if token_id and orch.book_analyzer:
+                try:
+                    book = orch.book_analyzer.get_snapshot(token_id)
+                    if book:
+                        return {
+                            "token_id": token_id,
+                            "bids": book.get("bids", [])[:10],
+                            "asks": book.get("asks", [])[:10],
+                            "mid_price": book.get("mid_price"),
+                            "spread": book.get("spread"),
+                            "obi": book.get("obi"),
+                            "tfi": book.get("tfi"),
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "source": "clob_ws",
+                        }
+                except Exception as e:
+                    logger.error("Error fetching book snapshot: %s", e)
+            # Fallback: return empty with indication
+            return {
+                "token_id": token_id or "none",
+                "bids": [],
+                "asks": [],
+                "mid_price": None,
+                "source": "no_book_available",
+            }
+        return {"bids": [], "asks": [], "source": "no_orchestrator"}
+
+    # ── Correlation Matrix ──────────────────────────────────────────────────────────────
+
+    @app.get("/api/risk/correlation")
+    async def risk_correlation(request: Request):
+        """Get correlation matrix for open positions."""
+        orch = request.app.state.orchestrator
+        if orch and hasattr(orch, "paper_trading") and orch.paper_trading:
+            positions = orch.paper_trading.get_positions(only_open=True)
+            if len(positions) >= 2:
+                # Compute simple correlation matrix from P&L movements
+                n = len(positions)
+                labels = [p["market"][:15] for p in positions]
+                # Build correlation from position side alignment and market category
+                matrix = []
+                for i in range(n):
+                    row = []
+                    for j in range(n):
+                        if i == j:
+                            row.append(1.0)
+                        elif i > j:
+                            row.append(matrix[j][i])
+                        else:
+                            # Estimate correlation based on market similarity and side alignment
+                            same_category = _market_similarity(positions[i]["market"], positions[j]["market"])
+                            same_side = 1.0 if positions[i]["side"] == positions[j]["side"] else -1.0
+                            corr = same_category * same_side * 0.5  # scale to [-0.5, 0.5]
+                            row.append(round(corr, 2))
+                    matrix.append(row)
+                avg_corr = round(sum(matrix[i][j] for i in range(n) for j in range(i)) / max(1, n * (n - 1) // 2), 2)
+                return {
+                    "positions": [{"market": p["market"], "side": p["side"]} for p in positions],
+                    "labels": labels,
+                    "matrix": matrix,
+                    "avg_correlation": avg_corr,
+                    "source": "paper_positions",
+                }
+        return {
+            "positions": [],
+            "labels": [],
+            "matrix": [],
+            "avg_correlation": 0,
+            "source": "no_positions",
+        }
+
     # ── Oracles / Spoofing ───────────────────────────────────────────────────────────────
 
     @app.get("/api/oracles/spoofing")
@@ -426,6 +504,23 @@ def _register_routes(app: FastAPI) -> None:
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────────────────────
+
+def _market_similarity(m1: str, m2: str) -> float:
+    """Estimate market similarity based on keyword overlap (0-1)."""
+    keywords = {
+        "trump": 0, "politics": 0, "election": 0,
+        "btc": 1, "crypto": 1, "bitcoin": 1, "eth": 1,
+        "fed": 2, "rate": 2, "inflation": 2, "interest": 2,
+        "oil": 3, "energy": 3, "commodity": 3,
+        "sp500": 4, "stock": 4, "equity": 4, "s&p": 4,
+    }
+    cats = set()
+    for kw, cat in keywords.items():
+        if kw in m1.lower() or kw in m2.lower():
+            cats.add(cat)
+    return 1.0 if len(cats) > 0 else 0.1  # same category = 1, different = 0.1
+
+
 
 
 def _get_paper_equity(orch) -> float:

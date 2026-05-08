@@ -1,4 +1,5 @@
 import { usePositions } from '../hooks/usePositions';
+import { useCorrelation } from '../hooks/useCorrelation';
 
 export function RiskMonitor() {
   const { positions, totalPnl, totalValue, liqCount, source } = usePositions();
@@ -150,7 +151,7 @@ export function RiskMonitor() {
         <h3 className="text-[10px] text-text-tertiary tracking-wider mb-2">
           CORRELATION MATRIX (open positions)
         </h3>
-        <CorrelationMiniMatrix positions={positions} />
+        <CorrelationMiniMatrix />
       </div>
     </div>
   );
@@ -169,24 +170,31 @@ function SummaryCard({ label, value, color = 'text-text-primary' }: {
   );
 }
 
-function CorrelationMiniMatrix({ positions }: { positions: { market: string }[] }) {
-  const n = Math.min(positions.length, 6);
-  if (n === 0) return <div className="text-center py-4 text-text-tertiary">No positions to correlate</div>;
+function CorrelationMiniMatrix() {
+  const { data: corr } = useCorrelation(15000);
+  const isReal = corr.source === 'paper_positions' && corr.matrix.length >= 2;
+  const n = Math.min(corr.matrix.length, 6);
+  const labels = corr.labels.slice(0, n);
 
-  const labels = positions.slice(0, n).map(p => p.market.slice(0, 12));
-
-  // Simulated correlation data
-  const corrData = [
-    [1.00, 0.45, 0.12, -0.08, 0.32, 0.55],
-    [0.45, 1.00, 0.28, -0.15, 0.20, 0.35],
-    [0.12, 0.28, 1.00, 0.05, -0.10, 0.08],
-    [-0.08, -0.15, 0.05, 1.00, 0.40, -0.22],
-    [0.32, 0.20, -0.10, 0.40, 1.00, 0.15],
-    [0.55, 0.35, 0.08, -0.22, 0.15, 1.00],
-  ];
+  if (n === 0) return (
+    <div>
+      <div className="text-center py-4 text-text-tertiary">No positions to correlate</div>
+        {corr.source !== 'paper_positions' && (
+          <div className="text-center text-[9px] text-text-tertiary">Source: {corr.source}</div>
+        )}
+    </div>
+  );
 
   return (
     <div className="overflow-x-auto">
+      <div className="flex items-center justify-between mb-1">
+        <span className={`text-[8px] px-1.5 py-0.5 rounded font-mono ${
+          isReal ? 'bg-warning/20 text-warning' : 'bg-bg-tertiary text-text-tertiary'
+        }`}>
+          {isReal ? '📦 PAPER' : `○ ${corr.source}`}
+        </span>
+      </div>
+
       <table className="text-[9px] font-mono">
         <thead>
           <tr>
@@ -197,10 +205,10 @@ function CorrelationMiniMatrix({ positions }: { positions: { market: string }[] 
           </tr>
         </thead>
         <tbody>
-          {labels.slice(0, n).map((l, i) => (
+          {labels.map((l, i) => (
             <tr key={i}>
               <td className="pr-1 text-text-tertiary">{l}</td>
-              {corrData[i].slice(0, n).map((v, j) => {
+              {corr.matrix[i].slice(0, n).map((v, j) => {
                 const bg = v === 1 ? 'bg-bg-active' :
                   v > 0.5 ? 'bg-loss/30' :
                   v > 0 ? 'bg-loss/15' :
@@ -221,7 +229,9 @@ function CorrelationMiniMatrix({ positions }: { positions: { market: string }[] 
       {/* Portfolio avg correlation */}
       <div className="mt-2 pt-1.5 border-t border-bg-hover flex justify-between text-[10px] font-mono">
         <span className="text-text-tertiary">Portfolio Avg Correlation</span>
-        <span className="text-warning">0.22</span>
+        <span className={Math.abs(corr.avg_correlation) > 0.5 ? 'text-warning' : 'text-text-primary'}>
+          {corr.avg_correlation.toFixed(2)}
+        </span>
       </div>
     </div>
   );

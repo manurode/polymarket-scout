@@ -1,6 +1,7 @@
 import { useWhales } from '../hooks/useWhales';
 import { useSpoofing } from '../hooks/useSpoofing';
 import { useRadarMarkets } from '../hooks/useRadarMarkets';
+import { useBookSnapshot } from '../hooks/useBookSnapshot';
 
 export function OracleRadar() {
   const { alphaWhales, whaleFlow, loading, error } = useWhales();
@@ -281,44 +282,77 @@ function SpoofRow({ market, spoofScore, classification }: {
 }
 
 function DOMChart() {
+  const { book, source } = useBookSnapshot(10000);
+  const isLive = source === 'clob_ws';
+
+  // Normalize bids and asks for display
+  const bids = (book?.bids || []).slice(0, 10);
+  const asks = (book?.asks || []).slice(0, 10);
+
+  const maxBidSize = bids.length > 0 ? Math.max(...bids.map(b => b.size)) : 1;
+  const maxAskSize = asks.length > 0 ? Math.max(...asks.map(a => a.size)) : 1;
+  const maxSize = Math.max(maxBidSize, maxAskSize, 1);
+
+  // Fallback OBI/TFI
+  const obi = book?.obi ?? null;
+  const tfi = book?.tfi ?? null;
+
   return (
     <div className="relative h-48 bg-bg-tertiary rounded overflow-hidden">
       {/* Mid-price line */}
       <div className="absolute top-0 bottom-0 left-1/2 w-px bg-bg-active border-dashed" />
 
-      {/* Simulated DOM bars */}
       <div className="absolute inset-0 flex items-end">
         {/* Bids (left side, green) */}
         <div className="w-1/2 flex items-end justify-end gap-px px-4 pb-2">
-          {[85, 70, 60, 45, 38, 25, 18, 12, 8, 5].map((h, i) => (
+          {bids.length > 0 ? bids.map((b, i) => (
             <div
               key={`bid-${i}`}
-              className="w-[8%] bg-profit/60 rounded-t-sm"
-              style={{ height: `${h}%` }}
+              className="bg-profit/60 rounded-t-sm min-w-[6px]"
+              style={{ height: `${Math.max(3, (b.size / maxSize) * 100)}%`, width: '7%' }}
             />
+          )) : Array.from({ length: 10 }).map((_, i) => (
+            <div key={`bid-e-${i}`} className="w-[7%] bg-bg-active/20 rounded-t-sm" style={{ height: `${Math.max(3, (1 - i * 0.1) * 60)}%` }} />
           ))}
         </div>
         {/* Asks (right side, red) */}
         <div className="w-1/2 flex items-end gap-px px-4 pb-2">
-          {[5, 10, 15, 22, 30, 35, 42, 55, 65, 80].map((h, i) => (
+          {asks.length > 0 ? asks.map((a, i) => (
             <div
               key={`ask-${i}`}
-              className="w-[8%] bg-loss/60 rounded-t-sm"
-              style={{ height: `${h}%` }}
+              className="bg-loss/60 rounded-t-sm min-w-[6px]"
+              style={{ height: `${Math.max(3, (a.size / maxSize) * 100)}%`, width: '7%' }}
             />
+          )) : Array.from({ length: 10 }).map((_, i) => (
+            <div key={`ask-e-${i}`} className="w-[7%] bg-bg-active/20 rounded-t-sm" style={{ height: `${Math.max(3, (i * 0.1) * 60)}%` }} />
           ))}
         </div>
       </div>
 
       {/* OBI/TFI labels */}
       <div className="absolute top-2 left-4 text-[10px] font-mono text-text-tertiary">
-        OBI: <span className="text-profit">-0.62</span>
+        OBI: {obi != null ? <span className="text-profit">{obi.toFixed(2)}</span> : '—'}
       </div>
       <div className="absolute top-2 right-4 text-[10px] font-mono text-text-tertiary">
-        TFI: <span className="text-profit">-0.15</span>
+        TFI: {tfi != null ? <span className="text-profit">{tfi.toFixed(2)}</span> : '—'}
       </div>
-      <div className="absolute bottom-2 left-1/2 -translate-x-1/2 text-[11px] font-mono font-bold text-warning">
-        DIV: 0.47 ⚠
+      <div className="absolute bottom-2 left-1/2 -translate-x-1/2 text-[11px] font-mono font-bold">
+        {isLive ? (
+          <span className="text-profit">
+            {book?.mid_price != null ? `$${book.mid_price.toFixed(3)}` : '● LIVE'}
+          </span>
+        ) : (
+          <span className="text-text-tertiary">○ NO BOOK DATA</span>
+        )}
+      </div>
+
+      {/* Source badge */}
+      <div className="absolute top-2 left-1/2 -translate-x-1/2">
+        <span className={`text-[8px] px-1.5 py-0.5 rounded font-mono ${
+          isLive ? 'bg-profit/20 text-profit' : 'bg-bg-tertiary text-text-tertiary'
+        }`}>
+          {isLive ? '● LIVE BOOK' : '○ SIMULATED'}
+        </span>
       </div>
 
       {/* Label */}
