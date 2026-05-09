@@ -50,7 +50,7 @@ class StrategyPerformance:
     losses: int = 0
     total_pnl: float = 0.0
     avg_win: float = 0.0
-      avg_loss: float = 0.0
+    avg_loss: float = 0.0
     win_rate: float = 0.0
     confidence: float = 0.5    # 0-1, confianza en la estrategia
     last_updated: float = field(default_factory=time.time)
