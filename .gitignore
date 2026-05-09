@@ -5,3 +5,4 @@ data/*.db
 .pytest_cache/
 data/polymarket.db-shm
 data/polymarket.db-wal
+data/history/

@@ -41,6 +41,7 @@ from src.redis_bus import MessageBus, create_message_bus
 from src.paper_trading import PaperTradingEngine
 from src.signal_pipeline import SignalPipeline
 from src.price_history import PriceHistory
+from src.adaptive_strategy_engine import AdaptiveStrategyEngine
 
 logger = logging.getLogger(__name__)
 
@@ -100,15 +101,21 @@ class ScoutOrchestrator:
         self.portfolio_manager = PortfolioManager(strategies=strategies)
         self.whale_tracker = WhaleTracker()
 
-        # ── Phase 6: Paper Trading ────────────────────────────────────────
+        # ── Phase 6: Paper Trading ─────────────────────────────────────────────────
         self.paper_trading = PaperTradingEngine(
             portfolio_manager=self.portfolio_manager,
             initial_usdc=config.get("paper_trading", {}).get("initial_usdc", 10000.0),
             initial_pol=config.get("paper_trading", {}).get("initial_pol", 100.0),
+            on_trade_close=self._on_trade_close,  # Callback para adaptive engine
         )
 
         # ── Signal Pipeline ────────────────────────────────────────────────
         self.signal_pipeline = SignalPipeline()
+
+        # ── Adaptive Strategy Engine ───────────────────────────────────────
+        self.adaptive_engine = AdaptiveStrategyEngine(
+            state_file="data/adaptive_state.json"
+        )
 
         # ── Price History ───────────────────────────────────────────────────
         self.price_history = PriceHistory()
@@ -376,17 +383,15 @@ class ScoutOrchestrator:
             await asyncio.sleep(PAPER_AUTO_CLOSE_INTERVAL)
 
     async def _paper_signal_loop(self) -> None:
-        """Pipeline de señales real: usa el SignalPipeline para generar entradas
-        basadas en datos del radar (momentum, mean reversion, volume breakout).
-
-        Reemplaza el sistema anterior de señales aleatorias con demo markets.
+        """Pipeline de señales adaptativo: usa AdaptiveStrategyEngine para generar entradas
+        con filtrado por régimen, aprendizaje de parámetros y ensemble weighting.
         """
-        logger.info("PaperTrading signal pipeline iniciado")
+        logger.info("PaperTrading adaptive signal pipeline iniciado")
 
         while self._running:
             try:
                 # Esperar a tener suficiente historial de precios
-                if self.signal_pipeline.get_history_size() < 5:
+                if self.adaptive_engine.pipeline.get_history_size() < 5:
                     await asyncio.sleep(5)
                     continue
 
@@ -400,16 +405,14 @@ class ScoutOrchestrator:
                     await asyncio.sleep(10)
                     continue
 
-                # Generar señales del pipeline (usa el último scan procesado)
-                # El radar loop ya alimenta _market_prices; el pipeline se alimenta
-                # a través de update_history que se llama desde generate()
-                # Necesitamos pasarle los snapshots más recientes
+                # Generar señales adaptativas
                 snapshots = getattr(self, '_last_radar_snapshots', [])
                 if not snapshots:
                     await asyncio.sleep(5)
                     continue
 
-                signals = self.signal_pipeline.generate(snapshots, cooldown_s=300)
+                # Usar el motor adaptativo
+                signals = self.adaptive_engine.generate_adaptive_signals(snapshots, cooldown_s=300)
 
                 if not signals:
                     await asyncio.sleep(10)
@@ -463,7 +466,7 @@ class ScoutOrchestrator:
                         )
 
                 if executed > 0:
-                    logger.info("PaperTrade: %d señales ejecutadas de %d generadas", executed, len(signals))
+                    logger.info("PaperTrade: %d señales adaptativas ejecutadas de %d generadas", executed, len(signals))
 
             except asyncio.CancelledError:
                 break
@@ -471,6 +474,18 @@ class ScoutOrchestrator:
                 logger.error("Error en paper signal loop: %s", e)
 
             await asyncio.sleep(PAPER_SIGNAL_INTERVAL)
+
+    # ── Callback para Adaptive Engine ──────────────────────────────────────────────
+
+    def _on_trade_close(self, strategy: str, pnl: float) -> None:
+        """Callback que recibe el PaperTradingEngine cuando cierra un trade.
+        
+        Actualiza el AdaptiveStrategyEngine para que aprenda del resultado.
+        """
+        try:
+            self.adaptive_engine.update_from_trade(strategy, pnl)
+        except Exception as e:
+            logger.error("Error actualizando adaptive engine desde trade: %s", e)
 
     # ── Trading Pipeline ──────────────────────────────────────────────────────────────────────────────
 

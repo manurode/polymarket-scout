@@ -99,8 +99,10 @@ class PaperTradingEngine:
         portfolio_manager=None,
         initial_usdc: float = DEFAULT_INITIAL_USDC,
         initial_pol: float = DEFAULT_INITIAL_POL,
+        on_trade_close: callable | None = None,  # Callback para notificar cierre de trade
     ):
         self.pm = portfolio_manager
+        self.on_trade_close = on_trade_close  # Callback: (strategy, pnl) -> None
         self.wallet = VirtualWallet(
             usdc_free=initial_usdc,
             pol_balance=initial_pol,
@@ -225,6 +227,13 @@ class PaperTradingEngine:
                     if t["strategy"] == pos.strategy
                 ]
                 self.pm.update_strategy_performance(pos.strategy, strategy_trades)
+            
+            # Feedback al AdaptiveStrategyEngine via callback
+            if self.on_trade_close:
+                try:
+                    self.on_trade_close(pos.strategy, pnl)
+                except Exception as e:
+                    logger.error("Error en on_trade_close callback: %s", e)
 
             logger.info(
                 "PaperTrade CLOSE #%d %s P&L=$%.2f (%.1f%%) reason=%s",
