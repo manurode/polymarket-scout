@@ -29,13 +29,12 @@ from typing import Callable, Optional
 import aiohttp
 
 from src.config import get_clob_credentials, has_clob_credentials
-from src.clob_auth import build_clob_auth_message
 
 logger = logging.getLogger(__name__)
 
 # ── Constantes ──────────────────────────────────────────────────────
 
-WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws"
+MARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 HEARTBEAT_INTERVAL = 30      # segundos entre pings
 RECONNECT_DELAY_BASE = 1.0   # delay inicial para exponential backoff
 RECONNECT_DELAY_MAX = 30.0   # delay máximo de reconexión
@@ -70,7 +69,7 @@ class _BookTracker:
 @dataclass
 class WebSocketConfig:
     """Configuración del WebSocket Manager."""
-    url: str = WS_URL
+    url: str = MARKET_WS_URL
     heartbeat_interval: float = HEARTBEAT_INTERVAL
     reconnect_delay_base: float = RECONNECT_DELAY_BASE
     reconnect_delay_max: float = RECONNECT_DELAY_MAX
@@ -125,13 +124,12 @@ class WebSocketManager:
         self.on_price: Callable | None = None
         self.on_state_change: Callable | None = None  # (token_id, old_state, new_state)
 
-        # CLOB credentials from .env (may be empty if not configured)
+        # Market channel is PUBLIC — no auth needed for orderbook data
+        # User channel (trading) uses API keys loaded from .env
         self._clob_creds = get_clob_credentials()
         self._clob_authed = has_clob_credentials()
-        if self._clob_authed:
-            logger.info("CLOB WS: API credentials loaded — authenticated WebSocket enabled")
-        else:
-            logger.info("CLOB WS: API credentials NOT configured — public-only WebSocket")
+        logger.info("CLOB WS: market channel (public) — %s",
+                     "user channel available ✅" if self._clob_authed else "user channel unavailable (no .env)")
 
     # ── Connection Lifecycle ──────────────────────────────────────
 
@@ -176,21 +174,16 @@ class WebSocketManager:
 
         while self._running:
             try:
-                # Build URL with api_key param if we have credentials
-                ws_url = self._config.url
-                if self._clob_authed and self._clob_creds["api_key"]:
-                    ws_url = f"{ws_url}?api_key={self._clob_creds['api_key']}"
-
                 self._ws = await self._session.ws_connect(
-                    ws_url,
+                    self._config.url,
                     heartbeat=self._config.heartbeat_interval,
                 )
                 self._connected = True
                 self._reconnect_attempt = 0
                 logger.info("WebSocket conectado a %s", self._config.url)
 
-                # Enviar auth si hay credenciales CLOB
-                await self._send_auth()
+                # Enviar suscripción MARKET con todos los tokens trackeados
+                await self._send_market_subscription()
 
                 # Re-suscribir todos los mercados trackeados
                 await self._resubscribe_all()
@@ -217,21 +210,20 @@ class WebSocketManager:
                 )
                 await self._subscribe_internal(token_id)
 
-    async def _send_auth(self) -> None:
-        """Send CLOB WebSocket authentication message if credentials exist."""
-        if not self._clob_authed or not self._ws:
+    async def _send_market_subscription(self) -> None:
+        """Send MARKET subscription with all tracked asset IDs on connect."""
+        if not self._ws:
             return
-
+        asset_ids = list(self._books.keys())
+        if not asset_ids:
+            logger.debug("CLOB WS: no assets to subscribe yet")
+            return
         try:
-            auth_msg = build_clob_auth_message(
-                api_key=self._clob_creds["api_key"],
-                secret=self._clob_creds["secret"],
-                passphrase=self._clob_creds["passphrase"],
-            )
-            await self._ws.send_json(auth_msg)
-            logger.info("CLOB WS: auth message sent")
+            msg = {"type": "MARKET", "assets_ids": asset_ids}
+            await self._ws.send_json(msg)
+            logger.info("CLOB WS: MARKET subscription sent for %d assets", len(asset_ids))
         except Exception as e:
-            logger.warning("CLOB WS: auth message failed — %s", e)
+            logger.warning("CLOB WS: MARKET subscription failed — %s", e)
 
     # ── Subscribe / Unsubscribe ─────────────────────────────────────
 
@@ -274,20 +266,14 @@ class WebSocketManager:
         await self._subscribe_internal(token_id)
 
     async def _subscribe_internal(self, token_id: str) -> None:
-        """Envía mensaje de suscripción al WebSocket."""
+        """Envía mensaje de suscripción al WebSocket (protocolo CLOB Market)."""
         if not self._connected or self._ws is None:
             return
 
         try:
             await self._ws.send_json({
-                "type": "subscribe",
-                "channel": "book",
-                "asset_id": token_id,
-            })
-            await self._ws.send_json({
-                "type": "subscribe",
-                "channel": "trades",
-                "asset_id": token_id,
+                "assets_ids": [token_id],
+                "operation": "subscribe",
             })
         except Exception as e:
             logger.error("Error suscribiendo %s: %s", token_id, e)
@@ -300,14 +286,8 @@ class WebSocketManager:
         if self._connected and self._ws:
             try:
                 await self._ws.send_json({
-                    "type": "unsubscribe",
-                    "channel": "book",
-                    "asset_id": token_id,
-                })
-                await self._ws.send_json({
-                    "type": "unsubscribe",
-                    "channel": "trades",
-                    "asset_id": token_id,
+                    "assets_ids": [token_id],
+                    "operation": "unsubscribe",
                 })
             except Exception:
                 pass
@@ -347,27 +327,31 @@ class WebSocketManager:
                 await asyncio.sleep(0.5)
 
     async def _handle_message(self, raw: str) -> None:
-        """Procesa un mensaje recibido del WebSocket."""
+        """Procesa un mensaje recibido del WebSocket (protocolo CLOB Market).
+
+        Los mensajes tienen el campo 'event_type' con valores como:
+        'book', 'price_change', 'last_trade_price', 'tick_size_change'.
+        """
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
             logger.debug("Mensaje no-JSON: %.100s", raw)
             return
 
-        msg_type = data.get("type", data.get("event", ""))
+        event_type = data.get("event_type", data.get("type", ""))
 
-        if msg_type in ("book", "delta", "l2_update"):
+        if event_type in ("book",):
             await self._handle_book_delta(data)
-        elif msg_type in ("trade", "trades", "last_trade_price"):
-            await self._handle_trade(data)
-        elif msg_type in ("price", "price_change"):
+        elif event_type in ("price_change", "last_trade_price"):
             await self._handle_price(data)
-        elif msg_type in ("subscriptions", "subscribed", "unsubscribed"):
-            logger.debug("Subscription ack: %s", msg_type)
-        elif msg_type == "error":
+        elif event_type == "tick_size_change":
+            logger.debug("Tick size change: %s", data)
+        elif event_type in ("subscriptions", "subscribed", "unsubscribed"):
+            logger.debug("Subscription ack: %s", event_type)
+        elif event_type == "error":
             logger.error("WebSocket server error: %s", data)
         else:
-            logger.debug("Mensaje desconocido: %s", msg_type)
+            logger.debug("Mensaje: type=%s", event_type)
 
     # ── Message Handlers ──────────────────────────────────────────
 
