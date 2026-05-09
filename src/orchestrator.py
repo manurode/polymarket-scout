@@ -174,6 +174,10 @@ class ScoutOrchestrator:
         # ── 6. WebSocket Manager ──────────────────────────────
         self.ws_manager = WebSocketManager(scanner=self.scanner)
 
+        # Wire WS callbacks → BookAnalyzer & TradeAggregator
+        self.ws_manager.on_book_delta = self._on_ws_book
+        self.ws_manager.on_price = self._on_ws_price
+
         # ── 7. Registrar health checks ────────────────────────
         self.degradation.register_health_check(
             "clob_ws", lambda: self.ws_manager.is_connected if self.ws_manager else False,
@@ -648,6 +652,32 @@ class ScoutOrchestrator:
                 logger.error("Error en market making loop: %s", e)
 
             await asyncio.sleep(MM_QUOTE_INTERVAL)
+
+    # ── WebSocket Callbacks ─────────────────────────────────────────
+
+    def _on_ws_book(self, asset_id: str, data: dict) -> None:
+        """Callback: WS book event → BookAnalyzer."""
+        try:
+            if self.book_analyzer:
+                self.book_analyzer.initialize_book(asset_id, data)
+        except Exception as e:
+            logger.debug("WS book callback error: %s", e)
+
+    def _on_ws_price(self, data: dict) -> None:
+        """Callback: WS price event → TradeAggregator."""
+        try:
+            if self.trade_aggregator:
+                asset_id = data.get("asset_id", "")
+                price = data.get("price", data.get("last_trade_price", 0))
+                if asset_id and price:
+                    self.trade_aggregator.add_trade(asset_id, {
+                        "price": float(price),
+                        "size": float(data.get("size", 0)),
+                        "side": data.get("side", ""),
+                        "timestamp": data.get("timestamp", ""),
+                    })
+        except Exception as e:
+            logger.debug("WS price callback error: %s", e)
 
     # ── Callback para Adaptive Engine ──────────────────────────────────────────────
 

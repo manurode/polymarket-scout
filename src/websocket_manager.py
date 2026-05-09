@@ -38,7 +38,7 @@ MARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 HEARTBEAT_INTERVAL = 30      # segundos entre pings
 RECONNECT_DELAY_BASE = 1.0   # delay inicial para exponential backoff
 RECONNECT_DELAY_MAX = 30.0   # delay máximo de reconexión
-GAP_TIMEOUT = 30             # segundos sin delta → forzar RECONCILING
+GAP_TIMEOUT = 300            # segundos sin delta → forzar RECONCILING (5 min)
 
 # Capacidad del buffer circular de deltas durante reconciliación
 DELTA_BUFFER_CAPACITY = 1000
@@ -390,51 +390,29 @@ class WebSocketManager:
     # ── Message Handlers ──────────────────────────────────────────
 
     async def _handle_book_delta(self, data: dict) -> None:
-        """Procesa un delta de order book."""
-        asset_id = data.get("asset_id", data.get("token_id", ""))
+        """Procesa un evento 'book' del WebSocket de Polymarket.
+
+        Formato real: {event_type:'book', asset_id, market, bids, asks,
+                        tick_size, last_trade_price, hash, timestamp}
+        """
+        asset_id = data.get("asset_id", "")
         if not asset_id:
             return
 
         tracker = self._books.get(asset_id)
         if tracker is None:
-            return
+            return  # not tracked by us
 
         now = time.monotonic()
-        seq = data.get("seq_num", data.get("sequence", -1))
+        tracker.last_delta_time = now
 
-        # Si estamos en INIT y recibimos un delta, transicionar a CLEAN
-        if tracker.state == BookState.INIT and seq >= 0:
-            tracker.seq_num = seq
-            tracker.last_delta_time = now
-            await self._transition_state(tracker, BookState.CLEAN, reason="first_delta")
+        # Polymarket sends full snapshots, not deltas. Mark as CLEAN on first book.
+        if tracker.state == BookState.INIT:
+            await self._transition_state(tracker, BookState.CLEAN, reason="first_book")
+        elif tracker.state == BookState.RECONCILING:
+            await self._transition_state(tracker, BookState.CLEAN, reason="book_received")
 
-        # Gap detection: si el seq_num no es el esperado
-        elif tracker.state == BookState.CLEAN:
-            expected_seq = tracker.seq_num + 1
-            if seq >= 0 and seq != expected_seq:
-                # ¡GAP DETECTADO! Pausar trading inmediatamente
-                logger.warning(
-                    "GAP detectado en %s: seq=%d, esperado=%d",
-                    asset_id, seq, expected_seq,
-                )
-                tracker.gap_count += 1
-                await self._transition_state(
-                    tracker, BookState.RECONCILING,
-                    reason=f"gap: seq={seq}, expected={expected_seq}",
-                )
-
-            if tracker.state == BookState.CLEAN:
-                tracker.seq_num = seq if seq >= 0 else tracker.seq_num + 1
-                tracker.last_delta_time = now
-
-        # Durante RECONCILING, bufferizar deltas
-        if tracker.state == BookState.RECONCILING:
-            if len(tracker.delta_buffer) < DELTA_BUFFER_CAPACITY:
-                tracker.delta_buffer.append(data)
-            else:
-                logger.warning("Buffer de deltas lleno para %s — descartando", asset_id)
-
-        # Notificar al callback externo
+        # Notify callback
         if self.on_book_delta:
             try:
                 self.on_book_delta(asset_id, data)
