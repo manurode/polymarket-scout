@@ -15,10 +15,13 @@ import json
 import logging
 import time
 from typing import Optional
+from urllib.parse import urlparse, urlunparse
 
 import aiohttp
 
 from src.rate_limiter import RateLimiter, get_default_limiter
+from src.clob_auth import build_clob_headers
+from src.config import get_clob_credentials, has_clob_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +51,14 @@ class AsyncPolymarketScanner:
         self._rate_limiter = rate_limiter or get_default_limiter()
         self._session_started = False
 
+        # CLOB credentials from .env (may be empty if not configured)
+        self._clob_creds = get_clob_credentials()
+        self._clob_authed = has_clob_credentials()
+        if self._clob_authed:
+            logger.info("CLOB API credentials loaded — authenticated requests enabled")
+        else:
+            logger.info("CLOB API credentials NOT configured — CLOB requests will be public-only")
+
     async def _ensure_session(self) -> None:
         """Ensure an aiohttp session exists."""
         if self._session is None or self._session.closed:
@@ -73,6 +84,45 @@ class AsyncPolymarketScanner:
             async with self._session.get(url) as resp:
                 if resp.status == 404:
                     # CLOB 404s are expected under rate-limiting; don't log
+                    raise aiohttp.ClientResponseError(
+                        resp.request_info, resp.history, status=404
+                    )
+                resp.raise_for_status()
+                return await resp.json()
+        except aiohttp.ClientResponseError as e:
+            if e.status != 404:
+                logger.error("HTTP %s: %s", e.status, url[:100])
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.error("Connection error: %s for %s", e, url[:100])
+            raise
+
+    async def _get_clob(self, url: str) -> dict | list:
+        """GET request to CLOB API with HMAC auth headers when credentials exist.
+
+        Extracts the request path from the URL, builds HMAC signature,
+        and includes POLY_API_KEY / POLY_TIMESTAMP / POLY_SIGNATURE headers.
+        Falls back gracefully (no auth) if credentials are absent.
+        """
+        headers = {"User-Agent": "polymarket-scout/2.0"}
+
+        if self._clob_authed:
+            parsed = urlparse(url)
+            request_path = parsed.path
+            if parsed.query:
+                request_path += "?" + parsed.query
+
+            auth_headers = build_clob_headers(
+                api_key=self._clob_creds["api_key"],
+                secret=self._clob_creds["secret"],
+                method="GET",
+                request_path=request_path,
+            )
+            headers.update(auth_headers)
+
+        try:
+            async with self._session.get(url, headers=headers) as resp:
+                if resp.status == 404:
                     raise aiohttp.ClientResponseError(
                         resp.request_info, resp.history, status=404
                     )
@@ -140,19 +190,19 @@ class AsyncPolymarketScanner:
     async def get_price_async(self, token_id: str, side: str = "buy") -> float:
         """Get current price for a token (rate-limited)."""
         await self._rate_limiter.wait_acquire("ad_hoc", timeout=3.0)
-        data = await self._get(f"{CLOB}/price?token_id={token_id}&side={side}")
+        data = await self._get_clob(f"{CLOB}/price?token_id={token_id}&side={side}")
         return float(data.get("price", 0))
 
     async def get_spread_async(self, token_id: str) -> float:
         """Get current bid-ask spread (rate-limited)."""
         await self._rate_limiter.wait_acquire("ad_hoc", timeout=3.0)
-        data = await self._get(f"{CLOB}/spread?token_id={token_id}")
+        data = await self._get_clob(f"{CLOB}/spread?token_id={token_id}")
         return float(data.get("spread", 0))
 
     async def get_book_async(self, token_id: str) -> dict:
         """Get full L2 order book (rate-limited, usado para snapshots de reconciliación)."""
         await self._rate_limiter.wait_acquire("reconciliation", timeout=3.0)
-        return await self._get(f"{CLOB}/book?token_id={token_id}")
+        return await self._get_clob(f"{CLOB}/book?token_id={token_id}")
 
     # ── Scan principal (compatible con v1.0) ──────────────────────
 

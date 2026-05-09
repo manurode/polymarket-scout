@@ -1,22 +1,17 @@
 import asyncio
 from dashboard.server import create_app
 from src.orchestrator import ScoutOrchestrator
+from src.config import get_yaml_config, get as cfg
 import uvicorn
 
 async def main():
-    config = {
-        "selection": {"top_n": 50},
-        "auto_trader": {
-            "enabled_strategies": [
-                "momentum_follow", "contrarian", "consensus_breakout",
-                "volume_breakout", "market_making", "correlation_arb",
-            ]
-        },
-        "paper_trading": {
-            "initial_usdc": 10000.0,
-            "initial_pol": 100.0,
-        },
-    }
+    config = get_yaml_config()
+
+    # Ensure paper_trading section exists
+    if "paper_trading" not in config:
+        config["paper_trading"] = {}
+    config["paper_trading"].setdefault("initial_usdc", 10000.0)
+    config["paper_trading"].setdefault("initial_pol", 100.0)
 
     orchestrator = ScoutOrchestrator(config)
     await orchestrator.start()

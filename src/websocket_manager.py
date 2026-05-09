@@ -28,6 +28,9 @@ from typing import Callable, Optional
 
 import aiohttp
 
+from src.config import get_clob_credentials, has_clob_credentials
+from src.clob_auth import build_clob_auth_message
+
 logger = logging.getLogger(__name__)
 
 # ── Constantes ──────────────────────────────────────────────────────
@@ -122,6 +125,14 @@ class WebSocketManager:
         self.on_price: Callable | None = None
         self.on_state_change: Callable | None = None  # (token_id, old_state, new_state)
 
+        # CLOB credentials from .env (may be empty if not configured)
+        self._clob_creds = get_clob_credentials()
+        self._clob_authed = has_clob_credentials()
+        if self._clob_authed:
+            logger.info("CLOB WS: API credentials loaded — authenticated WebSocket enabled")
+        else:
+            logger.info("CLOB WS: API credentials NOT configured — public-only WebSocket")
+
     # ── Connection Lifecycle ──────────────────────────────────────
 
     async def connect(self) -> None:
@@ -173,6 +184,9 @@ class WebSocketManager:
                 self._reconnect_attempt = 0
                 logger.info("WebSocket conectado a %s", self._config.url)
 
+                # Enviar auth si hay credenciales CLOB
+                await self._send_auth()
+
                 # Re-suscribir todos los mercados trackeados
                 await self._resubscribe_all()
                 return
@@ -197,6 +211,22 @@ class WebSocketManager:
                     reason="reconnect",
                 )
                 await self._subscribe_internal(token_id)
+
+    async def _send_auth(self) -> None:
+        """Send CLOB WebSocket authentication message if credentials exist."""
+        if not self._clob_authed or not self._ws:
+            return
+
+        try:
+            auth_msg = build_clob_auth_message(
+                api_key=self._clob_creds["api_key"],
+                secret=self._clob_creds["secret"],
+                passphrase=self._clob_creds["passphrase"],
+            )
+            await self._ws.send_json(auth_msg)
+            logger.info("CLOB WS: auth message sent")
+        except Exception as e:
+            logger.warning("CLOB WS: auth message failed — %s", e)
 
     # ── Subscribe / Unsubscribe ─────────────────────────────────────
 
