@@ -330,10 +330,8 @@ class WebSocketManager:
     async def _handle_message(self, raw: str) -> None:
         """Procesa un mensaje recibido del WebSocket (protocolo CLOB Market).
 
-        Los mensajes tienen el campo 'event_type' con valores como:
-        'book', 'price_change', 'last_trade_price', 'tick_size_change'.
-
-        El primer mensaje tras suscripción puede ser un array de assets_ids confirmados.
+        El servidor manda arrays de objetos, donde cada objeto es un evento
+        con campos: market, asset_id, timestamp, y posiblemente bids/asks.
         """
         try:
             data = json.loads(raw)
@@ -341,16 +339,24 @@ class WebSocketManager:
             logger.debug("Mensaje no-JSON: %.100s", raw)
             return
 
-        # Handle array messages (e.g., initial subscription confirmation: ["id1","id2",...])
+        # Handle array messages — each element is an event
         if isinstance(data, list):
-            logger.info("WS ⇐ array (%d items): %.200s", len(data), raw[:200])
+            for item in data:
+                if isinstance(item, dict):
+                    await self._handle_single_message(item)
+                else:
+                    logger.debug("WS ⇐ array element non-dict: %s", type(item).__name__)
             return
 
-        # Handle dict messages
-        if not isinstance(data, dict):
-            logger.info("WS ⇐ non-dict: %s", type(data).__name__)
+        # Handle single dict message
+        if isinstance(data, dict):
+            await self._handle_single_message(data)
             return
 
+        logger.debug("WS ⇐ unexpected: %s", type(data).__name__)
+
+    async def _handle_single_message(self, data: dict) -> None:
+        """Process a single market event dict from the WS."""
         event_type = data.get("event_type", data.get("type", ""))
 
         if event_type in ("book",):
@@ -358,13 +364,18 @@ class WebSocketManager:
         elif event_type in ("price_change", "last_trade_price"):
             await self._handle_price(data)
         elif event_type == "tick_size_change":
-            logger.info("WS ⇐ tick_size_change: %.200s", raw[:200])
-        elif event_type in ("subscriptions", "subscribed", "unsubscribed"):
-            logger.info("WS ⇐ subscription ack: %s", event_type)
+            logger.info("WS ⇐ tick_size_change: %s", json.dumps(data)[:200])
         elif event_type == "error":
             logger.error("WS ⇐ server error: %s", data)
+        elif "asset_id" in data:
+            # Market event without explicit event_type — log first occurrence
+            logger.info("WS ⇐ market event: asset=%s market=%s",
+                        data.get("asset_id", "?")[:16],
+                        data.get("market", "?")[:16])
+        elif event_type:
+            logger.info("WS ⇐ unknown [%s]: %.200s", event_type, json.dumps(data)[:200])
         else:
-            logger.info("WS ⇐ unknown [%s]: %.300s", event_type, raw[:300])
+            logger.info("WS ⇐ msg: %.300s", json.dumps(data)[:300])
 
     # ── Message Handlers ──────────────────────────────────────────
 
