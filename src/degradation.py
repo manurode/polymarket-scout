@@ -205,16 +205,19 @@ class DegradationManager:
         elif not redis_healthy and self._state.mode not in (SystemMode.REDIS_DOWN, SystemMode.MINIMAL):
             self.set_mode(SystemMode.REDIS_DOWN, "Redis health check failed")
 
-        # Auto-recovery: intentar subir de modo tras timeout
+        # Auto-recovery: recuperar inmediatamente cuando el componente vuelve
         if self.auto_recover:
-            time_in_mode = now - self._state.last_mode_change
-            if time_in_mode > self.recovery_timeout:
-                if self._state.mode == SystemMode.CLOB_WS_DOWN and clob_healthy:
-                    self.set_mode(SystemMode.FULL, "auto-recovery: CLOB WS restored")
-                elif self._state.mode == SystemMode.POLYGON_RPC_DOWN and polygon_healthy:
-                    self.set_mode(SystemMode.FULL, "auto-recovery: Polygon RPC restored")
-                elif self._state.mode == SystemMode.REDIS_DOWN and redis_healthy:
-                    self.set_mode(SystemMode.FULL, "auto-recovery: Redis restored")
+            if self._state.mode == SystemMode.CLOB_WS_DOWN and clob_healthy:
+                self.set_mode(SystemMode.FULL, "auto-recovery: CLOB WS restored")
+            elif self._state.mode == SystemMode.POLYGON_RPC_DOWN and polygon_healthy:
+                self.set_mode(SystemMode.FULL, "auto-recovery: Polygon RPC restored")
+            elif self._state.mode == SystemMode.REDIS_DOWN and redis_healthy:
+                self.set_mode(SystemMode.FULL, "auto-recovery: Redis restored")
+
+            # Recovery from composite degraded states (FULL only if all components are healthy)
+            if self._state.mode in (SystemMode.POLYGON_RPC_DOWN, SystemMode.CLOB_WS_DOWN):
+                if clob_healthy and polygon_healthy and redis_healthy:
+                    self.set_mode(SystemMode.FULL, "auto-recovery: all components healthy")
 
     # ── Strategy Compatibility ────────────────────────────────────
 

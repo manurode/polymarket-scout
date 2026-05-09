@@ -672,10 +672,25 @@ class ScoutOrchestrator:
     # ── WebSocket Callbacks ─────────────────────────────────────────
 
     def _on_ws_book(self, asset_id: str, data: dict) -> None:
-        """Callback: WS book event → BookAnalyzer."""
+        """Callback: WS book event -> BookAnalyzer.
+
+        Estrategia dual:
+        - Si el book NO existe aun en BookAnalyzer -> initialize_book (populateo completo).
+        - Si YA existe -> apply_delta (merge de updates, preserva niveles no mencionados).
+
+        Esto evita que un delta parcial del WS machaque un snapshot REST completo.
+        """
         try:
             if self.book_analyzer:
-                self.book_analyzer.initialize_book(asset_id, data)
+                existing = self.book_analyzer.get_book(asset_id)
+                is_new_type = data.get("type", "") == "new"
+
+                if existing is None or existing.bid_count == 0 or is_new_type:
+                    # Book vacio o es un snapshot completo -> populateo total
+                    self.book_analyzer.initialize_book(asset_id, data)
+                else:
+                    # Book ya existe -> merge delta (preserva niveles no afectados)
+                    self.book_analyzer.apply_delta(asset_id, data)
         except Exception as e:
             logger.error("WS book callback error: %s", e, exc_info=True)
 

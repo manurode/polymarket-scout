@@ -258,7 +258,7 @@ class WebSocketManager:
         )
         self._books[token_id] = tracker
 
-        # Bootstrap: obtener snapshot REST
+        # Bootstrap: obtener snapshot REST y aplicarlo al BookAnalyzer
         if fetch_snapshot and self._scanner:
             try:
                 snapshot = await self._scanner.get_book_async(token_id)
@@ -268,6 +268,12 @@ class WebSocketManager:
                     tracker.seq_num = int(snapshot["seq_num"])
                 tracker.last_delta_time = time.monotonic()
                 await self._transition_state(tracker, BookState.CLEAN, reason="bootstrap")
+                # ── Aplicar snapshot al BookAnalyzer vía callback ──
+                # Esto asegura que el order book local se inicialice con
+                # datos reales ANTES de procesar deltas del WS.
+                if self.on_book_delta:
+                    self.on_book_delta(token_id, snapshot)
+                    logger.debug("BookAnalyzer initialized from REST snapshot for %s", token_id[:16])
             except Exception as e:
                 logger.warning("No se pudo obtener snapshot para %s: %s", token_id, e)
                 # Seguimos en INIT, los deltas nos sacarán de ahí
