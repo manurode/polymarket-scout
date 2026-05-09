@@ -582,12 +582,11 @@ class ScoutOrchestrator:
                     if not self._running:
                         break
 
-                    # Datos del book desde BookAnalyzer (alimentado por WS deltas)
-                    fair_price = self.book_analyzer.get_mid_price(token_id) if self.book_analyzer else 0.5
-                    spread = self.book_analyzer.get_spread(token_id) if self.book_analyzer else 0.02
-                    best_bid = self.book_analyzer.get_book(token_id)
-                    best_bid_price = best_bid.bids[0, 0] if best_bid and best_bid.bids.shape[0] > 0 else 0.0
-                    best_ask_price = best_bid.asks[0, 0] if best_bid and best_bid.asks.shape[0] > 0 else 0.0
+                    # ── Datos del book desde BookAnalyzer (alimentado por WS deltas) ──
+                    book_snap = self.book_analyzer.get_book(token_id) if self.book_analyzer else None
+                    best_bid_price = book_snap.bids[0, 0] if book_snap and book_snap.bid_count > 0 else 0.0
+                    best_ask_price = book_snap.asks[0, 0] if book_snap and book_snap.ask_count > 0 else 0.0
+                    clob_spread = best_ask_price - best_bid_price if best_bid_price > 0 and best_ask_price > 0 else 1.0
 
                     # Gamma price como referencia (lo que el mercado realmente cree)
                     gamma_price = None
@@ -598,7 +597,33 @@ class ScoutOrchestrator:
                             gamma_price = snap.get("price_yes")
                             break
 
-                    # Si no hay mid price real, saltar
+                    # ── Fair price: Gamma > CLOB mid (si el spread es razonable) ──
+                    # Si el spread del CLOB es >20%, el mid es basura → usar Gamma.
+                    # Si no hay Gamma, usar CLOB mid solo si el spread es aceptable.
+                    if gamma_price is not None:
+                        fair_price = float(gamma_price)
+                    elif clob_spread <= 0.20 and book_snap:
+                        fair_price = book_snap.mid_price
+                    else:
+                        # Ni Gamma ni CLOB usable → saltar este mercado
+                        logger.debug("MM skip %s: no usable fair price (gamma=None, clob_spread=%.3f)", token_id, clob_spread)
+                        continue
+
+                    spread = clob_spread
+
+                    # ── Saltar mercados sin datos reales ──
+                    if book_snap is None or book_snap.bid_count == 0 or book_snap.ask_count == 0:
+                        logger.debug("MM skip %s: order book empty (bid_count=%d, ask_count=%d)",
+                                     token_id, book_snap.bid_count if book_snap else 0,
+                                     book_snap.ask_count if book_snap else 0)
+                        continue
+
+                    # ── Saltar mercados con spreads extremos (no hay liquidez real) ──
+                    if clob_spread > 0.50:
+                        logger.debug("MM skip %s: spread demasiado alto (%.3f > 0.50)", token_id, clob_spread)
+                        continue
+
+                    # Si el fair price está en los extremos, saltar
                     if fair_price <= 0.01 or fair_price >= 0.99:
                         continue
 
