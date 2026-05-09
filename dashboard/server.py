@@ -142,11 +142,11 @@ def _register_routes(app: FastAPI) -> None:
         orch = request.app.state.orchestrator
         if orch and hasattr(orch, "ws_manager") and orch.ws_manager:
             metrics = orch.ws_manager.get_health_metrics()
-            clean_count = sum(1 for m in metrics.values() if m.get("state") == "clean")
+            clean_count = sum(1 for m in metrics.values() if m.get("state") == "CLEAN")
             reconciling = [
                 {"token_id": tid, **m}
                 for tid, m in metrics.items()
-                if m.get("state") != "clean"
+                if m.get("state") == "RECONCILING"
             ]
             return {
                 "total": len(metrics),
@@ -288,14 +288,23 @@ def _register_routes(app: FastAPI) -> None:
         """Get real-time latency budget for critical path stages."""
         orch = request.app.state.orchestrator
         stages = []
+        stale_markets = 0  # mercados no-CLEAN (INIT o RECONCILING)
         if orch:
-            ws_lat = 999.0
+            ws_lat = 0.0  # ms desde ultimo book event en mercados CLEAN
             if orch.ws_manager:
                 metrics = orch.ws_manager.get_health_metrics()
                 if metrics:
-                    ages = [m.get("last_delta_age_ms", -1) for m in metrics.values() if m.get("last_delta_age_ms", -1) >= 0]
+                    ages = [
+                        m.get("last_delta_age_ms", -1)
+                        for m in metrics.values()
+                        if m.get("state") == "CLEAN" and m.get("last_delta_age_ms", -1) >= 0
+                    ]
                     if ages:
                         ws_lat = round(sum(ages) / len(ages), 1)
+                    stale_markets = sum(
+                        1 for m in metrics.values()
+                        if m.get("state") != "CLEAN"
+                    )
 
             # Clock time desde último radar scan
             radar_lat = 258.0  # default
@@ -342,6 +351,7 @@ def _register_routes(app: FastAPI) -> None:
             "stages": stages,
             "total_actual_ms": round(total_actual, 1),
             "total_budget_ms": total_budget,
+            "stale_markets": stale_markets,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 

@@ -39,6 +39,7 @@ HEARTBEAT_INTERVAL = 30      # segundos entre pings
 RECONNECT_DELAY_BASE = 1.0   # delay inicial para exponential backoff
 RECONNECT_DELAY_MAX = 30.0   # delay máximo de reconexión
 GAP_TIMEOUT = 300            # segundos sin delta → forzar RECONCILING (5 min)
+RECONCILE_COOLDOWN = 60     # segundos entre intentos de reconciliación automática
 
 # Capacidad del buffer circular de deltas durante reconciliación
 DELTA_BUFFER_CAPACITY = 1000
@@ -64,6 +65,7 @@ class _BookTracker:
     last_delta_time: float = 0.0  # timestamp del último delta recibido
     snapshot: dict | None = None  # último snapshot REST
     delta_buffer: list = field(default_factory=list)  # deltas pendientes durante RECONCILING
+    last_reconcile_attempt: float = 0.0  # timestamp del último intento de reconcile
 
 
 @dataclass
@@ -412,6 +414,13 @@ class WebSocketManager:
         now = time.monotonic()
         tracker.last_delta_time = now
 
+        # Track book version: Polymarket envía snapshots completos (no seq_num),
+        # usamos contador local como version identifier.
+        if tracker.seq_num < 0:
+            tracker.seq_num = 0  # primer book event recibido
+        else:
+            tracker.seq_num += 1
+
         # Polymarket sends full snapshots, not deltas. Mark as CLEAN on first book.
         if tracker.state == BookState.INIT:
             await self._transition_state(tracker, BookState.CLEAN, reason="first_book")
@@ -454,27 +463,46 @@ class WebSocketManager:
                     self._connected = False
 
     async def _health_check_loop(self) -> None:
-        """Monitoriza gaps y fuerza reconciliación si es necesario."""
+        """Monitoriza gaps y fuerza reconciliacion si es necesario."""
         while self._running:
             await asyncio.sleep(5)  # check cada 5s
 
             now = time.monotonic()
             for token_id, tracker in list(self._books.items()):
-                if tracker.state != BookState.CLEAN:
-                    continue
+                if tracker.state == BookState.CLEAN:
+                    # Sin deltas por mucho tiempo -> posible desconexion silenciosa
+                    if tracker.last_delta_time > 0:
+                        age = now - tracker.last_delta_time
+                        if age > self._config.gap_timeout:
+                            logger.warning(
+                                "Timeout de deltas para %s: %.0fs sin actividad",
+                                token_id, age,
+                            )
+                            await self._transition_state(
+                                tracker, BookState.RECONCILING,
+                                reason=f"timeout: {age:.0f}s sin delta",
+                            )
 
-                # Sin deltas por mucho tiempo → posible desconexión silenciosa
-                if tracker.last_delta_time > 0:
-                    age = now - tracker.last_delta_time
-                    if age > self._config.gap_timeout:
-                        logger.warning(
-                            "Timeout de deltas para %s: %.0fs sin actividad",
-                            token_id, age,
+                elif tracker.state == BookState.RECONCILING:
+                    # Auto-reconciliacion periodica para mercados en RECONCILING
+                    if tracker.last_reconcile_attempt > 0:
+                        since_last = now - tracker.last_reconcile_attempt
+                    else:
+                        since_last = RECONCILE_COOLDOWN + 1  # primer intento inmediato
+                    if since_last > RECONCILE_COOLDOWN:
+                        tracker.last_reconcile_attempt = now
+                        logger.info(
+                            "Auto-reconciliando %s (RECONCILING)...",
+                            token_id[:16],
                         )
-                        await self._transition_state(
-                            tracker, BookState.RECONCILING,
-                            reason=f"timeout: {age:.0f}s sin delta",
-                        )
+                        try:
+                            ok = await self.reconcile(token_id)
+                            if ok:
+                                logger.info("Auto-reconciliacion OK: %s", token_id[:16])
+                            else:
+                                logger.debug("Auto-reconciliacion fallida: %s", token_id[:16])
+                        except Exception as e:
+                            logger.warning("Error en auto-reconciliacion %s: %s", token_id[:16], e)
 
     # ── Reconciliation ────────────────────────────────────────────
 
