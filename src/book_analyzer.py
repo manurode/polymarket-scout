@@ -45,6 +45,8 @@ class BookSnapshot:
     token_id: str
     bids: np.ndarray       # shape (MAX_BOOK_LEVELS, 2): [[price, size], ...]
     asks: np.ndarray       # shape (MAX_BOOK_LEVELS, 2)
+    bid_count: int         # niveles activos en bids
+    ask_count: int         # niveles activos en asks
     obi: float             # Order Book Imbalance en [-1, +1]
     mid_price: float       # precio medio del best bid/ask
     spread: float          # spread en valor absoluto
@@ -360,6 +362,8 @@ class BookAnalyzer:
             token_id=token_id,
             bids=book.bids.copy(),
             asks=book.asks.copy(),
+            bid_count=book.bid_count,
+            ask_count=book.ask_count,
             obi=self.get_obi(token_id),
             mid_price=book.mid_price,
             spread=book.spread,
