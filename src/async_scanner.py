@@ -297,6 +297,8 @@ class AsyncPolymarketScanner:
                     "volume": volume,
                     "liquidity": float(market.get("liquidity", 0)),
                     "timestamp": now,
+                    "clobTokenIds": tokens,        # para MM suscripción WS
+                    "end_date": market.get("endDate", ""),
                 })
 
         return snapshots

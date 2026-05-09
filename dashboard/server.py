@@ -200,6 +200,36 @@ def _register_routes(app: FastAPI) -> None:
             alpha, flow = _mock_whales()
         return {"alpha_whales": alpha, "whale_flow": flow}
 
+    # ── Market Making ─────────────────────────────────────────────────────────────────
+
+    @app.get("/api/market-making/status")
+    async def market_making_status(request: Request):
+        """Get Market Making engine status."""
+        orch = request.app.state.orchestrator
+        if orch:
+            ws = orch.ws_manager
+            mm = orch.market_maker
+            return {
+                "websocket_connected": ws.is_connected if ws else False,
+                "clob_authed": ws._clob_authed if ws else False,
+                "markets_active": orch._mm_markets_active,
+                "quotes_generated": orch._mm_quotes_generated,
+                "quotes_skipped": orch._mm_quotes_skipped,
+                "errors": orch._mm_errors,
+                "last_quote_age_s": round(
+                    (__import__("time").time() - orch._mm_last_quote_time), 1
+                ) if orch._mm_last_quote_time > 0 else -1,
+                "active_tokens": list(orch._mm_active_tokens)[:20],
+                "mm_state": {
+                    "tracked_markets": len(mm._states) if mm else 0,
+                    "paused_markets": sum(
+                        1 for s in (mm._states.values() if mm else [])
+                        if __import__("time").time() < s.pause_until
+                    ),
+                } if mm else {},
+            }
+        return {"error": "no orchestrator"}
+
     # ── Markets / Radar ─────────────────────────────────────────────────────────────────
 
     @app.get("/api/markets/radar")

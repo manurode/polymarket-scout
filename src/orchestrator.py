@@ -54,6 +54,8 @@ DEFAULT_MARKOUT_UPDATE_INTERVAL = 5  # segundos entre actualizaciones de markout
 PAPER_MTM_INTERVAL = 5            # segundos entre mark-to-market
 PAPER_AUTO_CLOSE_INTERVAL = 10    # segundos entre evaluaciones de auto-close
 PAPER_SIGNAL_INTERVAL = 30        # segundos entre señales de trading (demo)
+MM_QUOTE_INTERVAL = 10            # segundos entre cotizaciones de market making
+MM_TOP_MARKETS = 10               # cuántos mercados del Top 50 trackear con MM
 
 
 class ScoutOrchestrator:
@@ -131,6 +133,14 @@ class ScoutOrchestrator:
         self._market_prices: dict[str, float] = {}  # market_name → price
         self._last_radar_snapshots: list[dict] = []
 
+        # ── Market Making State ───────────────────────────────────────────────────
+        self._mm_quotes_generated: int = 0
+        self._mm_quotes_skipped: int = 0
+        self._mm_markets_active: int = 0
+        self._mm_last_quote_time: float = 0.0
+        self._mm_errors: int = 0
+        self._mm_active_tokens: set = set()  # token_ids actualmente suscritos
+
     # ── Lifecycle ─────────────────────────────────────────────────
 
     async def start(self) -> None:
@@ -182,7 +192,13 @@ class ScoutOrchestrator:
             asyncio.create_task(self._paper_mtm_loop()),
             asyncio.create_task(self._paper_auto_close_loop()),
             asyncio.create_task(self._paper_signal_loop()),
+            asyncio.create_task(self._market_making_loop()),
         ]
+
+        # ── 9. Conectar WebSocket CLOB en background ──────────
+        if self.ws_manager and not self.ws_manager.is_connected:
+            asyncio.create_task(self.ws_manager.connect())
+            logger.info("CLOB WebSocket conectando en background...")
 
         logger.info("Scout Lab v2.0 — Todos los daemons arrancados")
 
@@ -475,6 +491,157 @@ class ScoutOrchestrator:
 
             await asyncio.sleep(PAPER_SIGNAL_INTERVAL)
 
+    # ── Market Making Loop ───────────────────────────────────────────
+
+    async def _market_making_loop(self) -> None:
+        """Market Making Daemon: conecta CLOB WS, genera quotes, aplica protecciones.
+
+        Flujo cada MM_QUOTE_INTERVAL segundos:
+        1. Espera a que el WS esté conectado
+        2. Toma los Top N mercados del selection engine
+        3. Subscribe/Unsubscribe dinámicamente del WS
+        4. Para cada mercado activo → calcula quote vía MarketMaker
+        5. Evalúa protecciones (OBI, whale, flash crash, reconciling)
+        6. Imprime quote en INFO si es seguro cotizar
+        """
+        logger.info(
+            "Market Making daemon iniciado (intervalo: %ds, top: %d mercados, creds: %s)",
+            MM_QUOTE_INTERVAL, MM_TOP_MARKETS,
+            "✅" if self.ws_manager._clob_authed else "❌ sin API keys",
+        )
+
+        while self._running:
+            try:
+                # ── Esperar a que el WS esté conectado ──────────
+                if not self.ws_manager or not self.ws_manager.is_connected:
+                    await asyncio.sleep(2)
+                    continue
+
+                # ── Obtener Top N mercados del radar ────────────
+                snapshots = getattr(self, '_last_radar_snapshots', [])
+                if not snapshots:
+                    await asyncio.sleep(5)
+                    continue
+
+                ranked = self.selection_engine.rank(snapshots)
+                top_snapshots = ranked.top[:MM_TOP_MARKETS]
+
+                wanted_tokens: set[str] = set()
+                token_to_snap: dict[str, dict] = {}  # token_id → snapshot
+                for ms in top_snapshots:
+                    tokens = ms.snapshot.get("clobTokenIds", [])
+                    if isinstance(tokens, list) and len(tokens) > 0:
+                        tid = tokens[0]
+                        wanted_tokens.add(tid)
+                        token_to_snap[tid] = ms.snapshot
+
+                # ── Subscribe nuevos / Unsubscribe salientes ────
+                current_tokens = self._mm_active_tokens
+                to_add = wanted_tokens - current_tokens
+                to_remove = current_tokens - wanted_tokens
+
+                for token_id in to_remove:
+                    try:
+                        await self.ws_manager.unsubscribe_book(token_id)
+                        logger.debug("MM unsubscribe: %s", token_id)
+                    except Exception as e:
+                        logger.debug("MM unsubscribe error %s: %s", token_id, e)
+
+                for token_id in to_add:
+                    snap = token_to_snap.get(token_id, {})
+                    condition_id = snap.get("condition_id", "")
+                    question = snap.get("question", "")
+                    try:
+                        await self.ws_manager.subscribe_book(
+                            token_id, condition_id=condition_id, fetch_snapshot=True,
+                        )
+                        logger.info("MM subscribed: %s (%s...)", token_id, question[:60])
+                    except Exception as e:
+                        logger.warning("MM subscribe error %s: %s", token_id, e)
+
+                self._mm_active_tokens = wanted_tokens
+                self._mm_markets_active = len(wanted_tokens)
+
+                # ── Generar quotes para mercados activos ────────
+                quotes_this_cycle = 0
+                import time as _time
+                now = _time.time()
+
+                for token_id in list(self._mm_active_tokens):
+                    if not self._running:
+                        break
+
+                    # Datos del book desde BookAnalyzer (alimentado por WS deltas)
+                    fair_price = self.book_analyzer.get_mid_price(token_id) if self.book_analyzer else 0.5
+                    spread = self.book_analyzer.get_spread(token_id) if self.book_analyzer else 0.02
+
+                    # Si no hay mid price real, saltar
+                    if fair_price <= 0.01 or fair_price >= 0.99:
+                        continue
+
+                    # Estado del WS para este token
+                    ws_state = self.ws_manager.get_state(token_id)
+                    book_reconciling = ws_state is not None and str(ws_state) != "BookState.CLEAN"
+
+                    # ¿Es seguro cotizar?
+                    should_q, reason = self.market_maker.should_quote(
+                        token_id=token_id,
+                        whale_detected=False,
+                        book_reconciling=book_reconciling,
+                        now=now,
+                    )
+
+                    if not should_q:
+                        self._mm_quotes_skipped += 1
+                        if "paused" not in reason:  # no spamear pauses
+                            logger.debug("MM skip %s: %s", token_id, reason)
+                        continue
+
+                    # Calcular quote
+                    quote = self.market_maker.calculate_quote(
+                        token_id=token_id,
+                        fair_price=fair_price,
+                        spread=spread,
+                        now=now,
+                    )
+
+                    if quote and not quote.paused:
+                        quotes_this_cycle += 1
+                        self._mm_quotes_generated += 1
+                        self._mm_last_quote_time = now
+
+                        # ── Log de quote en INFO ────────────────
+                        logger.info(
+                            "MM QUOTE %s | mid=%.4f spread=%.4f | "
+                            "bid=%.4f (size=$%.0f) ask=%.4f (size=$%.0f) | "
+                            "qw=%.2fx vol=%.2f inv=%.2f td=%.2f",
+                            token_id[:12],
+                            fair_price, spread,
+                            quote.bid_price, quote.bid_size,
+                            quote.ask_price, quote.ask_size,
+                            quote.quote_width_multiplier,
+                            quote.volatility_scalar,
+                            quote.inventory_scalar,
+                            quote.time_decay_scalar,
+                        )
+
+                if quotes_this_cycle > 0:
+                    logger.info(
+                        "MM cycle: %d quotes | %d active markets | "
+                        "generated=%d skipped=%d errors=%d",
+                        quotes_this_cycle, len(self._mm_active_tokens),
+                        self._mm_quotes_generated, self._mm_quotes_skipped,
+                        self._mm_errors,
+                    )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self._mm_errors += 1
+                logger.error("Error en market making loop: %s", e)
+
+            await asyncio.sleep(MM_QUOTE_INTERVAL)
+
     # ── Callback para Adaptive Engine ──────────────────────────────────────────────
 
     def _on_trade_close(self, strategy: str, pnl: float) -> None:
@@ -603,6 +770,8 @@ class ScoutOrchestrator:
     def get_system_status(self) -> dict:
         """Retorna el estado completo del sistema para monitorización."""
         pt = self.paper_trading
+        import time as _time
+        mm_last_age = _time.time() - self._mm_last_quote_time if self._mm_last_quote_time > 0 else -1
         return {
             "mode": self.degradation.get_mode().value if self.degradation else "unknown",
             "degradation_metrics": self.degradation.get_degradation_metrics() if self.degradation else {},
@@ -612,6 +781,15 @@ class ScoutOrchestrator:
             "active_strategies": self.portfolio_manager.get_active_strategies() if self.portfolio_manager else [],
             "alpha_whales": len(self.whale_tracker.get_alpha_whales()) if self.whale_tracker else 0,
             "websocket_connected": self.ws_manager.is_connected if self.ws_manager else False,
+            "clob_auth": self.ws_manager._clob_authed if self.ws_manager else False,
+            "market_making": {
+                "markets_active": self._mm_markets_active,
+                "quotes_generated": self._mm_quotes_generated,
+                "quotes_skipped": self._mm_quotes_skipped,
+                "errors": self._mm_errors,
+                "last_quote_age_s": round(mm_last_age, 1),
+                "active_tokens": list(self._mm_active_tokens)[:10],  # primeros 10
+            },
             "paper_trading": {
                 "open_positions": pt.open_position_count if pt else 0,
                 "total_pnl": round(pt.total_pnl, 2) if pt else 0,
