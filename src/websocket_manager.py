@@ -331,11 +331,23 @@ class WebSocketManager:
 
         Los mensajes tienen el campo 'event_type' con valores como:
         'book', 'price_change', 'last_trade_price', 'tick_size_change'.
+
+        El primer mensaje tras suscripción puede ser un array de assets_ids confirmados.
         """
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
             logger.debug("Mensaje no-JSON: %.100s", raw)
+            return
+
+        # Handle array messages (e.g., initial subscription confirmation: ["id1","id2",...])
+        if isinstance(data, list):
+            logger.debug("WS array message (%d items): %.200s", len(data), raw[:200])
+            return
+
+        # Handle dict messages
+        if not isinstance(data, dict):
+            logger.debug("WS non-dict message: %s", type(data).__name__)
             return
 
         event_type = data.get("event_type", data.get("type", ""))
