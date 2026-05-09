@@ -578,23 +578,27 @@ class ScoutOrchestrator:
                     if not self._running:
                         break
 
-                    # Datos del book desde BookAnalyzer (alimentado por WS deltas)
-                    fair_price = self.book_analyzer.get_mid_price(token_id) if self.book_analyzer else 0.5
-                    spread = self.book_analyzer.get_spread(token_id) if self.book_analyzer else 0.02
+                    # ── Get fair price from Gamma radar snapshots ──
+                    fair_price = 0.5
+                    spread = 0.03  # default 3% spread for Gamma-based quotes
+                    snapshots = getattr(self, '_last_radar_snapshots', [])
+                    for snap in snapshots:
+                        tokens = snap.get("clobTokenIds", [])
+                        if isinstance(tokens, list) and len(tokens) > 0 and tokens[0] == token_id:
+                            price_yes = snap.get("price_yes")
+                            if price_yes is not None and 0.01 < price_yes < 0.99:
+                                fair_price = float(price_yes)
+                            break
 
                     # Si no hay mid price real, saltar
                     if fair_price <= 0.01 or fair_price >= 0.99:
                         continue
 
-                    # Estado del WS para este token
-                    ws_state = self.ws_manager.get_state(token_id)
-                    book_reconciling = ws_state is not None and str(ws_state) != "BookState.CLEAN"
-
                     # ¿Es seguro cotizar?
                     should_q, reason = self.market_maker.should_quote(
                         token_id=token_id,
                         whale_detected=False,
-                        book_reconciling=book_reconciling,
+                        book_reconciling=False,
                         now=now,
                     )
 
