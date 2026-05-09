@@ -182,10 +182,8 @@ class WebSocketManager:
                 self._reconnect_attempt = 0
                 logger.info("WebSocket conectado a %s", self._config.url)
 
-                # Enviar suscripción MARKET con todos los tokens trackeados
-                await self._send_market_subscription()
-
                 # Re-suscribir todos los mercados trackeados
+                # (esto envía el mensaje MARKET con todos los assets)
                 await self._resubscribe_all()
                 return
 
@@ -201,14 +199,15 @@ class WebSocketManager:
 
     async def _resubscribe_all(self) -> None:
         """Re-suscribe todos los mercados activos tras reconexión."""
+        # Reset all trackers to INIT (will transition to CLEAN on first delta)
         for token_id, tracker in list(self._books.items()):
-            if tracker.state != BookState.INIT:
-                # Marcar como INIT para forzar nuevo snapshot
-                await self._transition_state(
-                    tracker, BookState.INIT,
-                    reason="reconnect",
-                )
-                await self._subscribe_internal(token_id)
+            await self._transition_state(
+                tracker, BookState.INIT,
+                reason="reconnect",
+            )
+
+        # Send full MARKET subscription with ALL tracked assets
+        await self._send_market_subscription()
 
     async def _send_market_subscription(self) -> None:
         """Send MARKET subscription with all tracked asset IDs on connect."""
@@ -268,6 +267,7 @@ class WebSocketManager:
     async def _subscribe_internal(self, token_id: str) -> None:
         """Envía mensaje de suscripción al WebSocket (protocolo CLOB Market)."""
         if not self._connected or self._ws is None:
+            logger.warning("WS subscribe deferred for %s (not connected)", token_id[:12])
             return
 
         try:
@@ -275,6 +275,7 @@ class WebSocketManager:
                 "assets_ids": [token_id],
                 "operation": "subscribe",
             })
+            logger.info("WS ⇒ subscribe: %s", token_id[:16])
         except Exception as e:
             logger.error("Error suscribiendo %s: %s", token_id, e)
 
@@ -342,12 +343,12 @@ class WebSocketManager:
 
         # Handle array messages (e.g., initial subscription confirmation: ["id1","id2",...])
         if isinstance(data, list):
-            logger.debug("WS array message (%d items): %.200s", len(data), raw[:200])
+            logger.info("WS ⇐ array (%d items): %.200s", len(data), raw[:200])
             return
 
         # Handle dict messages
         if not isinstance(data, dict):
-            logger.debug("WS non-dict message: %s", type(data).__name__)
+            logger.info("WS ⇐ non-dict: %s", type(data).__name__)
             return
 
         event_type = data.get("event_type", data.get("type", ""))
@@ -357,13 +358,13 @@ class WebSocketManager:
         elif event_type in ("price_change", "last_trade_price"):
             await self._handle_price(data)
         elif event_type == "tick_size_change":
-            logger.debug("Tick size change: %s", data)
+            logger.info("WS ⇐ tick_size_change: %.200s", raw[:200])
         elif event_type in ("subscriptions", "subscribed", "unsubscribed"):
-            logger.debug("Subscription ack: %s", event_type)
+            logger.info("WS ⇐ subscription ack: %s", event_type)
         elif event_type == "error":
-            logger.error("WebSocket server error: %s", data)
+            logger.error("WS ⇐ server error: %s", data)
         else:
-            logger.debug("Mensaje: type=%s", event_type)
+            logger.info("WS ⇐ unknown [%s]: %.300s", event_type, raw[:300])
 
     # ── Message Handlers ──────────────────────────────────────────
 
