@@ -210,19 +210,29 @@ class WebSocketManager:
         await self._send_market_subscription()
 
     async def _send_market_subscription(self) -> None:
-        """Send MARKET subscription with all tracked asset IDs on connect."""
+        """Send MARKET subscription with all tracked asset IDs.
+
+        This message ACTIVATES the data flow. The server requires it to be
+        sent before individual subscribe/unsubscribe messages take effect.
+        Always send it — even with 0 assets — to establish the channel.
+        """
         if not self._ws:
             return
         asset_ids = list(self._books.keys())
-        if not asset_ids:
-            logger.debug("CLOB WS: no assets to subscribe yet")
-            return
         try:
             msg = {"type": "MARKET", "assets_ids": asset_ids}
             await self._ws.send_json(msg)
-            logger.info("CLOB WS: MARKET subscription sent for %d assets", len(asset_ids))
+            if asset_ids:
+                logger.info("CLOB WS: MARKET sent with %d assets", len(asset_ids))
+            else:
+                logger.info("CLOB WS: MARKET sent (empty — channel initialized)")
         except Exception as e:
-            logger.warning("CLOB WS: MARKET subscription failed — %s", e)
+            logger.warning("CLOB WS: MARKET failed — %s", e)
+
+    async def _flush_market_subscription(self) -> None:
+        """Re-send MARKET message with current assets. Called after adding books."""
+        if self._connected and self._ws:
+            await self._send_market_subscription()
 
     # ── Subscribe / Unsubscribe ─────────────────────────────────────
 

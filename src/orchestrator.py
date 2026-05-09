@@ -562,6 +562,13 @@ class ScoutOrchestrator:
                 self._mm_active_tokens = wanted_tokens
                 self._mm_markets_active = len(wanted_tokens)
 
+                # ── Flush MARKET message after batch ──────────
+                if to_add and self.ws_manager:
+                    try:
+                        await self.ws_manager._flush_market_subscription()
+                    except Exception as e:
+                        logger.debug("MM flush market error: %s", e)
+
                 # ── Generar quotes para mercados activos ────────
                 quotes_this_cycle = 0
                 import time as _time
