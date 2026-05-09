@@ -374,3 +374,7 @@ class BookAnalyzer:
 
     def __len__(self) -> int:
         return len(self._books)
+
+    def __bool__(self) -> bool:
+        """A BookAnalyzer instance is always valid — never falsy."""
+        return True

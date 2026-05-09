@@ -661,7 +661,7 @@ class ScoutOrchestrator:
             if self.book_analyzer:
                 self.book_analyzer.initialize_book(asset_id, data)
         except Exception as e:
-            logger.debug("WS book callback error: %s", e)
+            logger.error("WS book callback error: %s", e, exc_info=True)
 
     def _on_ws_price(self, data: dict) -> None:
         """Callback: WS price event → TradeAggregator."""
