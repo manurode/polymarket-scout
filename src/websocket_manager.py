@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 # ── Constantes ──────────────────────────────────────────────────────
 
-WS_URL = "wss://ws-clob.polymarket.com"
+WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws"
 HEARTBEAT_INTERVAL = 30      # segundos entre pings
 RECONNECT_DELAY_BASE = 1.0   # delay inicial para exponential backoff
 RECONNECT_DELAY_MAX = 30.0   # delay máximo de reconexión
