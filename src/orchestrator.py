@@ -585,6 +585,18 @@ class ScoutOrchestrator:
                     # Datos del book desde BookAnalyzer (alimentado por WS deltas)
                     fair_price = self.book_analyzer.get_mid_price(token_id) if self.book_analyzer else 0.5
                     spread = self.book_analyzer.get_spread(token_id) if self.book_analyzer else 0.02
+                    best_bid = self.book_analyzer.get_book(token_id)
+                    best_bid_price = best_bid.bids[0, 0] if best_bid and best_bid.bids.shape[0] > 0 else 0.0
+                    best_ask_price = best_bid.asks[0, 0] if best_bid and best_bid.asks.shape[0] > 0 else 0.0
+
+                    # Gamma price como referencia (lo que el mercado realmente cree)
+                    gamma_price = None
+                    for ms in top_snapshots:
+                        snap = ms.snapshot
+                        ct = snap.get("clobTokenIds", [])
+                        if isinstance(ct, list) and len(ct) > 0 and ct[0] == token_id:
+                            gamma_price = snap.get("price_yes")
+                            break
 
                     # Si no hay mid price real, saltar
                     if fair_price <= 0.01 or fair_price >= 0.99:
@@ -624,10 +636,14 @@ class ScoutOrchestrator:
                         # ── Log de quote en INFO ────────────────
                         logger.info(
                             "MM QUOTE %s | mid=%.4f spread=%.4f | "
+                            "CLOB bb=%.4f ba=%.4f | "
+                            "gamma=%.4f | "
                             "bid=%.4f (size=$%.0f) ask=%.4f (size=$%.0f) | "
                             "qw=%.2fx vol=%.2f inv=%.2f td=%.2f",
                             token_id[:12],
                             fair_price, spread,
+                            best_bid_price, best_ask_price,
+                            gamma_price if gamma_price else -1,
                             quote.bid_price, quote.bid_size,
                             quote.ask_price, quote.ask_size,
                             quote.quote_width_multiplier,
