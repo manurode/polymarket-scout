@@ -67,7 +67,7 @@ radar:
   interval_seconds: 60           # polling interval for Gamma Radar
 
 websocket:
-  url: "wss://ws-subscriptions-clob.polymarket.com"
+  url: "wss://ws-clob.polymarket.com"
   heartbeat_interval: 30
   reconnect_delay_base: 1.0
   reconnect_delay_max: 30.0

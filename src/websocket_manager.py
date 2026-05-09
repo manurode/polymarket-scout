@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 # ── Constantes ──────────────────────────────────────────────────────
 
-WS_URL = "wss://ws-subscriptions-clob.polymarket.com"
+WS_URL = "wss://ws-clob.polymarket.com"
 HEARTBEAT_INTERVAL = 30      # segundos entre pings
 RECONNECT_DELAY_BASE = 1.0   # delay inicial para exponential backoff
 RECONNECT_DELAY_MAX = 30.0   # delay máximo de reconexión
@@ -176,8 +176,13 @@ class WebSocketManager:
 
         while self._running:
             try:
+                # Build URL with api_key param if we have credentials
+                ws_url = self._config.url
+                if self._clob_authed and self._clob_creds["api_key"]:
+                    ws_url = f"{ws_url}?api_key={self._clob_creds['api_key']}"
+
                 self._ws = await self._session.ws_connect(
-                    self._config.url,
+                    ws_url,
                     heartbeat=self._config.heartbeat_interval,
                 )
                 self._connected = True

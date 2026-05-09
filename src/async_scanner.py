@@ -16,6 +16,7 @@ import logging
 import time
 from typing import Optional
 from urllib.parse import urlparse, urlunparse
+from datetime import datetime, timezone
 
 import aiohttp
 
@@ -145,6 +146,21 @@ class AsyncPolymarketScanner:
             except (json.JSONDecodeError, TypeError):
                 return val
         return val
+
+    @staticmethod
+    def _parse_end_date(raw: str) -> float:
+        """Convert Gamma API ISO endDate to Unix timestamp.
+
+        Returns 0.0 if the date is missing or unparseable.
+        """
+        if not raw:
+            return 0.0
+        try:
+            # Handles: "2026-05-15T00:00:00Z", "2026-05-15T00:00:00+00:00", etc.
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return dt.timestamp()
+        except (ValueError, TypeError):
+            return 0.0
 
     # ── Gamma API (Radar Layer — sin rate-limit) ──────────────────
 
@@ -298,7 +314,7 @@ class AsyncPolymarketScanner:
                     "liquidity": float(market.get("liquidity", 0)),
                     "timestamp": now,
                     "clobTokenIds": tokens,        # para MM suscripción WS
-                    "end_date": market.get("endDate", ""),
+                    "end_date": self._parse_end_date(market.get("endDate", "")),
                 })
 
         return snapshots
