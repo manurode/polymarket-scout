@@ -39,6 +39,10 @@ SL_PCT = 0.10          # Stop Loss: -10% sobre precio de entrada
 TAU_LIQUIDATION = 0.95  # Liquidación forzosa si tau > 95%
 MAX_POSITION_AGE_H = 72  # Cierre forzoso tras 72h
 
+# Realismo del simulador
+SLIPPAGE_PCT = 0.01      # 1% de slippage aplicado al precio de cierre
+POL_COMMISSION = 0.02    # 0.02 POL por trade cerrado (gas simulado)
+
 
 # ── Tipos ─────────────────────────────────────────────────────────────────────────────
 
@@ -165,8 +169,12 @@ class PaperTradingEngine:
         position_id: int,
         close_price: float | None = None,
         reason: str = "manual",
+        apply_slippage: bool = True,
     ) -> dict | None:
         """Cierra una posición virtual y calcula P&L.
+
+        Aplica slippage realista del SLIPPAGE_PCT % cruzando contra liquidez L2.
+        Las comisiones se cobran en POL (gas simulado).
 
         Returns
         -------
@@ -179,6 +187,16 @@ class PaperTradingEngine:
                 return None
 
             price = close_price if close_price is not None else pos.mark
+
+            # ── Aplicar slippage realista ──────────────────────────────
+            # Al cerrar una posición YES, vendemos → recibimos un precio peor (slippage negativo).
+            # Al cerrar una posición NO, compramos para cerrar → precio peor.
+            if apply_slippage:
+                if pos.side == "YES":
+                    price = price * (1.0 - SLIPPAGE_PCT)   # vendemos más barato
+                else:
+                    price = price * (1.0 + SLIPPAGE_PCT)   # compramos más caro
+                price = round(max(0.001, min(0.999, price)), 6)
 
             # Calcular P&L
             if pos.side == "YES":
@@ -196,9 +214,8 @@ class PaperTradingEngine:
             self.wallet.usdc_collateral -= pos.size
             self.wallet.usdc_free += pos.size + pnl
 
-            # Gas simulado (0.01 POL por trade)
-            gas_cost = 0.01
-            self.wallet.pol_balance = max(0.0, self.wallet.pol_balance - gas_cost)
+            # Comisión en POL simulada (gas + protocolo)
+            self.wallet.pol_balance = max(0.0, self.wallet.pol_balance - POL_COMMISSION)
 
             # Registrar en historial
             trade = {
@@ -209,6 +226,7 @@ class PaperTradingEngine:
                 "size": pos.size,
                 "entry": pos.entry,
                 "exit": price,
+                "slippage_pct": SLIPPAGE_PCT * 100 if apply_slippage else 0.0,
                 "pnl": pos.pnl,
                 "pnl_pct": pos.pnl_pct,
                 "reason": reason,
@@ -216,18 +234,20 @@ class PaperTradingEngine:
             }
             self._trade_history.append(trade)
 
-            # Feedback al PortfolioManager
+            # ── Feedback al PortfolioManager (Bandit) ─────────────────────
             if self.pm:
                 equity_before = self.wallet.usdc_total - pnl  # equity antes de aplicar P&L
                 self.pm.record_trade(pos.strategy, pnl, equity_before)
-                # Actualizar Sortino con el trade recién cerrado
+                # Actualizar Sortino con todos los trades cerrados de esta estrategia
                 strategy_trades = [
                     {"pnl": t["pnl"], "amount_invested": t["size"]}
                     for t in self._trade_history
                     if t["strategy"] == pos.strategy
                 ]
-                self.pm.update_strategy_performance(pos.strategy, strategy_trades)
-            
+                sortino = self.pm.update_strategy_performance(pos.strategy, strategy_trades)
+                # Log del Bandit: asignación actualizada
+                self._log_bandit_allocation(pos.strategy, sortino)
+
             # Feedback al AdaptiveStrategyEngine via callback
             if self.on_trade_close:
                 try:
@@ -236,10 +256,31 @@ class PaperTradingEngine:
                     logger.error("Error en on_trade_close callback: %s", e)
 
             logger.info(
-                "PaperTrade CLOSE #%d %s P&L=$%.2f (%.1f%%) reason=%s",
-                pos.id, pos.strategy, pnl, pos.pnl_pct, reason,
+                "PaperTrade CLOSE #%d [%s] %s P&L=$%.2f (%.1f%%) slippage=%.1f%% reason=%s",
+                pos.id, pos.strategy, pos.market[:40],
+                pnl, pos.pnl_pct, SLIPPAGE_PCT * 100, reason,
             )
             return trade
+
+    def _log_bandit_allocation(self, updated_strategy: str, sortino: float) -> None:
+        """Emite un log INFO con el estado del Bandit tras actualizar una estrategia."""
+        if not self.pm:
+            return
+        try:
+            equity = self.wallet.usdc_total
+            allocations = self.pm.allocate(equity)
+            parts = []
+            for alloc in sorted(allocations, key=lambda a: a.fraction, reverse=True):
+                state = self.pm.get_strategy_state(alloc.strategy)
+                status = state.status.value.upper() if state else "?"
+                pct = round(alloc.fraction * 100, 1)
+                parts.append(f"{alloc.strategy}={pct}%[{status}]")
+            logger.info(
+                "🎰 BANDIT UPDATE [%s] sortino=%.3f | Asignaciones: %s",
+                updated_strategy, sortino, "  ".join(parts),
+            )
+        except Exception as e:
+            logger.debug("Error logging bandit: %s", e)
 
     # ── Mark-to-Market ───────────────────────────────────────────────────────────────────
 

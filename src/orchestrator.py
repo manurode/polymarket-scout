@@ -56,6 +56,11 @@ PAPER_AUTO_CLOSE_INTERVAL = 10    # segundos entre evaluaciones de auto-close
 PAPER_SIGNAL_INTERVAL = 30        # segundos entre señales de trading (demo)
 MM_QUOTE_INTERVAL = 10            # segundos entre cotizaciones de market making
 MM_TOP_MARKETS = 10               # cuántos mercados del Top 50 trackear con MM
+AUTONOMOUS_EXEC_INTERVAL = 15    # segundos entre ciclos del ejecutor autónomo
+L2_SEED_INTERVAL = 90            # segundos entre seedings de L2 desde REST
+
+# Estrategias que SIEMPRE compiten en el Bandit (mínimo dos brazos)
+BANDIT_PRIMARY_STRATEGIES = ["market_making", "momentum_follow"]
 
 
 class ScoutOrchestrator:
@@ -100,6 +105,10 @@ class ScoutOrchestrator:
             "momentum_follow", "contrarian", "consensus_breakout",
             "volume_breakout", "market_making", "correlation_arb",
         ])
+        # Garantizar que los dos brazos primarios del Bandit siempre estén presentes
+        for arm in BANDIT_PRIMARY_STRATEGIES:
+            if arm not in strategies:
+                strategies.insert(0, arm)
         self.portfolio_manager = PortfolioManager(strategies=strategies)
         self.whale_tracker = WhaleTracker()
 
@@ -132,6 +141,7 @@ class ScoutOrchestrator:
         self._timings: dict[str, float] = {}
         self._market_prices: dict[str, float] = {}  # market_name → price
         self._last_radar_snapshots: list[dict] = []
+        self._last_l2_seed_time: float = 0.0  # timestamp del último seeding REST de L2
 
         # ── Market Making State ───────────────────────────────────────────────────
         self._mm_quotes_generated: int = 0
@@ -197,6 +207,8 @@ class ScoutOrchestrator:
             asyncio.create_task(self._paper_auto_close_loop()),
             asyncio.create_task(self._paper_signal_loop()),
             asyncio.create_task(self._market_making_loop()),
+            asyncio.create_task(self._l2_seed_loop()),           # ← NUEVO: poblar L2 desde REST
+            asyncio.create_task(self._autonomous_execution_loop()),  # ← NUEVO: MM quotes → paper trades
         ]
 
         # ── 9. Conectar WebSocket CLOB en background ──────────
@@ -431,25 +443,35 @@ class ScoutOrchestrator:
             await asyncio.sleep(PAPER_AUTO_CLOSE_INTERVAL)
 
     async def _paper_signal_loop(self) -> None:
-        """Pipeline de señales adaptativo: usa AdaptiveStrategyEngine para generar entradas
-        con filtrado por régimen, aprendizaje de parámetros y ensemble weighting.
+        """Pipeline de señales adaptativo — complementa al autonomous_execution_loop.
+
+        Usa el AdaptiveStrategyEngine para señales de mean_reversion y volume_breakout
+        (estrategias secundarias del Bandit). El market_making y momentum_follow son
+        responsabilidad del _autonomous_execution_loop.
         """
         logger.info("PaperTrading adaptive signal pipeline iniciado")
+
+        # Mapping de nombres de señal → brazo del Bandit
+        STRATEGY_BANDIT_MAP = {
+            "momentum": "momentum_follow",
+            "mean_reversion": "contrarian",
+            "volume_breakout": "volume_breakout",
+        }
 
         while self._running:
             try:
                 # Esperar a tener suficiente historial de precios
-                if self.adaptive_engine.pipeline.get_history_size() < 5:
+                if self.adaptive_engine.pipeline.get_history_size() < 3:
                     await asyncio.sleep(5)
                     continue
 
-                # Solo abrir si hay liquidez y margen
-                max_positions = 6
+                # Solo abrir si hay liquidez y margen — el autonomous_loop ya tiene 8 slots
+                max_positions = 10
                 if self.paper_trading.open_position_count >= max_positions:
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(10)
                     continue
 
-                if self.paper_trading.wallet.usdc_free < 200:
+                if self.paper_trading.wallet.usdc_free < 150:
                     await asyncio.sleep(10)
                     continue
 
@@ -459,21 +481,21 @@ class ScoutOrchestrator:
                     await asyncio.sleep(5)
                     continue
 
-                # Usar el motor adaptativo
-                signals = self.adaptive_engine.generate_adaptive_signals(snapshots, cooldown_s=300)
+                # Usar cooldown más largo para no colisionar con autonomous loop
+                signals = self.adaptive_engine.generate_adaptive_signals(snapshots, cooldown_s=600)
 
                 if not signals:
-                    await asyncio.sleep(10)
+                    await asyncio.sleep(15)
                     continue
 
-                # Ejecutar las señales (máximo 2 por ciclo)
+                # Ejecutar las señales secundarias (máximo 1 por ciclo)
                 executed = 0
                 for sig in signals:
-                    if executed >= 2:
+                    if executed >= 1:
                         break
 
-                    strategy = sig.strategy
-                    market = sig.question[:60]
+                    # Mapear estrategia al brazo del Bandit correcto
+                    bandit_strategy = STRATEGY_BANDIT_MAP.get(sig.strategy, sig.strategy)
                     entry = sig.entry_price
                     side = sig.side
 
@@ -481,40 +503,35 @@ class ScoutOrchestrator:
                         continue  # precio extremo
 
                     # Kelly position sizing
-                    edge = abs(sig.confidence * 0.08)  # confianza → edge estimado
+                    edge = abs(sig.confidence * 0.07)
                     kelly = self.portfolio_manager.position_size(
-                        strategy_name=strategy,
+                        strategy_name=bandit_strategy,
                         edge=edge,
                         price=entry,
                         equity=self.paper_trading.wallet.usdc_total,
                     )
-                    size = min(kelly.size_final, self.paper_trading.wallet.usdc_free * 0.10)
+                    size = min(kelly.size_final, self.paper_trading.wallet.usdc_free * 0.08)
 
                     if size < 50:
                         continue  # demasiado pequeño
 
-                    tau = random.uniform(10, 60)
-                    toxicity = random.uniform(0.05, 0.3)
-
                     pos = await self.paper_trading.open_position(
-                        strategy=strategy,
-                        market=market,
+                        strategy=bandit_strategy,
+                        market=f"[SIG] {sig.question[:55]}",
                         side=side,
                         size=size,
                         entry=entry,
-                        tau_pct=tau,
-                        toxicity=toxicity,
+                        tau_pct=random.uniform(10, 60),
+                        toxicity=random.uniform(0.05, 0.3),
                     )
 
                     if pos:
                         executed += 1
                         logger.info(
-                            "PaperTrade SIGNAL [%s] %s %s %s @ $%.3f size=$%.2f conf=%.2f (%s)",
-                            strategy, side, market[:50], entry, size, sig.confidence, sig.reason,
+                            "PaperTrade SIG [%s→%s] %s @ $%.3f size=$%.2f conf=%.2f | %s",
+                            sig.strategy, bandit_strategy, side, entry, size,
+                            sig.confidence, sig.reason[:60],
                         )
-
-                if executed > 0:
-                    logger.info("PaperTrade: %d señales adaptativas ejecutadas de %d generadas", executed, len(signals))
 
             except asyncio.CancelledError:
                 break
@@ -737,6 +754,341 @@ class ScoutOrchestrator:
                 logger.error("Error en market making loop: %s", e)
 
             await asyncio.sleep(MM_QUOTE_INTERVAL)
+
+    # ── L2 Seeding Loop ─────────────────────────────────────────────────────────────────────
+    # Destruye el bloqueo spread=N/A: fuerza un fetch REST del CLOB book para cada mercado
+    # activo en el MM. Esto puebla el BookAnalyzer con datos reales ANTES de que lleguen los
+    # deltas del WS, garantizando que el Micro-Price esté disponible desde el primer ciclo.
+
+    async def _l2_seed_loop(self) -> None:
+        """L2 Seed Daemon: fetch REST CLOB snapshots para los Top N mercados activos.
+
+        Ejecuta cada L2_SEED_INTERVAL segundos. Para cada token activo en el MM:
+        1. Llama a get_book_async() → snapshot REST completo
+        2. Lo pasa al BookAnalyzer via initialize_book()
+        3. Calcula y loggea el Micro-Price resultante
+
+        Esto elimina el spread=N/A persistente incluso si el WS aún no ha enviado
+        datos para ese token.
+        """
+        logger.info("L2 Seed daemon iniciado (intervalo: %ds)", L2_SEED_INTERVAL)
+
+        # Esperar un poco para que el radar tenga mercados
+        await asyncio.sleep(20)
+
+        while self._running:
+            try:
+                if not self.scanner:
+                    await asyncio.sleep(10)
+                    continue
+
+                await self.scanner._ensure_session()
+
+                # Tomar los tokens activos del MM (ya suscritos) + los del radar si no hay MM aún
+                tokens_to_seed: list[tuple[str, str]] = []  # (token_id, question)
+
+                # Preferir tokens activos del MM
+                for token_id in list(self._mm_active_tokens):
+                    question = ""
+                    for snap in self._last_radar_snapshots:
+                        ct = snap.get("clobTokenIds", [])
+                        if isinstance(ct, list) and len(ct) > 0 and ct[0] == token_id:
+                            question = snap.get("question", "")[:60]
+                            break
+                    tokens_to_seed.append((token_id, question))
+
+                # Si no hay tokens MM aún, usar los Top 5 del radar
+                if not tokens_to_seed and self._last_radar_snapshots:
+                    ranked = self.selection_engine.rank(self._last_radar_snapshots)
+                    for ms in ranked.top[:5]:
+                        ct = ms.snapshot.get("clobTokenIds", [])
+                        if isinstance(ct, list) and len(ct) > 0:
+                            tokens_to_seed.append((ct[0], ms.question[:60]))
+
+                if not tokens_to_seed:
+                    await asyncio.sleep(L2_SEED_INTERVAL)
+                    continue
+
+                seeded = 0
+                for token_id, question in tokens_to_seed[:MM_TOP_MARKETS]:
+                    if not self._running:
+                        break
+                    try:
+                        # Espacio entre llamadas para no saturar el rate-limiter
+                        await asyncio.sleep(0.5)
+                        snapshot = await self.scanner.get_book_async(token_id)
+
+                        if not snapshot:
+                            continue
+
+                        raw_bids = snapshot.get("bids", [])
+                        raw_asks = snapshot.get("asks", [])
+
+                        if not raw_bids and not raw_asks:
+                            logger.debug("L2 Seed: book vacío para %s", token_id[:16])
+                            continue
+
+                        # Poblar el BookAnalyzer con datos reales
+                        book_snap = self.book_analyzer.initialize_book(token_id, snapshot)
+                        seeded += 1
+
+                        # Calcular Micro-Price: media ponderada por tamaño de bid/ask
+                        if book_snap.bid_count > 0 and book_snap.ask_count > 0:
+                            bb = book_snap.bids[0, 0]
+                            bb_sz = book_snap.bids[0, 1]
+                            ba = book_snap.asks[0, 0]
+                            ba_sz = book_snap.asks[0, 1]
+                            total_sz = bb_sz + ba_sz
+                            if total_sz > 0:
+                                micro_price = (bb * ba_sz + ba * bb_sz) / total_sz
+                            else:
+                                micro_price = (bb + ba) / 2.0
+                            spread_val = ba - bb
+
+                            logger.info(
+                                "L2 SEED ✅ %s | bb=%.4f ba=%.4f spread=%.4f micro=%.4f "
+                                "bids=%d asks=%d | %s",
+                                token_id[:16], bb, ba, spread_val, micro_price,
+                                book_snap.bid_count, book_snap.ask_count,
+                                question[:50],
+                            )
+                        else:
+                            logger.debug(
+                                "L2 Seed: %s solo con %d bids, %d asks",
+                                token_id[:16], book_snap.bid_count, book_snap.ask_count,
+                            )
+
+                    except Exception as e:
+                        logger.debug("L2 Seed error para %s: %s", token_id[:16], e)
+
+                if seeded > 0:
+                    logger.info("L2 Seed completado: %d/%d tokens poblados", seeded, len(tokens_to_seed))
+
+                self._last_l2_seed_time = time.time()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Error en L2 seed loop: %s", e)
+
+            await asyncio.sleep(L2_SEED_INTERVAL)
+
+    # ── Autonomous Execution Loop ────────────────────────────────────────────────────────
+    # El Círculo Evolutivo: L2 Book → MM Quote → Paper Trade → PortfolioManager → Bandit
+
+    async def _autonomous_execution_loop(self) -> None:
+        """Ejecutor Autónomo: convierte las quotes del MM y señales de momentum en paper trades.
+
+        Flujo cada AUTONOMOUS_EXEC_INTERVAL segundos:
+        1. Para cada mercado con L2 book limpio → calcula quote del MM
+        2. Si la quote es válida → abre paper trade con strategy="market_making"
+        3. Genera señales de momentum desde el pipeline adaptativo
+        4. Para cada señal → abre paper trade con strategy="momentum_follow"
+        5. Al cierre de cada posición → PaperTradingEngine notifica al PortfolioManager
+        6. El Bandit (Thompson Sampling) ajusta alloc_pct automáticamente
+
+        La diversidad de estrategias garantiza que el Bandit tenga al menos dos brazos
+        compitiendo (market_making vs. momentum_follow).
+        """
+        logger.info("Autonomous Execution daemon iniciado (intervalo: %ds)", AUTONOMOUS_EXEC_INTERVAL)
+
+        # Esperar a que haya datos del radar y L2
+        await asyncio.sleep(30)
+
+        while self._running:
+            try:
+                if not self._last_radar_snapshots:
+                    await asyncio.sleep(5)
+                    continue
+
+                equity = self.paper_trading.wallet.usdc_total
+                max_positions = 8
+                open_count = self.paper_trading.open_position_count
+
+                if open_count >= max_positions:
+                    await asyncio.sleep(AUTONOMOUS_EXEC_INTERVAL)
+                    continue
+
+                if self.paper_trading.wallet.usdc_free < 150:
+                    logger.debug("AutExec: capital libre insuficiente ($%.2f)", self.paper_trading.wallet.usdc_free)
+                    await asyncio.sleep(AUTONOMOUS_EXEC_INTERVAL)
+                    continue
+
+                import time as _time
+                now = _time.time()
+                executed_mm = 0
+                executed_mom = 0
+
+                # ── 1. MARKET MAKING arm: una quote por mercado con L2 limpio ──────────────
+                ranked = self.selection_engine.rank(self._last_radar_snapshots)
+                top_snapshots = ranked.top[:MM_TOP_MARKETS]
+
+                for ms in top_snapshots:
+                    if open_count + executed_mm >= max_positions:
+                        break
+                    if executed_mm >= 3:  # máx 3 trades MM por ciclo
+                        break
+
+                    snap = ms.snapshot
+                    tokens = snap.get("clobTokenIds", [])
+                    if not (isinstance(tokens, list) and len(tokens) > 0):
+                        continue
+                    token_id = tokens[0]
+
+                    # Verificar que el book L2 tiene datos reales
+                    book_snap = self.book_analyzer.get_book(token_id) if self.book_analyzer else None
+                    if book_snap is None or book_snap.bid_count == 0 or book_snap.ask_count == 0:
+                        continue
+
+                    bb = float(book_snap.bids[0, 0])
+                    ba = float(book_snap.asks[0, 0])
+                    bb_sz = float(book_snap.bids[0, 1])
+                    ba_sz = float(book_snap.asks[0, 1])
+
+                    clob_spread = ba - bb
+                    if clob_spread > 0.40 or clob_spread <= 0:
+                        continue  # spread demasiado ancho o inválido
+
+                    # Micro-Price: media ponderada por tamaño inverso (Lee-Ready)
+                    total_sz = bb_sz + ba_sz
+                    if total_sz > 0:
+                        micro_price = (bb * ba_sz + ba * bb_sz) / total_sz
+                    else:
+                        micro_price = (bb + ba) / 2.0
+
+                    if micro_price <= 0.02 or micro_price >= 0.98:
+                        continue
+
+                    # Verificar protección del MM
+                    ws_state = self.ws_manager.get_state(token_id) if self.ws_manager else None
+                    book_reconciling = ws_state is not None and str(ws_state) != "BookState.CLEAN"
+
+                    if self.market_maker:
+                        should_q, reason = self.market_maker.should_quote(
+                            token_id=token_id,
+                            book_reconciling=book_reconciling,
+                            now=now,
+                        )
+                        if not should_q:
+                            continue
+
+                    # Kelly sizing para MM
+                    edge = clob_spread * 0.5  # capturamos ~50% del spread
+                    kelly = self.portfolio_manager.position_size(
+                        strategy_name="market_making",
+                        edge=edge,
+                        price=micro_price,
+                        equity=equity,
+                    )
+                    size = min(kelly.size_final, self.paper_trading.wallet.usdc_free * 0.12)
+
+                    if size < 50:
+                        continue
+
+                    # Dirección basada en OBI
+                    obi = self.book_analyzer.get_obi(token_id) if self.book_analyzer else 0.0
+                    side = "YES" if obi >= 0 else "NO"  # seguir el desequilibrio del libro
+
+                    question = snap.get("question", "unknown market")
+                    market_name = f"[MM] {question[:55]}"
+
+                    pos = await self.paper_trading.open_position(
+                        strategy="market_making",
+                        market=market_name,
+                        side=side,
+                        size=size,
+                        entry=micro_price,
+                        tau_pct=random.uniform(15, 50),
+                        toxicity=random.uniform(0.05, 0.20),
+                    )
+
+                    if pos:
+                        executed_mm += 1
+                        logger.info(
+                            "AutExec MM TRADE #%d [market_making] %s %s @ micro=%.4f "
+                            "spread=%.4f obi=%.3f size=$%.2f kelly_k=%.3f | %s",
+                            pos.id, side, token_id[:12], micro_price,
+                            clob_spread, obi, size, kelly.k_dynamic,
+                            question[:55],
+                        )
+
+                # ── 2. MOMENTUM FOLLOW arm: señales del pipeline adaptativo ──────────────
+                # Asegurar suficiente historial de precios
+                if self.adaptive_engine.pipeline.get_history_size() >= 3:
+                    signals = self.adaptive_engine.generate_adaptive_signals(
+                        self._last_radar_snapshots,
+                        cooldown_s=180,
+                    )
+
+                    for sig in signals:
+                        if open_count + executed_mm + executed_mom >= max_positions:
+                            break
+                        if executed_mom >= 2:  # máx 2 trades momentum por ciclo
+                            break
+
+                        entry = sig.entry_price
+                        if entry <= 0.02 or entry >= 0.98:
+                            continue
+
+                        kelly = self.portfolio_manager.position_size(
+                            strategy_name="momentum_follow",
+                            edge=abs(sig.confidence * 0.06),
+                            price=entry,
+                            equity=equity,
+                        )
+                        size = min(kelly.size_final, self.paper_trading.wallet.usdc_free * 0.10)
+
+                        if size < 50:
+                            continue
+
+                        market_name = f"[MOM] {sig.question[:55]}"
+
+                        pos = await self.paper_trading.open_position(
+                            strategy="momentum_follow",
+                            market=market_name,
+                            side=sig.side,
+                            size=size,
+                            entry=entry,
+                            tau_pct=random.uniform(10, 60),
+                            toxicity=random.uniform(0.05, 0.30),
+                        )
+
+                        if pos:
+                            executed_mom += 1
+                            logger.info(
+                                "AutExec MOM TRADE #%d [momentum_follow] %s @ %.4f "
+                                "conf=%.2f size=$%.2f | %s",
+                                pos.id, sig.side, entry, sig.confidence, size,
+                                sig.reason[:60],
+                            )
+
+                # ── 3. Log del estado del Bandit cada ciclo ───────────────────────────
+                if executed_mm + executed_mom > 0:
+                    try:
+                        allocs = self.portfolio_manager.allocate(equity)
+                        alloc_parts = []
+                        for a in sorted(allocs, key=lambda x: x.fraction, reverse=True)[:4]:
+                            st = self.portfolio_manager.get_strategy_state(a.strategy)
+                            status = st.status.value.upper() if st else "?"
+                            sortino = self.portfolio_manager.get_sortino(a.strategy)
+                            alloc_parts.append(
+                                f"{a.strategy}={a.fraction*100:.1f}%[{status}|S={sortino:.2f}]"
+                            )
+                        logger.info(
+                            "🧠 BANDIT ESTADO | open=%d equity=$%.0f | %s",
+                            self.paper_trading.open_position_count,
+                            equity,
+                            "  ".join(alloc_parts),
+                        )
+                    except Exception as e:
+                        logger.debug("Error logging bandit state: %s", e)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Error en autonomous execution loop: %s", e)
+
+            await asyncio.sleep(AUTONOMOUS_EXEC_INTERVAL)
 
     # ── WebSocket Callbacks ─────────────────────────────────────────
 
