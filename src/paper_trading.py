@@ -45,7 +45,10 @@ TAU_LIQUIDATION = 0.95  # Liquidación forzosa si tau > 95%
 MAX_POSITION_AGE_H = 72  # Cierre forzoso tras 72h
 
 # Realismo del simulador
-SLIPPAGE_PCT = 0.01      # 1% de slippage aplicado al precio de cierre
+SLIPPAGE_PCT = 0.01      # 1% de slippage en mercados normales
+SLIPPAGE_THIN_BOOK = 0.03  # 3% de slippage en libros finos (order_count < 20, size > $50)
+THIN_BOOK_ORDER_THRESHOLD = 20   # Umbral de órdenes para considerar libro fino
+THIN_BOOK_SIZE_THRESHOLD = 50.0  # Tamaño mínimo (USD) para aplicar penalización
 POL_COMMISSION = 0.02    # 0.02 POL por trade cerrado (gas simulado)
 
 
@@ -412,11 +415,23 @@ class PaperTradingEngine:
         close_price: float | None = None,
         reason: str = "manual",
         apply_slippage: bool = True,
+        order_count: int = 999,
     ) -> dict | None:
         """Cierra una posición virtual y calcula P&L.
 
-        Aplica slippage realista del SLIPPAGE_PCT % cruzando contra liquidez L2.
+        Aplica slippage realista cruzando contra liquidez L2.
+        Si el libro es fino (order_count < THIN_BOOK_ORDER_THRESHOLD) y el
+        tamaño supera THIN_BOOK_SIZE_THRESHOLD, se aplica la penalización de
+        market impact ampliada (SLIPPAGE_THIN_BOOK = 3%).
+
         Las comisiones se cobran en POL (gas simulado).
+
+        Parameters
+        ----------
+        order_count : int
+            Número de órdenes en el libro real al momento del cierre.
+            Permite al motor aplicar penalización por market impact en
+            mercados con poca liquidez.
 
         Returns
         -------
@@ -430,21 +445,42 @@ class PaperTradingEngine:
 
             price = close_price if close_price is not None else pos.mark
 
-            # ── Aplicar slippage realista ──────────────────────────────
-            # Al cerrar una posición YES, vendemos → recibimos un precio peor (slippage negativo).
-            # Al cerrar una posición NO, compramos para cerrar → precio peor.
+            # ── Selección de slippage según profundidad del libro ─────────
+            thin_book = (
+                order_count < THIN_BOOK_ORDER_THRESHOLD
+                and pos.size > THIN_BOOK_SIZE_THRESHOLD
+            )
+            effective_slippage = SLIPPAGE_THIN_BOOK if thin_book else SLIPPAGE_PCT
+            if thin_book:
+                logger.warning(
+                    "MTM MARKET IMPACT #%d [%s] side=%s size=$%.0f order_count=%d "
+                    "→ slippage escalado %.0f%% (libro fino)",
+                    pos.id, pos.market[:40], pos.side, pos.size,
+                    order_count, effective_slippage * 100,
+                )
+
+            # ── Aplicar slippage realista ──────────────────────────────────
+            # Al cerrar YES (venta), recibimos un precio peor (menor).
+            # Al cerrar NO (venta de nuestra posición NO = compra de YES),
+            # el coste es mayor (precio efectivo de cierre más alto).
             if apply_slippage:
                 if pos.side == "YES":
-                    price = price * (1.0 - SLIPPAGE_PCT)   # vendemos más barato
+                    price = price * (1.0 - effective_slippage)   # vendemos más barato
                 else:
-                    price = price * (1.0 + SLIPPAGE_PCT)   # compramos más caro
+                    # Para NO: el cierre penaliza en la dirección contraria.
+                    # Un precio de mark_NO más bajo es más costoso.
+                    price = price * (1.0 - effective_slippage)   # mark_NO baja → peor cierre
                 price = round(max(0.001, min(0.999, price)), 6)
 
-            # Calcular P&L
+            # ── Calcular P&L ──────────────────────────────────────────────
+            # YES: pnl = (precio_cierre - precio_entrada) * size
+            # NO:  pnl = (mark_NO_cierre - entry_NO) * size
+            #      donde entry_NO = 1 - ask_YES_apertura
+            #      y    mark_NO   = 1 - ask_YES_actual  (ya almacenado en pos.mark)
             if pos.side == "YES":
                 pnl = (price - pos.entry) * pos.size
-            else:  # NO
-                pnl = (pos.entry - price) * pos.size
+            else:  # NO — ambos precios ya están expresados en términos NO
+                pnl = (price - pos.entry) * pos.size
 
             pos.pnl = round(pnl, 2)
             pos.pnl_pct = round((pnl / pos.size) * 100, 2) if pos.size > 0 else 0.0
@@ -471,7 +507,7 @@ class PaperTradingEngine:
                 "size": pos.size,
                 "entry": pos.entry,
                 "exit": round(price, 6),
-                "slippage_pct": SLIPPAGE_PCT * 100 if apply_slippage else 0.0,
+                "slippage_pct": effective_slippage * 100 if apply_slippage else 0.0,
                 "slippage_usd": round(slippage_usd, 4),
                 "commission_usd": round(commission_usd, 4),
                 "pnl": pos.pnl,
@@ -506,7 +542,7 @@ class PaperTradingEngine:
             logger.info(
                 "PaperTrade CLOSE #%d [%s] %s P&L=$%.2f (%.1f%%) slippage=%.1f%% reason=%s",
                 pos.id, pos.strategy, pos.market[:40],
-                pnl, pos.pnl_pct, SLIPPAGE_PCT * 100, reason,
+                pnl, pos.pnl_pct, effective_slippage * 100, reason,
             )
             return trade
 
@@ -532,36 +568,95 @@ class PaperTradingEngine:
 
     # ── Mark-to-Market ───────────────────────────────────────────────────────────────────
 
-    async def mark_to_market(self, price_source: dict[str, float] | None = None) -> None:
+    async def mark_to_market(
+        self,
+        price_source: dict[str, float] | None = None,
+        yes_ask_source: dict[str, float] | None = None,
+    ) -> None:
         """Actualiza el mark price de todas las posiciones abiertas.
+
+        Fórmula correcta por tipo de posición
+        --------------------------------------
+        YES  →  mark = best_bid_YES   (cuánto recibimos al vender)
+        NO   →  mark = 1 - best_ask_YES  (precio inverso: el coste de cerrar)
+
+        Si ``yes_ask_source`` está disponible se usa para calcular el mark de
+        posiciones NO con la matemática correcta.  Si no, ``price_source``
+        se interpreta como mid-price YES y se aplica la misma inversión.
 
         Parameters
         ----------
         price_source : dict[str, float] | None
-            Diccionario {market: precio_actual}. Si es None, simula movimiento.
+            Diccionario {market: best_bid_YES}.  Si es None, simula movimiento.
+        yes_ask_source : dict[str, float] | None
+            Diccionario {market: best_ask_YES} para el mark de posiciones NO.
         """
         async with self._lock:
             for pos in self._positions:
                 if pos.closed_at is not None:
                     continue
 
+                prev_mark = pos.mark
+
                 if price_source and pos.market in price_source:
-                    pos.mark = price_source[pos.market]
+                    best_bid_yes = price_source[pos.market]
+
+                    if pos.side == "YES":
+                        # ── YES: vendemos al mejor bid YES ───────────────────
+                        pos.mark = best_bid_yes
+                    else:
+                        # ── NO: el valor de mercado de nuestra posición NO ───
+                        # Compramos NO a (1 - best_ask_YES) y el mark debe
+                        # reflejar cuánto valdría cerrarla ahora.
+                        # mark_NO = 1 - best_ask_YES
+                        # Si best_ask_YES no está disponible, usamos best_bid_YES
+                        # (más conservador) como proxy del ask.
+                        best_ask_yes = (
+                            yes_ask_source.get(pos.market, best_bid_yes)
+                            if yes_ask_source
+                            else best_bid_yes
+                        )
+                        pos.mark = max(0.001, min(0.999, 1.0 - best_ask_yes))
+
+                    logger.debug(
+                        "MTM #%d [%s] side=%s entry=%.4f mark=%.4f→%.4f "
+                        "best_bid_yes=%.4f best_ask_yes=%s",
+                        pos.id, pos.market[:35], pos.side,
+                        pos.entry, prev_mark, pos.mark,
+                        best_bid_yes,
+                        f"{yes_ask_source.get(pos.market, 'N/A') if yes_ask_source else 'N/A'}",
+                    )
                 else:
                     # Simulación: movimiento browniano ligero
                     drift = 0.0
                     vol = 0.002  # 0.2% volatilidad por tick
                     dt = 1.0
                     shock = random.gauss(drift * dt, vol * (dt ** 0.5))
-                    pos.mark = max(0.01, min(0.99, pos.mark * (1 + shock)))
+                    if pos.side == "YES":
+                        pos.mark = max(0.01, min(0.99, pos.mark * (1 + shock)))
+                    else:
+                        # Invertir el shock para NO: si el YES sube, el NO baja
+                        pos.mark = max(0.01, min(0.99, pos.mark * (1 - shock)))
 
-                # Recalcular P&L no realizado
+                # ── Recalcular P&L no realizado ───────────────────────────────
                 if pos.side == "YES":
+                    # Long YES: ganamos si el precio sube
                     pos.pnl = round((pos.mark - pos.entry) * pos.size, 2)
                 else:
-                    pos.pnl = round((pos.entry - pos.mark) * pos.size, 2)
+                    # Long NO: compramos NO a entry_NO = (1 - ask_YES_en_apertura)
+                    # Ganamos si el mark_NO actual (1 - ask_YES_ahora) > entry_NO
+                    # pnl = (mark_NO - entry_NO) * size
+                    pos.pnl = round((pos.mark - pos.entry) * pos.size, 2)
 
                 pos.pnl_pct = round((pos.pnl / pos.size) * 100, 2) if pos.size > 0 else 0.0
+
+                logger.debug(
+                    "MTM P&L #%d [%s] side=%s mark=%.4f entry=%.4f "
+                    "pnl=$%.2f (%.1f%%) → tp_threshold=%.1f%%",
+                    pos.id, pos.market[:35], pos.side,
+                    pos.mark, pos.entry, pos.pnl, pos.pnl_pct,
+                    TP_PCT * 100,
+                )
 
                 # Liquidation zone si tau > 85%
                 pos.liquidation_zone = pos.tau_pct > 85

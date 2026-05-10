@@ -46,7 +46,7 @@ MAX_POSITION_SIZE = 5000.0   # $5000 máximo
 # Bandit
 DEFAULT_EPOCH_HOURS = 6      # reasignación cada 6h
 PROBATION_EPOCHS = 4         # épocas de prueba para nuevas estrategias
-PROBATION_ALLOCATION = 0.02  # 2% del capital durante prueba
+PROBATION_ALLOCATION = 0.16  # 16% del capital durante prueba (base de exploración)
 BETA_PRIOR_A = 1.0           # prior no informativo
 BETA_PRIOR_B = 1.0
 
@@ -548,6 +548,49 @@ class PortfolioManager:
             name, prev_status, state.successes, state.failures, len(state.sortino_history),
         )
         return True
+
+    def reset_all_strategies(self) -> dict[str, str]:
+        """Resetea TODAS las estrategias a PROBATION con contadores de bandit limpios.
+
+        Usar tras detectar que el Bandit fue corrompido por datos falsos (p.ej.
+        P&L irreal por bug en MTM).  Los pesos de Sortino históricos se borran
+        para que el Bandit parta de cero con la nueva lógica de simulación.
+
+        Returns
+        -------
+        dict[str, str]
+            Mapa {nombre_estrategia: status_anterior} para auditoría.
+        """
+        import logging as _logging
+        _log = _logging.getLogger(__name__)
+        audit: dict[str, str] = {}
+
+        for name, state in self._strategies.items():
+            prev = state.status.value
+            audit[name] = prev
+            state.status = StrategyStatus.PROBATION
+            state.consecutive_losses = 0
+            state.frozen_epochs = 0
+            state.probation_epochs = 0
+            state.successes = 0
+            state.failures = 0
+            state.sortino_history.clear()
+            # Resetear también métricas de paper trading acumuladas
+            state.total_trades = 0
+            state.winning_trades = 0
+            state.cumulative_pnl = 0.0
+            state.max_drawdown = 0.0
+            state.peak_equity = 0.0
+
+        _log.warning(
+            "🔴 BANDIT NUCLEAR RESET: %d estrategias → PROBATION (%.0f%% alloc cada una). "
+            "Estado anterior: %s",
+            len(audit),
+            PROBATION_ALLOCATION * 100,
+            audit,
+        )
+        return audit
+
 
     @property
     def strategy_count(self) -> int:
