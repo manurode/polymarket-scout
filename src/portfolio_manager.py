@@ -516,6 +516,39 @@ class PortfolioManager:
             if s.status not in (StrategyStatus.RETIRED, StrategyStatus.FROZEN)
         ]
 
+    def reset_strategy(self, name: str) -> bool:
+        """Resetea una estrategia FROZEN/RETIRED de vuelta a PROBATION.
+
+        Limpia los contadores de pérdidas consecutivas y épocas congeladas
+        para que el Bandit vuelva a asignarle capital en el próximo ciclo.
+
+        Parameters
+        ----------
+        name : str
+            Nombre de la estrategia a resetear.
+
+        Returns
+        -------
+        bool
+            True si la estrategia existía y fue reseteada; False si no existía.
+        """
+        state = self._strategies.get(name)
+        if state is None:
+            return False
+
+        prev_status = state.status.value
+        state.status = StrategyStatus.PROBATION
+        state.consecutive_losses = 0
+        state.frozen_epochs = 0
+        state.probation_epochs = 0
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "PortfolioManager: estrategia '%s' reseteada de [%s] → [PROBATION] "
+            "(successes=%d, failures=%d, sortino_hist=%d entries)",
+            name, prev_status, state.successes, state.failures, len(state.sortino_history),
+        )
+        return True
+
     @property
     def strategy_count(self) -> int:
         return len(self._strategies)

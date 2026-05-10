@@ -218,6 +218,11 @@ class ScoutOrchestrator:
 
         logger.info("Scout Lab v2.0 — Todos los daemons arrancados")
 
+        # ── 10. Reiniciar market_making a PROBATION ──────────────────────────
+        # Garantiza que la estrategia no arranque en estado FROZEN por residuos
+        # de sesiones anteriores. El Bandit le asignará capital desde el primer ciclo.
+        self.portfolio_manager.reset_strategy("market_making")
+
     async def stop(self) -> None:
         """Detiene todos los daemons."""
         logger.info("Scout Lab v2.0 — Deteniendo...")
@@ -658,16 +663,25 @@ class ScoutOrchestrator:
                             gamma_price = snap.get("price_yes")
                             break
 
-                    # ── Fair price: Gamma > CLOB mid (si el spread es razonable) ──
-                    # Si el spread del CLOB es >20%, el mid es basura → usar Gamma.
-                    # Si no hay Gamma, usar CLOB mid solo si el spread es aceptable.
-                    if gamma_price is not None:
+                    # ── Fair price: CLOB micro-price es el ancla principal ──────
+                    # El micro-price ponderado por tamaño es la referencia canónica.
+                    # Gamma solo actúa como último recurso si el CLOB está vacío.
+                    if book_snap and book_snap.bid_count > 0 and book_snap.ask_count > 0:
+                        bb_sz_fp = float(book_snap.bids[0, 1])
+                        ba_sz_fp = float(book_snap.asks[0, 1])
+                        total_sz_fp = bb_sz_fp + ba_sz_fp
+                        if total_sz_fp > 0:
+                            micro_price_fp = (best_bid_price * ba_sz_fp + best_ask_price * bb_sz_fp) / total_sz_fp
+                        else:
+                            micro_price_fp = (best_bid_price + best_ask_price) / 2.0
+                        fair_price = micro_price_fp
+                    elif gamma_price is not None:
+                        # CLOB vacío → fallback Gamma
                         fair_price = float(gamma_price)
-                    elif clob_spread <= 0.20 and book_snap:
-                        fair_price = book_snap.mid_price
+                        logger.debug("MM %s: CLOB vacío, usando gamma_price=%.4f como fallback", token_id[:16], fair_price)
                     else:
-                        # Ni Gamma ni CLOB usable → saltar este mercado
-                        logger.debug("MM skip %s: no usable fair price (gamma=None, clob_spread=%.3f)", token_id, clob_spread)
+                        # Ni CLOB ni Gamma → saltar este mercado
+                        logger.debug("MM skip %s: sin fair price (CLOB vacío y gamma=None)", token_id[:16])
                         continue
 
                     spread = clob_spread
@@ -715,13 +729,32 @@ class ScoutOrchestrator:
                     )
 
                     if quote and not quote.paused:
+                        # ── Sanity Check: la quote NUNCA debe cruzar el spread real ──
+                        # Si nuestro bid virtual >= best_ask real, actuaríamos como
+                        # takers pagando el spread en lugar de capturarlo.
+                        # Si nuestro ask virtual <= best_bid real, lo mismo al revés.
+                        quote_crosses_spread = (
+                            best_bid_price > 0 and best_ask_price > 0
+                            and (quote.bid_price >= best_ask_price or quote.ask_price <= best_bid_price)
+                        )
+                        if quote_crosses_spread:
+                            self._mm_quotes_skipped += 1
+                            logger.warning(
+                                "MM SANITY FAIL %s: quote cruza el spread real! "
+                                "virtual bid=%.4f >= ba=%.4f  OR  virtual ask=%.4f <= bb=%.4f — descartando",
+                                token_id[:12],
+                                quote.bid_price, best_ask_price,
+                                quote.ask_price, best_bid_price,
+                            )
+                            continue
+
                         quotes_this_cycle += 1
                         self._mm_quotes_generated += 1
                         self._mm_last_quote_time = now
 
                         # ── Log de quote en INFO ────────────────
                         logger.info(
-                            "MM QUOTE %s | mid=%.4f spread=%.4f | "
+                            "MM QUOTE %s | micro=%.4f spread=%.4f | "
                             "CLOB bb=%.4f ba=%.4f | "
                             "gamma=%.4f | "
                             "bid=%.4f (size=$%.0f) ask=%.4f (size=$%.0f) | "
