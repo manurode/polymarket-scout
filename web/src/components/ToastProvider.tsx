@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, useCallback, type ReactNode } from 'react';
+import { createContext, useContext, useState, useCallback, useEffect, type ReactNode } from 'react';
 import type { Severity } from '../types';
 
 // ── Types ────────────────────────────────────────────────────────────
@@ -74,7 +74,33 @@ const severityStyles: Record<Severity, { bg: string; border: string; text: strin
   info: { bg: 'bg-info/10', border: 'border-info/50', text: 'text-info', icon: '🔵' },
 };
 
-function ToastContainer({ toasts, onDismiss }: { toasts: Toast[]; onDismiss: (id: string) => void }) {
+function ToastContainer({
+  toasts,
+  onDismiss,
+}: {
+  toasts: Toast[];
+  onDismiss: (id: string) => void;
+}) {
+  // BUG FIX: CSS was injected at module top-level — breaks in SSR/test environments.
+  // Moved into useEffect so it only runs in the browser, once, after mount.
+  useEffect(() => {
+    const existing = document.getElementById('toast-animations');
+    if (existing) return;
+    const style = document.createElement('style');
+    style.id = 'toast-animations';
+    style.textContent = `
+      @keyframes slideIn {
+        from { opacity: 0; transform: translateX(100%); }
+        to { opacity: 1; transform: translateX(0); }
+      }
+      @keyframes shrink {
+        from { width: 100%; }
+        to { width: 0%; }
+      }
+    `;
+    document.head.appendChild(style);
+  }, []);
+
   return (
     <div className="fixed top-14 right-4 z-50 flex flex-col gap-2 max-w-sm pointer-events-none">
       {toasts.map(toast => {
@@ -93,9 +119,7 @@ function ToastContainer({ toasts, onDismiss }: { toasts: Toast[]; onDismiss: (id
             <div className="flex items-start gap-2">
               <span className="text-sm flex-shrink-0">{style.icon}</span>
               <div className="flex-1 min-w-0">
-                <div className={`text-xs font-semibold ${style.text}`}>
-                  {toast.title}
-                </div>
+                <div className={`text-xs font-semibold ${style.text}`}>{toast.title}</div>
                 <div className="text-[11px] text-text-secondary mt-0.5 leading-tight">
                   {toast.message}
                 </div>
@@ -111,7 +135,9 @@ function ToastContainer({ toasts, onDismiss }: { toasts: Toast[]; onDismiss: (id
             {toast.duration > 0 && (
               <div className="mt-2 bg-bg-primary/50 rounded-full h-0.5 overflow-hidden">
                 <div
-                  className={`h-full rounded-full ${toast.severity === 'critical' ? 'bg-loss' : 'bg-bg-active'}`}
+                  className={`h-full rounded-full ${
+                    toast.severity === 'critical' ? 'bg-loss' : 'bg-bg-active'
+                  }`}
                   style={{ animation: `shrink ${toast.duration}ms linear forwards` }}
                 />
               </div>
@@ -122,17 +148,3 @@ function ToastContainer({ toasts, onDismiss }: { toasts: Toast[]; onDismiss: (id
     </div>
   );
 }
-
-// Add animations to global CSS
-const style = document.createElement('style');
-style.textContent = `
-  @keyframes slideIn {
-    from { opacity: 0; transform: translateX(100%); }
-    to { opacity: 1; transform: translateX(0); }
-  }
-  @keyframes shrink {
-    from { width: 100%; }
-    to { width: 0%; }
-  }
-`;
-document.head.appendChild(style);

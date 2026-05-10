@@ -34,10 +34,11 @@ export function usePositions(pollIntervalMs: number = 5000): PositionsData {
         const res = await fetch('/api/risk/positions');
         if (res.ok && mountedRef.current) {
           const data: Position[] = await res.json();
-          // Check if we got real data or empty/mock
           if (Array.isArray(data)) {
-            setPositions(data.length > 0 ? data : MOCK_POSITIONS);
-            setSource(data.length > 0 ? 'paper_trading' : 'mock');
+            // BUG FIX: Don't fall back to mock when the real engine returns [] (no open positions).
+            // An empty array IS a valid real state. Only use mock if the endpoint itself is missing.
+            setPositions(data);
+            setSource('paper_trading');
           }
           setLoading(false);
         }
@@ -57,7 +58,9 @@ export function usePositions(pollIntervalMs: number = 5000): PositionsData {
 
   const totalPnl = positions.reduce((s, p) => s + p.pnl, 0);
   const totalValue = positions.reduce((s, p) => s + p.size, 0);
-  const liqCount = positions.filter(p => p.tau_pct > 85).length;
+  // BUG FIX: Liquidation zone = tau >= 95% (matches auto-close threshold in paper_trading.py).
+  // tau > 85% is the "warning" zone; tau >= 95% is the forced close threshold.
+  const liqCount = positions.filter(p => p.tau_pct >= 95).length;
 
   return { positions, loading, source, totalPnl, totalValue, liqCount };
 }

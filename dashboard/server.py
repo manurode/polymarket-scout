@@ -290,17 +290,23 @@ def _register_routes(app: FastAPI) -> None:
         stages = []
         stale_markets = 0  # mercados no-CLEAN (INIT o RECONCILING)
         if orch:
-            ws_lat = 0.0  # ms desde ultimo book event en mercados CLEAN
+            # WS→Book: last_delta_age_ms is the age (staleness) of the last book event,
+            # NOT network round-trip latency. If markets are idle (no recent trades),
+            # this grows to minutes — which is misleading to show as "latency".
+            # We only report it when fresh (< 5000ms), otherwise use 0 (shows as "—").
+            ws_lat = 0.0
+            ws_lat_source = "no_data"
             if orch.ws_manager:
                 metrics = orch.ws_manager.get_health_metrics()
                 if metrics:
-                    ages = [
+                    clean_ages = [
                         m.get("last_delta_age_ms", -1)
                         for m in metrics.values()
-                        if m.get("state") == "CLEAN" and m.get("last_delta_age_ms", -1) >= 0
+                        if m.get("state") == "CLEAN" and 0 <= m.get("last_delta_age_ms", -1) <= 5000
                     ]
-                    if ages:
-                        ws_lat = round(sum(ages) / len(ages), 1)
+                    if clean_ages:
+                        ws_lat = round(sum(clean_ages) / len(clean_ages), 1)
+                        ws_lat_source = "ws_metrics"
                     stale_markets = sum(
                         1 for m in metrics.values()
                         if m.get("state") != "CLEAN"
@@ -326,7 +332,7 @@ def _register_routes(app: FastAPI) -> None:
                 risk_lat = t.get("risk_check_ms", risk_lat)
 
             stages = [
-                {"id": "ws_to_book", "label": "WS→Book", "actual_ms": ws_lat, "budget_ms": 5, "source": "ws_metrics" if orch.ws_manager else "default"},
+                {"id": "ws_to_book", "label": "WS→Book", "actual_ms": ws_lat, "budget_ms": 5, "source": ws_lat_source},
                 {"id": "obi_spoof", "label": "OBI+TFI→Spoof", "actual_ms": mm_lat, "budget_ms": 5, "source": "default"},
                 {"id": "signal_decision", "label": "Signal→Decision", "actual_ms": sig_lat, "budget_ms": 10, "source": "default"},
                 {"id": "kelly_position", "label": "Kelly→Position", "actual_ms": kelly_lat, "budget_ms": 5, "source": "default"},
@@ -603,7 +609,12 @@ def _register_routes(app: FastAPI) -> None:
 # ── Helpers ─────────────────────────────────────────────────────────────────────────────────
 
 def _market_similarity(m1: str, m2: str) -> float:
-    """Estimate market similarity based on keyword overlap (0-1)."""
+    """Estimate market similarity based on shared keyword category (0-1).
+
+    BUG FIX: Previously used OR logic — any keyword found in *either* market
+    added the category, producing false high correlations between unrelated markets.
+    Now both markets must share at least one keyword category to score 1.0.
+    """
     keywords = {
         "trump": 0, "politics": 0, "election": 0,
         "btc": 1, "crypto": 1, "bitcoin": 1, "eth": 1,
@@ -611,11 +622,16 @@ def _market_similarity(m1: str, m2: str) -> float:
         "oil": 3, "energy": 3, "commodity": 3,
         "sp500": 4, "stock": 4, "equity": 4, "s&p": 4,
     }
-    cats = set()
+    m1_cats: set[int] = set()
+    m2_cats: set[int] = set()
     for kw, cat in keywords.items():
-        if kw in m1.lower() or kw in m2.lower():
-            cats.add(cat)
-    return 1.0 if len(cats) > 0 else 0.1  # same category = 1, different = 0.1
+        if kw in m1.lower():
+            m1_cats.add(cat)
+        if kw in m2.lower():
+            m2_cats.add(cat)
+    # Markets are similar only if they BOTH have keywords from the same category
+    shared = m1_cats & m2_cats
+    return 1.0 if shared else 0.1
 
 
 
@@ -633,16 +649,34 @@ def _get_heartbeats(orch) -> dict:
         # CLOB WebSocket
         ws_connected = False
         ws_latency = 999.0
+        ws_status = "red"
         ws_subscribed = "0/0"
         if orch.ws_manager:
             ws_connected = orch.ws_manager.is_connected
             ws_subscribed = f"{len(orch.ws_manager.get_tracked_tokens())}/50"
-            # Latencia real: usar tiempo desde último delta si disponible
+            # last_delta_age_ms = time since last book event (staleness), NOT round-trip latency.
+            # Values > 5000ms mean the book is stale — mark as amber or red.
             metrics = orch.ws_manager.get_health_metrics()
             if metrics:
-                ages = [m.get("last_delta_age_ms", -1) for m in metrics.values() if m.get("last_delta_age_ms", -1) >= 0]
-                if ages:
-                    ws_latency = round(sum(ages) / len(ages), 1)
+                clean_ages = [
+                    m.get("last_delta_age_ms", -1)
+                    for m in metrics.values()
+                    if m.get("state") == "CLEAN" and m.get("last_delta_age_ms", -1) >= 0
+                ]
+                if clean_ages:
+                    avg_age = round(sum(clean_ages) / len(clean_ages), 1)
+                    # Report the age as-is but cap display at 9999ms to avoid absurd numbers
+                    ws_latency = min(avg_age, 9999.0)
+                    if avg_age > 5000:
+                        ws_status = "red"
+                    elif avg_age > 1000:
+                        ws_status = "amber"
+                    else:
+                        ws_status = "green" if ws_connected else "red"
+                else:
+                    ws_status = "green" if ws_connected else "red"
+            else:
+                ws_status = "green" if ws_connected else "red"
 
         # Gamma API: usar timing del último radar scan (no tenemos log directo, usamos estimate)
         gamma_latency = 258.0  # TODO: instrumentar
@@ -661,7 +695,7 @@ def _get_heartbeats(orch) -> dict:
 
         return {
             "clob_ws": {
-                "status": "green" if ws_connected else "red",
+                "status": ws_status,
                 "label": "CLOB WebSocket",
                 "latency_ms": ws_latency,
                 "subscribed": ws_subscribed,
@@ -797,6 +831,8 @@ def _mock_whales() -> tuple[list, dict]:
 
 def _mock_positions() -> list[dict]:
     """Mock open positions with risk metrics."""
+    # BUG FIX: Position 6 had pnl_pct=-26.8% which is impossible — the SL triggers at -10%.
+    # Corrected to a realistic near-SL value. Also: liquidation_zone reflects tau>=85, not pnl.
     return [
         {"id": 1, "market": "Trump wins 2028?", "strategy": "MOM", "side": "YES",
          "size": 86, "entry": 0.62, "mark": 0.67, "pnl": 7.12, "pnl_pct": 8.3,
@@ -814,8 +850,8 @@ def _mock_positions() -> list[dict]:
          "size": 38, "entry": 0.35, "mark": 0.39, "pnl": 4.56, "pnl_pct": 12.0,
          "tau_pct": 15, "toxicity": 0.05, "liquidation_zone": False},
         {"id": 6, "market": "Oil price > $80?", "strategy": "CNTR", "side": "NO",
-         "size": 28, "entry": 0.80, "mark": 0.85, "pnl": -7.50, "pnl_pct": -26.8,
-         "tau_pct": 91, "toxicity": 1.20, "liquidation_zone": True},
+         "size": 28, "entry": 0.80, "mark": 0.854, "pnl": -2.71, "pnl_pct": -9.5,
+         "tau_pct": 91, "toxicity": 0.88, "liquidation_zone": True},
     ]
 
 

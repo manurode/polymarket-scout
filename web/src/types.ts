@@ -75,6 +75,7 @@ export interface StrategyRanking {
   trades: number;
   win_rate: number;
   sharpe: number;
+  cumulative_pnl?: number; // Present in real and mock payloads — optional for backward compat
 }
 
 export interface Allocation {

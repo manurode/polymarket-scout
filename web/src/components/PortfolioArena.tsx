@@ -1,6 +1,6 @@
 import { usePortfolio } from '../hooks/usePortfolio';
 import { useSystemStatus } from '../hooks/useSystemStatus';
-import type { StrategyState } from '../types';
+import type { StrategyState, StrategyRanking } from '../types';
 
 const STATE_ICONS: Record<StrategyState, string> = {
   active: '●', probation: '◐', frozen: '⊘', retired: '⊗',
@@ -11,6 +11,13 @@ const STATE_CLASSES: Record<StrategyState, string> = {
   probation: 'text-info',
   frozen: 'text-text-tertiary',
   retired: 'text-bg-active line-through',
+};
+
+const STATE_LABELS: Record<StrategyState, string> = {
+  active: 'Active',
+  probation: 'Probation',
+  frozen: 'Frozen',
+  retired: 'Retired',
 };
 
 export function PortfolioArena() {
@@ -43,9 +50,14 @@ export function PortfolioArena() {
   const epochNum = status.portfolio_epoch || 0;
   const hasData = strategies.length > 0;
 
+  // Strategy state counts
+  const activeCount = strategies.filter(s => s.state === 'active').length;
+  const frozenCount = strategies.filter(s => s.state === 'frozen').length;
+  const retiredCount = strategies.filter(s => s.state === 'retired').length;
+
   return (
     <div className="p-4 space-y-4">
-      {/* ── Header ─────────────────────────────────────────────────────────────────────── */}
+      {/* ── Header ─────────────────────────────────────────────────── */}
       <div className="flex items-center justify-between">
         <h2 className="text-sm font-bold tracking-wider text-text-primary">
           PORTFOLIO ARENA
@@ -55,12 +67,17 @@ export function PortfolioArena() {
             📦 PAPER TRADING
           </span>
           <span className="text-[11px] font-mono text-text-secondary">
-            Epoch {epochNum}/6h █░░
+            Epoch {epochNum}/6h
           </span>
+          {hasData && (
+            <span className="text-[10px] font-mono text-text-tertiary">
+              {activeCount}● {frozenCount > 0 ? `${frozenCount}⊘ ` : ''}{retiredCount > 0 ? `${retiredCount}⊗` : ''}
+            </span>
+          )}
         </div>
       </div>
 
-      {/* ── Empty state ─────────────────────────────────────────────────── */}
+      {/* ── Empty state ──────────────────────────────────────────── */}
       {!hasData && (
         <div className="bg-bg-secondary border border-bg-hover rounded p-8 text-center text-text-tertiary">
           No strategy data available — backend may be using mock data
@@ -68,7 +85,7 @@ export function PortfolioArena() {
       )}
 
       <div className="grid grid-cols-3 gap-4">
-        {/* ── Strategy Rankings ────────────────────────────────── */}
+        {/* ── Strategy Rankings ───────────────────────────────── */}
         <div className="col-span-2 bg-bg-secondary border border-bg-hover rounded p-3">
           <h3 className="text-[10px] text-text-tertiary tracking-wider mb-2">
             TOURNAMENT RANKING (by Sortino Ratio)
@@ -80,35 +97,63 @@ export function PortfolioArena() {
                   <th className="text-left py-1 pr-2">#</th>
                   <th className="text-left py-1 pr-2">Strategy</th>
                   <th className="text-right py-1 pr-2">Sortino</th>
+                  <th className="text-right py-1 pr-2">Sharpe</th>
                   <th className="text-center py-1 pr-2">State</th>
                   <th className="text-right py-1 pr-2">Alloc%</th>
                   <th className="text-right py-1 pr-2">Trades</th>
-                  <th className="text-right py-1">WR%</th>
+                  <th className="text-right py-1 pr-2">WR%</th>
+                  <th className="text-right py-1">Cum P&L</th>
                 </tr>
               </thead>
               <tbody>
                 {strategies.map((s, i) => {
-                  const sortinoColor = s.sortino >= 2 ? 'text-profit' :
-                    s.sortino >= 0 ? 'text-text-primary' : 'text-loss';
-                  const rowClass = s.state === 'frozen'
-                    ? 'opacity-60'
-                    : s.state === 'retired'
-                    ? 'opacity-40 line-through'
-                    : '';
+                  const sortinoColor =
+                    s.sortino >= 2
+                      ? 'text-profit'
+                      : s.sortino >= 0
+                      ? 'text-text-primary'
+                      : 'text-loss';
+                  const rowClass =
+                    s.state === 'frozen'
+                      ? 'opacity-60'
+                      : s.state === 'retired'
+                      ? 'opacity-40'
+                      : '';
+                  const cumulPnl = s.cumulative_pnl ?? null;
                   return (
-                    <tr key={s.name} className={`border-b border-bg-hover/50 ${rowClass}`}>
+                    <tr
+                      key={s.name}
+                      className={`border-b border-bg-hover/50 hover:bg-bg-hover/20 transition-colors ${rowClass}`}
+                      title={`State: ${STATE_LABELS[s.state]}`}
+                    >
                       <td className="py-1 pr-2 text-text-tertiary">{i + 1}</td>
-                      <td className="py-1 pr-2 text-text-primary truncate max-w-[120px]">{s.name}</td>
+                      <td className={`py-1 pr-2 truncate max-w-[120px] ${s.state === 'retired' ? 'line-through text-text-tertiary' : 'text-text-primary'}`}>
+                        {s.name}
+                      </td>
                       <td className={`py-1 pr-2 text-right ${sortinoColor}`}>
                         {s.sortino.toFixed(2)}
+                      </td>
+                      <td className={`py-1 pr-2 text-right ${s.sharpe >= 1 ? 'text-text-primary' : 'text-text-tertiary'}`}>
+                        {s.sharpe.toFixed(2)}
                       </td>
                       <td className={`py-1 pr-2 text-center ${STATE_CLASSES[s.state]}`}>
                         {STATE_ICONS[s.state]}
                       </td>
                       <td className="py-1 pr-2 text-right">{s.alloc_pct}%</td>
                       <td className="py-1 pr-2 text-right text-text-secondary">{s.trades}</td>
-                      <td className="py-1 text-right text-text-secondary">
-                        {Number(s.win_rate * 100).toFixed(0)}%
+                      <td className="py-1 pr-2 text-right text-text-secondary">
+                        {(s.win_rate * 100).toFixed(0)}%
+                      </td>
+                      <td className={`py-1 text-right text-[10px] ${
+                        cumulPnl == null
+                          ? 'text-text-tertiary'
+                          : cumulPnl >= 0
+                          ? 'text-profit'
+                          : 'text-loss'
+                      }`}>
+                        {cumulPnl != null
+                          ? `${cumulPnl >= 0 ? '+' : ''}$${cumulPnl.toFixed(1)}`
+                          : '—'}
                       </td>
                     </tr>
                   );
@@ -120,7 +165,7 @@ export function PortfolioArena() {
           )}
         </div>
 
-        {/* ── Capital Allocation ───────────────────────────────── */}
+        {/* ── Capital Allocation ────────────────────────────────── */}
         <div className="bg-bg-secondary border border-bg-hover rounded p-3">
           <h3 className="text-[10px] text-text-tertiary tracking-wider mb-2">
             CAPITAL ALLOCATION
@@ -128,60 +173,42 @@ export function PortfolioArena() {
           {allocation.total_equity > 0 ? (
             <>
               {/* Active capital bar */}
-              <div className="mb-2">
-                <div className="flex justify-between text-[10px] font-mono mb-0.5">
-                  <span className="text-text-secondary">Active</span>
-                  <span className="text-profit">
-                    ${allocation.active.toLocaleString()} ({Math.round((allocation.active / allocation.total_equity) * 100)}%)
-                  </span>
-                </div>
-                <div className="bg-bg-tertiary rounded-full h-3 overflow-hidden">
-                  <div
-                    className="bg-profit h-full rounded-full transition-all duration-700"
-                    style={{ width: `${(allocation.active / allocation.total_equity) * 100}%` }}
-                  />
-                </div>
-              </div>
+              <AllocationBar
+                label="Active"
+                value={allocation.active}
+                total={allocation.total_equity}
+                barClass="bg-profit"
+                valueClass="text-profit"
+              />
 
               {/* Frozen capital bar */}
               {allocation.frozen > 0 && (
-                <div className="mb-2">
-                  <div className="flex justify-between text-[10px] font-mono mb-0.5">
-                    <span className="text-text-secondary">Frozen</span>
-                    <span className="text-text-tertiary">
-                      ${allocation.frozen.toLocaleString()} ({Math.round((allocation.frozen / allocation.total_equity) * 100)}%)
-                    </span>
-                  </div>
-                  <div className="bg-bg-tertiary rounded-full h-3 overflow-hidden">
-                    <div
-                      className="bg-text-tertiary h-full rounded-full"
-                      style={{ width: `${(allocation.frozen / allocation.total_equity) * 100}%` }}
-                    />
-                  </div>
-                </div>
+                <AllocationBar
+                  label="Frozen"
+                  value={allocation.frozen}
+                  total={allocation.total_equity}
+                  barClass="bg-text-tertiary"
+                  valueClass="text-text-tertiary"
+                />
               )}
 
               {/* Retired capital bar */}
               {allocation.retired > 0 && (
-                <div className="mb-2">
-                  <div className="flex justify-between text-[10px] font-mono mb-0.5">
-                    <span className="text-text-secondary">Retired</span>
-                    <span className="text-bg-active">
-                      ${allocation.retired.toLocaleString()}
-                    </span>
-                  </div>
-                  <div className="bg-bg-tertiary rounded-full h-3 overflow-hidden">
-                    <div
-                      className="bg-bg-active h-full rounded-full"
-                      style={{ width: `${(allocation.retired / allocation.total_equity) * 100}%` }}
-                    />
-                  </div>
-                </div>
+                <AllocationBar
+                  label="Retired"
+                  value={allocation.retired}
+                  total={allocation.total_equity}
+                  barClass="bg-bg-active"
+                  valueClass="text-bg-active"
+                />
               )}
 
               {/* Equity summary */}
               <div className="mt-4 space-y-1.5">
-                <MetricRow label="Total Equity" value={`$${allocation.total_equity.toLocaleString()}`} />
+                <MetricRow
+                  label="Total Equity"
+                  value={`$${allocation.total_equity.toLocaleString()}`}
+                />
                 <MetricRow
                   label="P&L (24h)"
                   value={`${allocation.pnl_24h >= 0 ? '+' : ''}$${allocation.pnl_24h.toLocaleString()} (${allocation.pnl_24h_pct >= 0 ? '+' : ''}${allocation.pnl_24h_pct}%)`}
@@ -189,7 +216,7 @@ export function PortfolioArena() {
                 />
                 <MetricRow
                   label="Max Drawdown"
-                  value={`-$${Math.abs(allocation.max_drawdown).toLocaleString()} (${allocation.max_drawdown_pct || 0}%)`}
+                  value={`-$${Math.abs(allocation.max_drawdown).toLocaleString()} (${allocation.max_drawdown_pct ?? 0}%)`}
                   color="text-loss"
                 />
               </div>
@@ -200,11 +227,19 @@ export function PortfolioArena() {
         </div>
       </div>
 
-      {/* ── Kelly Position Sizing Pipeline ─────────────────────── */}
+      {/* ── Kelly Position Sizing Pipeline ────────────────────── */}
+      {/* NOTE: This section displays the last signal computed by the auto-trader.
+               It is STATIC until the backend exposes a /api/portfolio/last_signal endpoint.
+               Context: paper_signal_loop runs every 30s and generates signals. */}
       <div className="bg-bg-secondary border border-bg-hover rounded p-3">
-        <h3 className="text-[10px] text-text-tertiary tracking-wider mb-2">
-          LAST POSITION SIZING PIPELINE
-        </h3>
+        <div className="flex items-center justify-between mb-2">
+          <h3 className="text-[10px] text-text-tertiary tracking-wider">
+            LAST POSITION SIZING PIPELINE
+          </h3>
+          <span className="text-[8px] px-1.5 py-0.5 rounded font-mono bg-bg-tertiary text-text-tertiary">
+            ○ STATIC — no live endpoint yet
+          </span>
+        </div>
         <div className="flex items-center gap-2 text-[10px] font-mono flex-wrap">
           <span className="text-text-secondary">Signal: momentum → YES "Trump wins 2028?" @ $0.62</span>
           <span className="text-bg-active mx-1">→</span>
@@ -229,7 +264,44 @@ export function PortfolioArena() {
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-function MetricRow({ label, value, color = 'text-text-primary' }: {
+function AllocationBar({
+  label,
+  value,
+  total,
+  barClass,
+  valueClass,
+}: {
+  label: string;
+  value: number;
+  total: number;
+  barClass: string;
+  valueClass: string;
+}) {
+  // BUG FIX: Guard division-by-zero
+  const pct = total > 0 ? (value / total) * 100 : 0;
+  return (
+    <div className="mb-2">
+      <div className="flex justify-between text-[10px] font-mono mb-0.5">
+        <span className="text-text-secondary">{label}</span>
+        <span className={valueClass}>
+          ${value.toLocaleString()} ({Math.round(pct)}%)
+        </span>
+      </div>
+      <div className="bg-bg-tertiary rounded-full h-3 overflow-hidden">
+        <div
+          className={`${barClass} h-full rounded-full transition-all duration-700`}
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+    </div>
+  );
+}
+
+function MetricRow({
+  label,
+  value,
+  color = 'text-text-primary',
+}: {
   label: string;
   value: string;
   color?: string;
