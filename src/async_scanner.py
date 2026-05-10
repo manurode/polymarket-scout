@@ -220,6 +220,40 @@ class AsyncPolymarketScanner:
         await self._rate_limiter.wait_acquire("reconciliation", timeout=3.0)
         return await self._get_clob(f"{CLOB}/book?token_id={token_id}")
 
+    async def get_order_count_async(self, token_id: str) -> int:
+        """Fetch the number of active orders (bids + asks) for a token from the CLOB.
+
+        Hits ``/order-count`` first (lightweight). Falls back to counting the full
+        book if that endpoint doesn't exist. Returns 0 on any error so callers can
+        degrade gracefully without crashing the scan.
+        """
+        await self._rate_limiter.wait_acquire("ad_hoc", timeout=3.0)
+        try:
+            data = await self._get_clob(f"{CLOB}/order-count?token_id={token_id}")
+            # Expected response: {"count": 42} or {"bid_count": 20, "ask_count": 22}
+            if isinstance(data, dict):
+                if "count" in data:
+                    return int(data["count"])
+                bid = int(data.get("bid_count", 0))
+                ask = int(data.get("ask_count", 0))
+                if bid + ask > 0:
+                    return bid + ask
+        except Exception:
+            pass
+
+        # Fallback: count levels from the full book (heavier, but reliable)
+        try:
+            await self._rate_limiter.wait_acquire("reconciliation", timeout=3.0)
+            book = await self._get_clob(f"{CLOB}/book?token_id={token_id}")
+            if isinstance(book, dict):
+                bids = book.get("bids", [])
+                asks = book.get("asks", [])
+                return len(bids) + len(asks)
+        except Exception:
+            pass
+
+        return 0
+
     # ── Scan principal (compatible con v1.0) ──────────────────────
 
     async def scan_markets_async(
@@ -281,12 +315,32 @@ class AsyncPolymarketScanner:
                     else None
                 )
                 spread = None
+                order_count = 0
+
+                # ── volume_24h: Gamma exposes this under multiple field names ──
+                # Try each candidate in priority order; fall back to 0.
+                volume_24h = 0.0
+                for _field in ("volume24hr", "oneDayVolume", "volume_24h", "dailyVolume"):
+                    _raw = market.get(_field)
+                    if _raw is not None:
+                        try:
+                            volume_24h = float(_raw)
+                            break
+                        except (TypeError, ValueError):
+                            pass
+
+                # ── created_at: needed by SelectionEngine._is_new_market ──
+                created_at: Optional[float] = None
+                _created_raw = market.get("createdAt") or event.get("createdAt")
+                if _created_raw:
+                    created_at = self._parse_end_date(_created_raw)  # same ISO→unix logic
 
                 # CLOB enrichment (best-effort, rate-limited)
                 if enrich_clob and token_yes:
                     try:
                         price_yes = await self.get_price_async(token_yes)
                         spread = await self.get_spread_async(token_yes)
+                        order_count = await self.get_order_count_async(token_yes)
                     except Exception:
                         # Gamma prices are good enough; CLOB enrichment is optional
                         if price_yes is None:
@@ -311,7 +365,10 @@ class AsyncPolymarketScanner:
                     "price_no": price_no,
                     "spread": spread,
                     "volume": volume,
+                    "volume_24h": volume_24h,
                     "liquidity": float(market.get("liquidity", 0)),
+                    "order_count": order_count,
+                    "created_at": created_at,
                     "timestamp": now,
                     "clobTokenIds": tokens,        # para MM suscripción WS
                     "end_date": self._parse_end_date(market.get("endDate", "")),
@@ -327,14 +384,21 @@ class AsyncPolymarketScanner:
         markets_per_event: int = 20,
         min_volume: float = 1000,
     ) -> list[dict]:
-        """Radar puro: solo Gamma API, sin tocar el CLOB.
+        """Radar L1: Gamma API pura, sin llamadas al CLOB.
 
         Diseñado para ejecutarse cada 30-60 segundos como capa de
-        descubrimiento. Extremadamente rápido (~2-3s) y nunca bloqueado.
+        descubrimiento rápido (~2-3s). Nunca bloquea el rate-limiter
+        del CLOB — ese es trabajo de la capa L2 (WebSocket / MM loop).
+
+        Los snapshots incluyen ``volume_24h`` y ``created_at`` desde
+        Gamma. El SelectionEngine v3.1 tiene un «margen de cortesía»:
+        mercados con ``volume_24h > $1000`` pasan los Hard Gates de
+        spread/order_count aunque esos campos estén vacíos, y serán
+        validados en el siguiente ciclo por el WebSocket CLOB.
         """
         return await self.scan_markets_async(
             events_limit=events_limit,
             markets_per_event=markets_per_event,
             min_volume=min_volume,
-            enrich_clob=False,
+            enrich_clob=False,  # L1 = Gamma only; CLOB enrichment is L2's job
         )

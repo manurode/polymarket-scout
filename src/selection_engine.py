@@ -8,10 +8,11 @@ La arquitectura v2.0 usa un sistema de dos capas:
 El score compuesto prioriza mercados con alto volumen RECIENTE, buena liquidez,
 lejos de la expiración y con spread razonable.
 
-Filtros anti-mercados-zombi — "Filtro de Pulso" (v3.0):
-  - Hard Gate de Actividad: vol24h == 0 → score=0, excepto mercados nuevos (<24h).
-  - Validación de Spread: spread == "N/A" o libro vacío → mercado ignorado.
-  - Densidad de Órdenes: si no hay órdenes en el CLOB, el mercado no entra al Top 50.
+Filtros anti-mercados-zombi — "Filtro de Pulso" (v3.1):
+  - Hard Gate de Actividad: vol24h == 0 → score=0, excepto mercados nuevos (<48h).
+  - Validación de Spread: spread == "N/A" o libro vacío → ignorado, SALVO que
+    vol24h > $1000 (margen de cortesía para mercados aún no consultados al CLOB).
+  - Densidad de Órdenes: order_count==0 → ignorado, SALVO margen de cortesía.
   - Ranking Inverso de Pulso: los mercados con actividad se ordenan por vol24h DESC.
   - Hard limit de liquidez: liquidez < $500 → score=0.
   - Penalización agresiva de spread: spreads > 10% reciben un multiplicador 0.01x.
@@ -40,13 +41,17 @@ SCORE_WEIGHTS = {
 }
 
 # Umbrales
-SPREAD_PENALTY_THRESHOLD  = 0.10   # spreads > 10% → multiplicador 0.01x en score final
-SPREAD_PENALTY_MULTIPLIER = 0.01   # Factor de penalización AGRESIVO para spreads excesivos
-MIN_LIQUIDITY_USD         = 500.0  # Liquidez mínima — mercados por debajo reciben score=0
-EXTREME_PRICE_LOW         = 0.02   # Precio < 2%: evento considerado imposible
-EXTREME_PRICE_HIGH        = 0.98   # Precio > 98%: evento considerado seguro
-EXPIRY_WARN_HOURS         = 24     # mercados que expiran en < 24h penalizados
-NEW_MARKET_WINDOW_HOURS   = 24     # Mercados creados en las últimas N horas son "nuevos"
+SPREAD_PENALTY_THRESHOLD    = 0.10    # spreads > 10% → multiplicador 0.01x en score final
+SPREAD_PENALTY_MULTIPLIER   = 0.01    # Factor de penalización AGRESIVO para spreads excesivos
+MIN_LIQUIDITY_USD           = 500.0   # Liquidez mínima — mercados por debajo reciben score=0
+EXTREME_PRICE_LOW           = 0.02    # Precio < 2%: evento considerado imposible
+EXTREME_PRICE_HIGH          = 0.98    # Precio > 98%: evento considerado seguro
+EXPIRY_WARN_HOURS           = 24      # mercados que expiran en < 24h penalizados
+NEW_MARKET_WINDOW_HOURS     = 48      # Mercados creados en las últimas N horas son "nuevos"
+# Margen de cortesía: mercados con vol24h > este umbral pueden pasar el Hard Gate
+# de spread/order_count vacíos. El Scanner L1 (Gamma) aún no ha consultado el CLOB;
+# el WS (L2) los validará en el siguiente ciclo.
+MIN_VOL24H_FOR_SPREAD_GRACE = 1_000.0  # $1 000 — umbral para el margen de cortesía
 
 
 @dataclass
@@ -74,12 +79,23 @@ class RankingResult:
 
 
 def _is_new_market(snapshot: dict) -> bool:
-    """Retorna True si el mercado fue creado en las últimas NEW_MARKET_WINDOW_HOURS horas."""
+    """Retorna True si el mercado probablemente es nuevo (< NEW_MARKET_WINDOW_HOURS horas).
+
+    Estrategia en dos pasos:
+    1. Si ``created_at`` (timestamp UNIX) está disponible, lo usa directamente.
+    2. Si no está disponible (Gamma a veces no lo expone), usa una heurística:
+       volumen total bajo + vol24h == 0 es señal fuerte de mercado recién creado.
+    """
     created_at = snapshot.get("created_at")  # timestamp UNIX esperado
-    if created_at is None:
-        return False
-    age_hours = (time.time() - created_at) / 3600
-    return age_hours <= NEW_MARKET_WINDOW_HOURS
+    if created_at is not None and created_at > 0:
+        age_hours = (time.time() - float(created_at)) / 3600
+        return age_hours <= NEW_MARKET_WINDOW_HOURS
+
+    # Heurística: sin created_at → mercado con volumen total muy bajo y sin vol24h
+    # probablemente acabó de crearse. Le damos el beneficio de la duda.
+    volume_total = snapshot.get("volume", 0) or 0
+    volume_24h   = snapshot.get("volume_24h", 0) or 0
+    return volume_total < 500 and volume_24h == 0
 
 
 def _parse_spread(snapshot: dict) -> Optional[float]:
@@ -140,9 +156,12 @@ class SelectionEngine:
           - recency_score:     penalización por cercanía a expiración (peso 10%).
 
         Hard Gates (score=0 inmediato, antes de cualquier cálculo):
-          1. spread == "N/A" o None → libro vacío, mercado ignorado.
-          2. order_count == 0 → CLOB vacío, sin actividad real.
-          3. vol24h == 0 y el mercado NO es nuevo (<24h) → sin pulso.
+          1. spread == None → libro no consultado.
+             EXCEPCIÓN: si vol24h > MIN_VOL24H_FOR_SPREAD_GRACE → margen de cortesía
+             (pasa con score reducido; el WS lo validará en el siguiente ciclo).
+          2. order_count == 0 → CLOB sin órdenes.
+             EXCEPCIÓN: misma gracia que Gate 1 si vol24h suficiente.
+          3. vol24h == 0 y el mercado NO es nuevo (<48h) → sin pulso.
           4. Liquidez < MIN_LIQUIDITY_USD ($500) → inoperable.
           5. Precio en extremos (< 2% o > 98%) con spread alto → score=0.
 
@@ -153,24 +172,31 @@ class SelectionEngine:
         volume_24h   = max(0, snapshot.get("volume_24h", 0) or 0)
         liquidity    = max(0, snapshot.get("liquidity", 0) or 0)
         order_count  = max(0, snapshot.get("order_count", 0) or 0)  # órdenes en el CLOB
-        price        = snapshot.get("price")  # precio mid del mercado (0-1)
+        price        = snapshot.get("price") or snapshot.get("price_yes")  # precio mid
         spread       = _parse_spread(snapshot)
 
-        # ── HARD GATE 1: Spread N/A → libro de órdenes vacío ─────
-        # Si el spread es N/A, no hay bid ni ask. El mercado no existe
-        # en la práctica. Lo ignoramos completamente.
-        if spread is None:
+        # ── Margen de cortesía: ¿puede ignorar Gates 1 y 2? ──────
+        # Un mercado con vol24h > $1000 pero sin datos de CLOB aún
+        # (el Scanner L1 aún no lo ha enriquecido) recibe el beneficio
+        # de la duda. El WS lo validará en el siguiente ciclo.
+        has_vol24h_grace = volume_24h >= MIN_VOL24H_FOR_SPREAD_GRACE
+
+        # ── HARD GATE 1: Spread N/A → libro de órdenes sin datos ──
+        # Si el spread es N/A y NO tiene volumen suficiente, el mercado
+        # es un zombi. Si SÍ tiene volumen, lo dejamos pasar con un score
+        # conservador (el CLOB lo validará pronto).
+        if spread is None and not has_vol24h_grace:
             return 0.0
 
         # ── HARD GATE 2: CLOB vacío → sin órdenes activas ────────
         # order_count proviene del análisis del libro CLOB.
-        # Si es 0, nadie está dispuesto a comprar ni vender. Ignorado.
-        if order_count == 0:
+        # Si es 0 y no tiene volumen suficiente → zombi confirmado.
+        if order_count == 0 and not has_vol24h_grace:
             return 0.0
 
         # ── HARD GATE 3: vol24h == 0 → sin pulso ─────────────────
         # El mercado no se ha movido hoy. Excepto si es recién creado
-        # (< 24h), en cuyo caso se le da el beneficio de la duda.
+        # (< 48h), en cuyo caso se le da el beneficio de la duda.
         if volume_24h == 0 and not _is_new_market(snapshot):
             return 0.0
 
@@ -183,7 +209,7 @@ class SelectionEngine:
         # ── HARD GATE 5: Probabilidad extrema + spread alto ──────
         # Mercados con precio < 2% o > 98% y spread elevado son
         # eventos que el mercado da por imposibles/seguros.
-        if price is not None and spread > SPREAD_PENALTY_THRESHOLD:
+        if price is not None and spread is not None and spread > SPREAD_PENALTY_THRESHOLD:
             if price < EXTREME_PRICE_LOW or price > EXTREME_PRICE_HIGH:
                 return 0.0
 
@@ -222,7 +248,8 @@ class SelectionEngine:
         # ── Penalización agresiva de spread (multiplicador post-score) ──
         # Spreads > 10% son señal de mercado zombi o ilíquido.
         # Multiplicador 0.01x: hunde el mercado al fondo de la lista.
-        if spread > SPREAD_PENALTY_THRESHOLD:
+        # spread puede ser None para mercados en margen de cortesía (aún sin CLOB).
+        if spread is not None and spread > SPREAD_PENALTY_THRESHOLD:
             base_score *= SPREAD_PENALTY_MULTIPLIER
 
         return base_score
