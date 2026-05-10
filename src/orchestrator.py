@@ -738,6 +738,21 @@ class ScoutOrchestrator:
                             quote.time_decay_scalar,
                         )
 
+                        # ── Cross Engine: registrar como orden límite virtual ────────
+                        # La orden queda pendiente hasta que el precio real del mercado
+                        # la cruce (via _on_ws_book → cross_and_fill).
+                        snap = token_to_snap.get(token_id, {})
+                        question = snap.get("question", token_id[:40])
+                        self.paper_trading.register_mm_quote(
+                            token_id=token_id,
+                            market=f"[MM] {question[:55]}",
+                            bid_price=quote.bid_price,
+                            ask_price=quote.ask_price,
+                            bid_size=quote.bid_size,
+                            ask_size=quote.ask_size,
+                            strategy="market_making",
+                        )
+
                 if quotes_this_cycle > 0:
                     logger.info(
                         "MM cycle: %d quotes | %d active markets | "
@@ -1108,13 +1123,14 @@ class ScoutOrchestrator:
     # ── WebSocket Callbacks ─────────────────────────────────────────
 
     def _on_ws_book(self, asset_id: str, data: dict) -> None:
-        """Callback: WS book event -> BookAnalyzer.
+        """Callback: WS book event -> BookAnalyzer + Cross Engine fill simulation.
 
         Estrategia dual:
         - Si el book NO existe aun en BookAnalyzer -> initialize_book (populateo completo).
         - Si YA existe -> apply_delta (merge de updates, preserva niveles no mencionados).
 
-        Esto evita que un delta parcial del WS machaque un snapshot REST completo.
+        Tras actualizar el book, extrae el mejor bid/ask real y dispara el Cross Engine
+        para comprobar si alguna orden límite virtual ha sido cruzada y ejecutarla.
         """
         try:
             if self.book_analyzer:
@@ -1127,6 +1143,25 @@ class ScoutOrchestrator:
                 else:
                     # Book ya existe -> merge delta (preserva niveles no afectados)
                     self.book_analyzer.apply_delta(asset_id, data)
+
+                # ── Cross Engine: cruzar precio real contra órdenes límite virtuales ──
+                # Solo si hay órdenes virtuales pendientes para este token.
+                if self.paper_trading._open_orders:
+                    book_snap = self.book_analyzer.get_book(asset_id)
+                    if book_snap and book_snap.bid_count > 0 and book_snap.ask_count > 0:
+                        real_best_bid = float(book_snap.bids[0, 0])
+                        real_best_ask = float(book_snap.asks[0, 0])
+                        try:
+                            loop = asyncio.get_event_loop()
+                            if loop.is_running():
+                                asyncio.ensure_future(
+                                    self.paper_trading.cross_and_fill(
+                                        asset_id, real_best_bid, real_best_ask,
+                                    )
+                                )
+                        except RuntimeError:
+                            pass  # sin event loop activo (e.g., tests)
+
         except Exception as e:
             logger.error("WS book callback error: %s", e, exc_info=True)
 

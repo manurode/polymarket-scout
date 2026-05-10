@@ -25,6 +25,11 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# Máximo de órdenes límite activas por token (evita acumulación ilimitada)
+MAX_OPEN_ORDERS_PER_TOKEN = 4
+# Vida máxima de una orden límite virtual (segundos) antes de cancelarse
+ORDER_TTL_SECONDS = 120
+
 # ── Constantes ─────────────────────────────────────────────────────────────────────
 
 DEFAULT_INITIAL_USDC = 10_000.0
@@ -45,6 +50,20 @@ POL_COMMISSION = 0.02    # 0.02 POL por trade cerrado (gas simulado)
 
 
 # ── Tipos ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class VirtualLimitOrder:
+    """Orden límite virtual pendiente de ejecución (pre-fill)."""
+    id: int
+    token_id: str
+    market: str          # nombre legible del mercado
+    strategy: str
+    bid_price: float     # precio de compra (si aplica)
+    ask_price: float     # precio de venta (si aplica)
+    bid_size: float      # tamaño USD del lado bid
+    ask_size: float      # tamaño USD del lado ask
+    created_at: float = field(default_factory=time.time)
+
 
 @dataclass
 class VirtualPosition:
@@ -115,6 +134,190 @@ class PaperTradingEngine:
         self._position_counter = 0
         self._trade_history: list[dict] = []
         self._lock = asyncio.Lock()
+
+        # ── Virtual Limit Order Book (Cross Engine) ────────────────────────
+        self._open_orders: list[VirtualLimitOrder] = []
+        self._order_counter = 0
+
+    # ── Cross Engine: Virtual Limit Orders ─────────────────────────────────────────
+
+    def register_mm_quote(
+        self,
+        token_id: str,
+        market: str,
+        bid_price: float,
+        ask_price: float,
+        bid_size: float,
+        ask_size: float,
+        strategy: str = "market_making",
+    ) -> VirtualLimitOrder:
+        """Registra un quote de Market Making como orden límite virtual activa.
+
+        El Cross Engine evaluará estas órdenes en cada `cross_and_fill()` para
+        determinar si el precio real del mercado las cruza y ejecutarlas.
+
+        Parameters
+        ----------
+        token_id : str
+            ID del token del mercado.
+        market : str
+            Nombre legible del mercado.
+        bid_price, ask_price : float
+            Precios bid y ask del quote.
+        bid_size, ask_size : float
+            Tamaños en USD para cada lado.
+        strategy : str
+            Nombre del brazo del Bandit.
+
+        Returns
+        -------
+        VirtualLimitOrder
+            La orden registrada.
+        """
+        now = time.time()
+
+        # Cancelar órdenes antiguas (TTL expirado) para este token
+        self._open_orders = [
+            o for o in self._open_orders
+            if not (o.token_id == token_id and (now - o.created_at) > ORDER_TTL_SECONDS)
+        ]
+
+        # Limitar órdenes activas por token
+        token_orders = [o for o in self._open_orders if o.token_id == token_id]
+        if len(token_orders) >= MAX_OPEN_ORDERS_PER_TOKEN:
+            # Eliminar la más antigua
+            oldest = min(token_orders, key=lambda o: o.created_at)
+            self._open_orders.remove(oldest)
+
+        self._order_counter += 1
+        order = VirtualLimitOrder(
+            id=self._order_counter,
+            token_id=token_id,
+            market=market,
+            strategy=strategy,
+            bid_price=bid_price,
+            ask_price=ask_price,
+            bid_size=bid_size,
+            ask_size=ask_size,
+        )
+        self._open_orders.append(order)
+        logger.debug(
+            "CrossEngine: orden límite #%d registrada | %s | bid=%.4f ask=%.4f",
+            order.id, token_id[:16], bid_price, ask_price,
+        )
+        return order
+
+    async def cross_and_fill(
+        self,
+        token_id: str,
+        real_best_bid: float,
+        real_best_ask: float,
+    ) -> list[VirtualPosition]:
+        """Cruza el precio real del mercado contra las órdenes límite virtuales.
+
+        Lógica de cruce (market-making pasivo):
+        - Si el Best Ask real BAJA hasta cruzar nuestro Virtual Bid → Fill BID:
+          Alguien en el mercado está dispuesto a vender más barato que nuestro bid.
+          Simulamos que compramos YES → posición LONG YES.
+        - Si el Best Bid real SUBE hasta cruzar nuestro Virtual Ask → Fill ASK:
+          Alguien en el mercado paga más que nuestro ask.
+          Simulamos que vendemos NO → posición SHORT (LONG NO).
+
+        Parameters
+        ----------
+        token_id : str
+            ID del token cuyo book acaba de actualizarse.
+        real_best_bid : float
+            Mejor bid real actual del mercado (Polymarket CLOB).
+        real_best_ask : float
+            Mejor ask real actual del mercado (Polymarket CLOB).
+
+        Returns
+        -------
+        list[VirtualPosition]
+            Posiciones abiertas por fills ejecutados en este ciclo.
+        """
+        filled_positions: list[VirtualPosition] = []
+        if real_best_bid <= 0 or real_best_ask <= 0:
+            return filled_positions
+
+        now = time.time()
+        orders_to_fill: list[tuple[VirtualLimitOrder, str, float, float]] = []
+
+        # Identificar órdenes a ejecutar (sin lock para la lectura)
+        for order in list(self._open_orders):
+            if order.token_id != token_id:
+                continue
+
+            # TTL check
+            if (now - order.created_at) > ORDER_TTL_SECONDS:
+                continue
+
+            # ── Fill BID: real_best_ask <= our_bid_price ─────────────────
+            # El mercado ofrece vender a un precio ≤ lo que nosotros pagamos.
+            # Esto significa que nuestra orden de compra se ejecuta.
+            if real_best_ask <= order.bid_price and order.bid_size >= 50:
+                orders_to_fill.append((order, "YES", order.bid_price, order.bid_size))
+
+            # ── Fill ASK: real_best_bid >= our_ask_price ─────────────────
+            # El mercado quiere comprar a un precio ≥ lo que nosotros pedimos.
+            # Nuestra orden de venta se ejecuta → abrimos posición NO.
+            elif real_best_bid >= order.ask_price and order.ask_size >= 50:
+                orders_to_fill.append((order, "NO", order.ask_price, order.ask_size))
+
+        # Ejecutar fills
+        for order, side, fill_price, fill_size in orders_to_fill:
+            # Eliminar la orden del libro (ya ejecutada)
+            try:
+                self._open_orders.remove(order)
+            except ValueError:
+                continue  # ya fue eliminada por otro fill concurrente
+
+            size = min(fill_size, self.wallet.usdc_free)
+            if size < 50:
+                logger.debug("CrossEngine: fill omitido (capital libre=$%.2f)", self.wallet.usdc_free)
+                continue
+
+            pos = await self.open_position(
+                strategy=order.strategy,
+                market=order.market,
+                side=side,
+                size=size,
+                entry=fill_price,
+                tau_pct=random.uniform(10, 55),
+                toxicity=random.uniform(0.03, 0.20),
+            )
+
+            if pos:
+                filled_positions.append(pos)
+                logger.info(
+                    "PAPER TRADE EXECUTED | Side: %s | Price: %.4f | Size: $%.0f | "
+                    "Market: %s | token: %s | real_bb=%.4f real_ba=%.4f",
+                    side, fill_price, size,
+                    order.market[:55], token_id[:16],
+                    real_best_bid, real_best_ask,
+                )
+
+        return filled_positions
+
+    def get_open_orders(self) -> list[dict]:
+        """Retorna las órdenes límite virtuales activas (para el dashboard)."""
+        now = time.time()
+        return [
+            {
+                "id": o.id,
+                "token_id": o.token_id,
+                "market": o.market,
+                "strategy": o.strategy,
+                "bid_price": round(o.bid_price, 4),
+                "ask_price": round(o.ask_price, 4),
+                "bid_size": round(o.bid_size, 2),
+                "ask_size": round(o.ask_size, 2),
+                "age_s": round(now - o.created_at, 1),
+            }
+            for o in self._open_orders
+            if (now - o.created_at) <= ORDER_TTL_SECONDS
+        ]
 
     # ── Execution ───────────────────────────────────────────────────────────────────
 
