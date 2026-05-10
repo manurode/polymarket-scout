@@ -721,9 +721,16 @@ class ScoutOrchestrator:
                                      book_snap.ask_count if book_snap else 0)
                         continue
 
-                    # ── Saltar mercados con spreads extremos (no hay liquidez real) ──
-                    if clob_spread > 0.50:
-                        logger.debug("MM skip %s: spread demasiado alto (%.3f > 0.50)", token_id, clob_spread)
+                    # ── FIX 2: Rechazar mercados con spread CLOB > 5% ──────────────
+                    # Un spread superior al 5% hundirá el Mark-to-Market al momento
+                    # de abrir la posición, disparando el SL instantáneamente.
+                    # El MM no debe jugar en mercados ilíquidos (ej. deportes).
+                    MAX_ALLOWED_CLOB_SPREAD = 0.05  # 5%
+                    if clob_spread > MAX_ALLOWED_CLOB_SPREAD:
+                        logger.debug(
+                            "MM skip %s: spread CLOB=%.3f supera límite del %.0f%% — mercado ilíquido, rechazado",
+                            token_id[:16], clob_spread, MAX_ALLOWED_CLOB_SPREAD * 100,
+                        )
                         continue
 
                     # Si el fair price está en los extremos, saltar
@@ -799,20 +806,37 @@ class ScoutOrchestrator:
                             quote.time_decay_scalar,
                         )
 
-                        # ── Cross Engine: registrar como orden límite virtual ────────
-                        # La orden queda pendiente hasta que el precio real del mercado
-                        # la cruce (via _on_ws_book → cross_and_fill).
-                        snap = token_to_snap.get(token_id, {})
-                        question = snap.get("question", token_id[:40])
-                        self.paper_trading.register_mm_quote(
-                            token_id=token_id,
-                            market=f"[MM] {question[:55]}",
-                            bid_price=quote.bid_price,
-                            ask_price=quote.ask_price,
-                            bid_size=quote.bid_size,
-                            ask_size=quote.ask_size,
-                            strategy="market_making",
-                        )
+                        # ── FIX 1: Control de Inventario en _market_making_loop ──────
+                        # Antes de registrar la orden virtual, verificar que no exista
+                        # ya una posición abierta para este token_id (YES o NO).
+                        # Si ya hay ≥ 1 posición, saltamos este mercado.
+                        open_for_token = [
+                            p for p in self.paper_trading._positions
+                            if p.closed_at is None and token_id in p.market
+                        ]
+                        if open_for_token:
+                            self._mm_quotes_skipped += 1
+                            logger.debug(
+                                "MM INV BLOCK %s: ya hay %d posición(es) abierta(s) [%s] — quote no registrada",
+                                token_id[:16],
+                                len(open_for_token),
+                                ", ".join(p.side for p in open_for_token),
+                            )
+                        else:
+                            # ── Cross Engine: registrar como orden límite virtual ────
+                            # La orden queda pendiente hasta que el precio real del mercado
+                            # la cruce (via _on_ws_book → cross_and_fill).
+                            snap = token_to_snap.get(token_id, {})
+                            question = snap.get("question", token_id[:40])
+                            self.paper_trading.register_mm_quote(
+                                token_id=token_id,
+                                market=f"[MM] {question[:55]}",
+                                bid_price=quote.bid_price,
+                                ask_price=quote.ask_price,
+                                bid_size=quote.bid_size,
+                                ask_size=quote.ask_size,
+                                strategy="market_making",
+                            )
 
                 if quotes_this_cycle > 0:
                     logger.info(
@@ -1051,8 +1075,9 @@ class ScoutOrchestrator:
                     ba_sz = float(book_snap.asks[0, 1])
 
                     clob_spread = ba - bb
-                    if clob_spread > 0.40 or clob_spread <= 0:
-                        continue  # spread demasiado ancho o inválido
+                    # ── FIX 2: Coherencia — mismo límite de spread del 5% ──────────
+                    if clob_spread > 0.05 or clob_spread <= 0:
+                        continue  # spread ilíquido: rechazado (SL instantáneo)
 
                     # Micro-Price: media ponderada por tamaño inverso (Lee-Ready)
                     total_sz = bb_sz + ba_sz

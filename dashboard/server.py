@@ -216,6 +216,43 @@ def _register_routes(app: FastAPI) -> None:
             history = _mock_equity_history()
         return {"history": history, "count": len(history)}
 
+    @app.post("/api/portfolio/reset")
+    async def portfolio_reset(request: Request):
+        """Force-close all open positions and cancel pending virtual orders.
+
+        This is the "clean ledger" operation. Positions are marked with
+        reason='reset' and returned to the wallet as collateral. Use this
+        to eliminate stale/hung positions after fixing strategy bugs.
+        """
+        orch = request.app.state.orchestrator
+        if not (orch and hasattr(orch, "paper_trading") and orch.paper_trading):
+            return JSONResponse({"error": "no paper trading engine"}, status_code=503)
+
+        pt = orch.paper_trading
+        open_positions = [p for p in pt._positions if p.closed_at is None]
+        closed_ids = []
+
+        for pos in open_positions:
+            trade = await pt.close_position(pos.id, reason="reset", apply_slippage=False)
+            if trade:
+                closed_ids.append(pos.id)
+
+        # Cancel all pending virtual limit orders
+        cancelled_orders = len(pt._open_orders)
+        pt._open_orders.clear()
+
+        logger.info(
+            "Portfolio RESET: %d posiciones cerradas, %d órdenes canceladas",
+            len(closed_ids), cancelled_orders,
+        )
+        return {
+            "status": "ok",
+            "positions_closed": len(closed_ids),
+            "orders_cancelled": cancelled_orders,
+            "closed_ids": closed_ids,
+            "message": f"Ledger limpiado. {len(closed_ids)} posiciones cerradas, {cancelled_orders} órdenes virtuales canceladas.",
+        }
+
     # ── Whales ───────────────────────────────────────────────────────────────────────────
 
     @app.get("/api/whales")

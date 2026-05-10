@@ -245,6 +245,19 @@ class PaperTradingEngine:
         if real_best_bid <= 0 or real_best_ask <= 0:
             return filled_positions
 
+        # ── FIX 2: Rechazo por spread ilíquido (> 5%) ─────────────────────────────
+        # Si el spread real del CLOB supera el 5%, el MTM caerá inmediatamente al
+        # abrir la posición, disparando el Stop-Loss de forma artificial.
+        # El Cross Engine NUNCA debe ejecutar fills en mercados con spreads así.
+        MAX_FILL_SPREAD = 0.05  # 5%
+        real_spread = real_best_ask - real_best_bid
+        if real_spread > MAX_FILL_SPREAD:
+            logger.warning(
+                "CrossEngine SPREAD BLOCK %s: spread=%.4f (%.1f%%) > %.0f%% — fill rechazado (mercado ilíquido)",
+                token_id[:16], real_spread, real_spread * 100, MAX_FILL_SPREAD * 100,
+            )
+            return filled_positions
+
         now = time.time()
         orders_to_fill: list[tuple[VirtualLimitOrder, str, float, float]] = []
 
