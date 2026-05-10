@@ -195,10 +195,27 @@ def _register_routes(app: FastAPI) -> None:
         orch = request.app.state.orchestrator
         if orch and hasattr(orch, "whale_tracker"):
             alpha = orch.whale_tracker.get_alpha_whales()
-            flow = orch.whale_tracker.get_whale_flow()
+            # get_whale_flow() requires a condition_id — aggregate across all tracked markets.
+            flow_list = []
+            tracked = (
+                orch.ws_manager.get_tracked_tokens()
+                if orch.ws_manager else []
+            )
+            for cid in list(tracked)[:20]:  # limit to 20 markets for speed
+                wf = orch.whale_tracker.get_whale_flow(cid)
+                flow_list.append({
+                    "condition_id": wf.condition_id,
+                    "net_flow_1h": wf.net_flow_1h,
+                    "net_flow_24h": wf.net_flow_24h,
+                    "whale_consensus": wf.whale_consensus,
+                    "whale_zscore": wf.whale_zscore,
+                    "active_whales": wf.active_whales,
+                    "bullish_whales": wf.bullish_whales,
+                    "bearish_whales": wf.bearish_whales,
+                })
         else:
-            alpha, flow = _mock_whales()
-        return {"alpha_whales": alpha, "whale_flow": flow}
+            alpha, flow_list = _mock_whales()
+        return {"alpha_whales": alpha, "whale_flow": flow_list}
 
     # ── Market Making ─────────────────────────────────────────────────────────────────
 
@@ -370,16 +387,20 @@ def _register_routes(app: FastAPI) -> None:
         if orch and hasattr(orch, "ws_manager") and orch.ws_manager:
             if token_id and orch.book_analyzer:
                 try:
-                    book = orch.book_analyzer.get_snapshot(token_id)
-                    if book:
+                    # BookAnalyzer exposes get_book(), which returns a BookSnapshot dataclass
+                    # (not a dict). bids/asks are numpy arrays of shape (MAX_LEVELS, 2).
+                    snap = orch.book_analyzer.get_book(token_id)
+                    if snap:
+                        n_bids = snap.bid_count
+                        n_asks = snap.ask_count
                         return {
                             "token_id": token_id,
-                            "bids": book.get("bids", [])[:10],
-                            "asks": book.get("asks", [])[:10],
-                            "mid_price": book.get("mid_price"),
-                            "spread": book.get("spread"),
-                            "obi": book.get("obi"),
-                            "tfi": book.get("tfi"),
+                            "bids": snap.bids[:n_bids].tolist()[:10],
+                            "asks": snap.asks[:n_asks].tolist()[:10],
+                            "mid_price": snap.mid_price,
+                            "spread": snap.spread,
+                            "obi": snap.obi,
+                            "tfi": None,  # TFI not stored in BookSnapshot; compute separately if needed
                             "timestamp": datetime.now(timezone.utc).isoformat(),
                             "source": "clob_ws",
                         }
@@ -809,7 +830,13 @@ def _mock_allocation() -> dict:
     }
 
 
-def _mock_whales() -> tuple[list, dict]:
+def _mock_whales() -> tuple[list, list]:
+    """Mock whale data.
+
+    Returns the same shape as the live path:
+    - alpha_whales: list of wallet dicts
+    - whale_flow:   list of per-market flow dicts
+    """
     alpha_whales = [
         {"wallet": "0xA1B2", "score": 0.94, "total_pnl": 45000, "win_rate": 0.68,
          "trades_per_week": 7.2, "last_active_s": 45},
@@ -818,14 +845,17 @@ def _mock_whales() -> tuple[list, dict]:
         {"wallet": "0xE5F6", "score": 0.89, "total_pnl": 28000, "win_rate": 0.65,
          "trades_per_week": 4.1, "last_active_s": 300},
     ]
-    whale_flow = {
-        "markets": [
-            {"market": "Trump wins 2028?", "flow_usd": 12000, "direction": "buy"},
-            {"market": "BTC > $100K Dec?", "flow_usd": -8000, "direction": "sell"},
-            {"market": "Fed cuts rates?", "flow_usd": 4000, "direction": "buy"},
-        ],
-        "avg_conviction_multiplier": 1.18,
-    }
+    whale_flow = [
+        {"condition_id": "mock-trump", "net_flow_1h": 12000, "net_flow_24h": 28000,
+         "whale_consensus": 0.80, "whale_zscore": 1.4, "active_whales": 3,
+         "bullish_whales": 3, "bearish_whales": 0},
+        {"condition_id": "mock-btc", "net_flow_1h": -8000, "net_flow_24h": -15000,
+         "whale_consensus": 0.60, "whale_zscore": -1.1, "active_whales": 2,
+         "bullish_whales": 0, "bearish_whales": 2},
+        {"condition_id": "mock-fed", "net_flow_1h": 4000, "net_flow_24h": 9000,
+         "whale_consensus": 0.50, "whale_zscore": 0.7, "active_whales": 2,
+         "bullish_whales": 1, "bearish_whales": 1},
+    ]
     return alpha_whales, whale_flow
 
 
