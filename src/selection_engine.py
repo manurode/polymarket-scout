@@ -8,10 +8,11 @@ La arquitectura v2.0 usa un sistema de dos capas:
 El score compuesto prioriza mercados con alto volumen RECIENTE, buena liquidez,
 lejos de la expiración y con spread razonable.
 
-Filtros anti-mercados-zombi (v2.1):
-  - Prioridad temporal: volumen_24h tiene un 70% del peso, volumen_total solo 10%.
-  - Filtro de spread: spreads >15% reciben un multiplicador de penalización 0.1x.
-  - Liquidez real: mercados con liquidez <$500 (dato Gamma API) quedan excluidos del Top N.
+Filtros anti-mercados-zombi (v2.2):
+  - Prioridad temporal: volumen_24h tiene un 70% del peso, volumen_total solo 5%.
+  - Hard limit de liquidez: mercados con liquidez <$500 reciben score=0 directamente.
+  - Penalización agresiva de spread: spreads >10% reciben un multiplicador 0.01x.
+  - Filtro de probabilidad extrema: precio <2% o >98% con spread alto → score=0.
 
 Usage:
     engine = SelectionEngine(top_n=50)
@@ -25,21 +26,23 @@ from typing import Optional
 
 
 # ── Pesos del score ───────────────────────────────────────────────
-# v2.1: El volumen se divide en 24h (señal reciente) y total (histórico).
-# Esto evita que mercados zombi con mucho volumen histórico pero inactivos
-# acaparen los slots del Top 50.
+# v2.2: El volumen se divide en 24h (señal reciente) y total (histórico).
+# volumen_total reducido a 5% para neutralizar el sesgo de mercados zombi
+# con alto historial pero actividad nula hoy.
 
 SCORE_WEIGHTS = {
-    "volume_24h": 0.70,   # Volumen últimas 24h — señal de actividad real
-    "volume_total": 0.10, # Volumen histórico — peso reducido para evitar zombis
-    "liquidity": 0.10,    # Liquidez actual del libro
+    "volume_24h": 0.70,   # Volumen últimas 24h — señal de actividad real (dominante)
+    "volume_total": 0.05, # Volumen histórico — casi irrelevante, anti-zombi
+    "liquidity": 0.15,    # Liquidez actual del libro (aumentado de 10%)
     "recency": 0.10,      # Tiempo hasta expiración
 }
 
 # Umbrales
-SPREAD_PENALTY_THRESHOLD = 0.15   # spreads > 15% → multiplicador 0.1x en score final
-SPREAD_PENALTY_MULTIPLIER = 0.1   # Factor de penalización para spreads excesivos
-MIN_LIQUIDITY_USD = 500.0          # Liquidez mínima para entrar al Top N (Gamma API)
+SPREAD_PENALTY_THRESHOLD = 0.10   # spreads > 10% → multiplicador 0.01x en score final
+SPREAD_PENALTY_MULTIPLIER = 0.01  # Factor de penalización AGRESIVO para spreads excesivos
+MIN_LIQUIDITY_USD = 500.0          # Liquidez mínima — mercados por debajo reciben score=0
+EXTREME_PRICE_LOW = 0.02           # Precio < 2%: evento considerado imposible
+EXTREME_PRICE_HIGH = 0.98          # Precio > 98%: evento considerado seguro
 EXPIRY_WARN_HOURS = 24            # mercados que expiran en < 24h penalizados
 
 
@@ -94,23 +97,40 @@ class SelectionEngine:
     ) -> float:
         """Calcula el score para un mercado individual.
 
-        Componentes (v2.1):
+        Componentes (v2.2):
           - volume_24h_score:  log10 normalizado del volumen de las últimas 24h (peso 70%).
-          - volume_total_score: log10 normalizado del volumen histórico total (peso 10%).
-          - liquidity_score:   log10 normalizado de la liquidez del libro (peso 10%).
+          - volume_total_score: log10 normalizado del volumen histórico total (peso 5%).
+          - liquidity_score:   log10 normalizado de la liquidez del libro (peso 15%).
           - recency_score:     penalización por cercanía a expiración (peso 10%).
 
-        Penalización de spread (multiplicador post-score):
-          Si spread > 15%, el score final se multiplica por SPREAD_PENALTY_MULTIPLIER (0.1).
-          Esto envía efectivamente los mercados zombi al final de la lista.
+        Hard filters (score=0 inmediato, antes de cualquier cálculo):
+          1. Liquidez < MIN_LIQUIDITY_USD ($500) → score=0 (hard limit Gamma API).
+          2. Precio en extremos (< 2% o > 98%) con spread alto → score=0.
+
+        Penalización agresiva de spread (multiplicador post-score):
+          Si spread > 10%, el score final se multiplica por 0.01.
+          Esto hunde los mercados zombi al fondo de 1000+ mercados.
         """
-        # ── Volúmenes ─────────────────────────────────────────────
-        # volume_24h: campo específico de actividad reciente; fallback a 0
+        # ── Datos base ────────────────────────────────────────────
         volume_24h = max(0, snapshot.get("volume_24h", 0) or 0)
-        # volume: volumen histórico total del mercado
         volume_total = max(0, snapshot.get("volume", 0) or 0)
         liquidity = max(0, snapshot.get("liquidity", 0) or 0)
         spread = snapshot.get("spread")
+        price = snapshot.get("price")  # precio mid del mercado (0-1)
+
+        # ── HARD FILTER 1: Liquidez mínima ────────────────────────
+        # Si la liquidez del libro (Gamma API) es inferior a $500,
+        # el mercado es inoperable. Score=0 sin más cálculos.
+        if liquidity < MIN_LIQUIDITY_USD:
+            return 0.0
+
+        # ── HARD FILTER 2: Probabilidad extrema + spread alto ─────
+        # Mercados con precio < 2% o > 98% y spread elevado son
+        # eventos que el mercado da por imposibles/seguros y donde
+        # el market making no tiene sentido.
+        if price is not None and spread is not None and spread > SPREAD_PENALTY_THRESHOLD:
+            if price < EXTREME_PRICE_LOW or price > EXTREME_PRICE_HIGH:
+                return 0.0
 
         # ── Volume 24h: log10 normalizado contra el máximo del batch ──
         vol_24h_score = (
@@ -118,7 +138,7 @@ class SelectionEngine:
             if max_volume_24h > 1 else 0.0
         )
 
-        # ── Volume total: log10 normalizado ───────────────────────
+        # ── Volume total: log10 normalizado (peso mínimo, anti-zombi) ──
         vol_total_score = (
             math.log10(volume_total + 1) / math.log10(max_volume_total + 1)
             if max_volume_total > 1 else 0.0
@@ -149,9 +169,9 @@ class SelectionEngine:
             + recency_score   * self.weights["recency"]
         )
 
-        # ── Penalización de spread (multiplicador post-score) ─────
-        # Spreads > 15% son señal de mercado zombi o ilíquido.
-        # Aplicamos un multiplicador 0.1x para empujarlos al final de la lista.
+        # ── Penalización agresiva de spread (multiplicador post-score) ──
+        # Spreads > 10% son señal de mercado zombi o ilíquido.
+        # Multiplicador 0.01x: hunde el mercado al fondo de la lista de 1000+ mercados.
         if spread is not None and spread > SPREAD_PENALTY_THRESHOLD:
             base_score *= SPREAD_PENALTY_MULTIPLIER
 
@@ -176,11 +196,13 @@ class SelectionEngine:
 
         Notes
         -----
-        Filtros anti-zombi aplicados antes del ranking (v2.1):
-          1. Mercados con ``liquidity`` < MIN_LIQUIDITY_USD ($500) quedan excluidos
-             del Top N independientemente de su score.
-          2. Mercados con ``spread`` > SPREAD_PENALTY_THRESHOLD (15%) reciben un
-             multiplicador 0.1x sobre su score final.
+        Filtros anti-zombi aplicados (v2.2):
+          1. Hard limit de liquidez: ``liquidity`` < $500 → score=0 (se puntúan como 0
+             y nunca entran al Top N, independientemente de volumen histórico).
+          2. Probabilidad extrema: precio <2% o >98% con spread >10% → score=0.
+          3. Penalización agresiva: spread >10% → multiplicador 0.01x sobre score final.
+          4. El filtro post-ranking de ``eligible`` mantiene el hard limit como doble
+             barrera de seguridad.
         """
         if not snapshots:
             return RankingResult(top=[], all_scored=[], enter=[], exit=[])
@@ -208,11 +230,11 @@ class SelectionEngine:
         # Ordenar descendente por score
         scored.sort(key=lambda ms: ms.score, reverse=True)
 
-        # ── Filtro de liquidez real (Gamma API) ───────────────────
-        # Mercados con liquidez < MIN_LIQUIDITY_USD ($500) no pueden entrar al Top N.
-        # Se puntúan igualmente (para diagnóstico en all_scored) pero quedan excluidos.
-        eligible = [ms for ms in scored if ms.liquidity >= MIN_LIQUIDITY_USD]
-        ineligible_ids = {ms.condition_id for ms in scored if ms.liquidity < MIN_LIQUIDITY_USD}
+        # ── Filtro de liquidez real (Gamma API) — doble barrera ───
+        # score=0 ya fue asignado en _compute_score para ilíquidos,
+        # pero mantenemos el filtro explícito como segunda barrera de seguridad.
+        eligible = [ms for ms in scored if ms.liquidity >= MIN_LIQUIDITY_USD and ms.score > 0]
+        ineligible_ids = {ms.condition_id for ms in scored if ms.liquidity < MIN_LIQUIDITY_USD or ms.score == 0}
 
         # Top N: solo mercados elegibles por liquidez
         top = eligible[:self.top_n]

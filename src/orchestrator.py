@@ -276,6 +276,34 @@ class ScoutOrchestrator:
                     len(snapshots), len(ranked.top), int(elapsed_ms),
                 )
 
+                # ── Log detallado del Top 10 tras cada scan ──────────
+                if ranked.top:
+                    logger.info("── TOP %d MERCADOS (score > 0) ──────────────────────────────────────────────────", len(ranked.top))
+                    for i, ms in enumerate(ranked.top[:10], 1):
+                        snap = ms.snapshot
+                        vol24 = snap.get("volume_24h") or 0
+                        vol_tot = snap.get("volume") or 0
+                        liq = snap.get("liquidity") or 0
+                        spread = snap.get("spread")
+                        price = snap.get("price_yes") or snap.get("price")
+                        spread_str = f"{spread*100:.1f}%" if spread is not None else "N/A"
+                        price_str = f"{price:.4f}" if price is not None else "N/A"
+                        logger.info(
+                            "  #%02d [score=%.4f] vol24h=$%-9.0f vol=$%-11.0f liq=$%-8.0f spread=%-7s price=%-7s | %s",
+                            i, ms.score,
+                            vol24, vol_tot, liq,
+                            spread_str, price_str,
+                            ms.question[:70],
+                        )
+                    # Mercados descartados (score=0)
+                    zeroed = [ms for ms in ranked.all_scored if ms.score == 0]
+                    if zeroed:
+                        logger.info(
+                            "  ⛔ %d mercados con score=0 (liq<$500 / spread>10%% extremo / prob extrema)",
+                            len(zeroed),
+                        )
+                    logger.info("─" * 80)
+
                 # Publicar en el bus
                 if self._bus:
                     await self._bus.publish("radar:update", {
@@ -555,11 +583,27 @@ class ScoutOrchestrator:
                     snap = token_to_snap.get(token_id, {})
                     condition_id = snap.get("condition_id", "")
                     question = snap.get("question", "")
+                    # Buscar el MarketScore para obtener el score calculado
+                    ms_match = next((ms for ms in top_snapshots if ms.condition_id == condition_id), None)
+                    score_val = ms_match.score if ms_match else 0.0
+                    vol24 = snap.get("volume_24h") or 0
+                    vol_tot = snap.get("volume") or 0
+                    liq = snap.get("liquidity") or 0
+                    spread = snap.get("spread")
+                    price = snap.get("price_yes") or snap.get("price")
+                    spread_str = f"{spread*100:.1f}%" if spread is not None else "N/A"
+                    price_str  = f"{price:.4f}" if price is not None else "N/A"
                     try:
                         await self.ws_manager.subscribe_book(
                             token_id, condition_id=condition_id, fetch_snapshot=True,
                         )
-                        logger.info("MM subscribed: %s (%s...)", token_id, question[:60])
+                        logger.info(
+                            "WS ⇒ subscribe | score=%.4f vol24h=$%-9.0f vol=$%-11.0f "
+                            "liq=$%-8.0f spread=%-7s price=%-7s | %s",
+                            score_val, vol24, vol_tot, liq,
+                            spread_str, price_str,
+                            question[:80],
+                        )
                     except Exception as e:
                         logger.warning("MM subscribe error %s: %s", token_id, e)
 
