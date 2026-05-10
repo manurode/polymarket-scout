@@ -998,6 +998,20 @@ class ScoutOrchestrator:
                         continue
                     token_id = tokens[0]
 
+                    # ── FIX 1: Control de Inventario ───────────────────────────────────────
+                    # Bloquear si ya hay una posición abierta para este token_id,
+                    # sin importar si es YES o NO. "1 posición por mercado" estricta.
+                    open_positions_for_market = [
+                        p for p in self.paper_trading._positions
+                        if p.closed_at is None and token_id in p.market
+                    ]
+                    if len(open_positions_for_market) >= 1:
+                        logger.debug(
+                            "AutExec INV BLOCK %s: ya hay %d posición(es) abiertas — skip",
+                            token_id[:16], len(open_positions_for_market),
+                        )
+                        continue
+
                     # Verificar que el book L2 tiene datos reales
                     book_snap = self.book_analyzer.get_book(token_id) if self.book_analyzer else None
                     if book_snap is None or book_snap.bid_count == 0 or book_snap.ask_count == 0:

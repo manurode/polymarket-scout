@@ -34,6 +34,20 @@ ADAPTATION_WINDOW = 50      # trades para adaptar parámetros
 MIN_TRADES_FOR_ADAPTATION = 10
 CONFIDENCE_DECAY = 0.95     # decaimiento de confianza histórica
 
+# ── FIX 3: Modo Paper Trading — umbrales hiperactivos ─────────────────────────
+# Activar para observar cómo compiten todas las estrategias direccionales
+# contra market_making en los logs del Bandit. Cambiar a False para live trading.
+PAPER_TRADING_HYPERACTIVE = True
+
+# Umbrales en modo HIPERACTIVO (Paper Trading)
+_PT_MOMENTUM_THRESHOLD = 0.002       # 0.2%  (vs 2% en prod)
+_PT_MEAN_REV_DEVIATION = 0.01        # 1%    (vs 5% en prod)
+_PT_VOLUME_SPIKE_RATIO = 1.1         # 1.1x  (vs 2.5x en prod)
+_PT_MIN_CONFIDENCE     = 0.05        # 5%    (vs 30% en prod)
+_PT_WEIGHT_CUTOFF      = 0.05        # 5%    (vs 15% en prod)
+_PT_SIGNAL_COOLDOWN    = 30          # 30s   (vs 120s en prod)
+
+
 # ── Tipos ──────────────────────────────────────────────────────────────────
 
 class MarketRegime:
@@ -126,11 +140,37 @@ class AdaptiveStrategyEngine:
 
     def _init_thresholds(self) -> None:
         """Inicializa umbrales para cada estrategia."""
-        defaults = {
-            "momentum": AdaptiveThresholds("momentum", momentum_threshold=0.02),
-            "mean_reversion": AdaptiveThresholds("mean_reversion", mean_rev_deviation=0.05),
-            "volume_breakout": AdaptiveThresholds("volume_breakout", volume_spike_ratio=2.5),
-        }
+        if PAPER_TRADING_HYPERACTIVE:
+            # FIX 3: umbrales ultra-bajos para activar todas las estrategias en Paper Trading
+            defaults = {
+                "momentum": AdaptiveThresholds(
+                    "momentum",
+                    momentum_threshold=_PT_MOMENTUM_THRESHOLD,
+                    min_confidence=_PT_MIN_CONFIDENCE,
+                ),
+                "mean_reversion": AdaptiveThresholds(
+                    "mean_reversion",
+                    mean_rev_deviation=_PT_MEAN_REV_DEVIATION,
+                    min_confidence=_PT_MIN_CONFIDENCE,
+                ),
+                "volume_breakout": AdaptiveThresholds(
+                    "volume_breakout",
+                    volume_spike_ratio=_PT_VOLUME_SPIKE_RATIO,
+                    min_confidence=_PT_MIN_CONFIDENCE,
+                ),
+            }
+            logger.info(
+                "AdaptiveEngine: modo HIPERACTIVO activado — "
+                "mom_thr=%.3f  mean_rev_dev=%.3f  vol_spike=%.1fx  min_conf=%.2f",
+                _PT_MOMENTUM_THRESHOLD, _PT_MEAN_REV_DEVIATION,
+                _PT_VOLUME_SPIKE_RATIO, _PT_MIN_CONFIDENCE,
+            )
+        else:
+            defaults = {
+                "momentum": AdaptiveThresholds("momentum", momentum_threshold=0.02),
+                "mean_reversion": AdaptiveThresholds("mean_reversion", mean_rev_deviation=0.05),
+                "volume_breakout": AdaptiveThresholds("volume_breakout", volume_spike_ratio=2.5),
+            }
         
         for name, thresh in defaults.items():
             if name not in self.adaptive_thresholds:
@@ -353,12 +393,16 @@ class AdaptiveStrategyEngine:
     def generate_adaptive_signals(
         self,
         snapshots: list[dict],
-        cooldown_s: float = 120,
+        cooldown_s: float | None = None,
         max_signals: int = 5
     ) -> list[Signal]:
         """
         Genera señales usando el pipeline base pero con filtrado adaptativo.
         """
+        # Cooldown: en modo hiperactivo usar el PT cooldown si no se especifica
+        if cooldown_s is None:
+            cooldown_s = _PT_SIGNAL_COOLDOWN if PAPER_TRADING_HYPERACTIVE else 120
+        
         # Actualizar historial primero
         self.pipeline.update_history(snapshots)
         
@@ -397,6 +441,10 @@ class AdaptiveStrategyEngine:
         
         # Ordenar por peso final y limitar
         all_weighted_signals.sort(key=lambda w: w.final_weight, reverse=True)
+        
+        # Peso mínimo — reducido en modo hiperactivo para dejar pasar más señales
+        weight_cutoff = _PT_WEIGHT_CUTOFF if PAPER_TRADING_HYPERACTIVE else 0.15
+        all_weighted_signals = [w for w in all_weighted_signals if w.final_weight > weight_cutoff]
         
         # Aplicar cooldown
         now = time.time()

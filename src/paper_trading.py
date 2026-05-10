@@ -257,16 +257,54 @@ class PaperTradingEngine:
             # El mercado ofrece vender a un precio ≤ lo que nosotros pagamos.
             # Esto significa que nuestra orden de compra se ejecuta.
             if real_best_ask <= order.bid_price and order.bid_size >= 50:
+                # FIX 2 — Sanity Check: rechazar si el ask virtual ≤ real best bid
+                # (indica spread cruzado por lag de asincronía — cotización tóxica).
+                if order.ask_price <= real_best_bid:
+                    logger.warning(
+                        "CrossEngine SANITY FAIL %s: virtual_ask=%.4f <= real_bb=%.4f "
+                        "— spread cruzado por lag, fill BID rechazado",
+                        order.token_id[:16], order.ask_price, real_best_bid,
+                    )
+                    continue
                 orders_to_fill.append((order, "YES", order.bid_price, order.bid_size))
 
             # ── Fill ASK: real_best_bid >= our_ask_price ─────────────────
             # El mercado quiere comprar a un precio ≥ lo que nosotros pedimos.
             # Nuestra orden de venta se ejecuta → abrimos posición NO.
             elif real_best_bid >= order.ask_price and order.ask_size >= 50:
+                # FIX 2 — Sanity Check: rechazar si el bid virtual ≥ real best ask
+                # (indica que cotizamos por encima del mercado — ejecución tóxica).
+                if order.bid_price >= real_best_ask:
+                    logger.warning(
+                        "CrossEngine SANITY FAIL %s: virtual_bid=%.4f >= real_ba=%.4f "
+                        "— spread cruzado por lag, fill ASK rechazado",
+                        order.token_id[:16], order.bid_price, real_best_ask,
+                    )
+                    continue
                 orders_to_fill.append((order, "NO", order.ask_price, order.ask_size))
 
         # Ejecutar fills
         for order, side, fill_price, fill_size in orders_to_fill:
+            # ── FIX 1: Control de Inventario en Cross Engine ────────────────────────
+            # Antes de ejecutar el fill, verificar que no exista ya una posición
+            # abierta para este token (YES o NO). Esto cubre el lag WS-ejecución.
+            existing_for_token = [
+                p for p in self._positions
+                if p.closed_at is None and order.token_id in p.market
+            ]
+            if existing_for_token:
+                logger.warning(
+                    "CrossEngine INV BLOCK %s: ya existe posición abierta [%s] — fill %s rechazado",
+                    order.token_id[:16],
+                    ", ".join(p.side for p in existing_for_token),
+                    side,
+                )
+                try:
+                    self._open_orders.remove(order)
+                except ValueError:
+                    pass
+                continue
+
             # Eliminar la orden del libro (ya ejecutada)
             try:
                 self._open_orders.remove(order)
