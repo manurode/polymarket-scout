@@ -429,7 +429,10 @@ class AdaptiveStrategyEngine:
                 should_trade, reason = self.should_trade(history, signal)
                 
                 if not should_trade:
-                    logger.debug(f"Señal filtrada: {signal.strategy} en {signal.market[:30]} - {reason}")
+                    logger.debug(
+                        "DEBUG: Strategy [%s] generated signal for [%s] but was ignored due to [%s]",
+                        signal.strategy, signal.market[:45], reason,
+                    )
                     continue
                 
                 # Calcular peso ponderado

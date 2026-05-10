@@ -133,6 +133,7 @@ class PaperTradingEngine:
         self._positions: list[VirtualPosition] = []
         self._position_counter = 0
         self._trade_history: list[dict] = []
+        self._equity_log: list[dict] = []  # [{timestamp, equity}]
         self._lock = asyncio.Lock()
 
         # ── Virtual Limit Order Book (Cross Engine) ────────────────────────
@@ -458,19 +459,25 @@ class PaperTradingEngine:
             # Comisión en POL simulada (gas + protocolo)
             self.wallet.pol_balance = max(0.0, self.wallet.pol_balance - POL_COMMISSION)
 
-            # Registrar en historial
+            # Registrar en historial (ledger enriquecido)
+            commission_usd = POL_COMMISSION * POL_PRICE_USD
+            slippage_usd = round(abs(price - (close_price or pos.mark)) * pos.size, 4) if apply_slippage else 0.0
             trade = {
                 "id": pos.id,
+                "token_id": pos.market,  # market name also serves as reference
                 "strategy": pos.strategy,
                 "market": pos.market,
                 "side": pos.side,
                 "size": pos.size,
                 "entry": pos.entry,
-                "exit": price,
+                "exit": round(price, 6),
                 "slippage_pct": SLIPPAGE_PCT * 100 if apply_slippage else 0.0,
+                "slippage_usd": round(slippage_usd, 4),
+                "commission_usd": round(commission_usd, 4),
                 "pnl": pos.pnl,
                 "pnl_pct": pos.pnl_pct,
                 "reason": reason,
+                "opened_at": pos.opened_at,
                 "closed_at": pos.closed_at,
             }
             self._trade_history.append(trade)
@@ -621,10 +628,42 @@ class PaperTradingEngine:
         return self.wallet.to_dict()
 
     def get_trade_history(self, strategy: str | None = None) -> list[dict]:
-        """Retorna historial de trades cerrados."""
+        """Retorna historial de trades cerrados (orden cronológico)."""
         if strategy:
             return [t for t in self._trade_history if t["strategy"] == strategy]
         return list(self._trade_history)
+
+    def get_closed_trades(self, limit: int = 200) -> list[dict]:
+        """Retorna el Trade Ledger completo, ordenado del más reciente al más antiguo.
+
+        Incluye token_id, estrategia, precios de entrada/salida, P&L, comisiones,
+        slippage y motivo de cierre (SL, TP, Time-Decay, expired, manual).
+        """
+        trades = sorted(
+            self._trade_history,
+            key=lambda t: t.get("closed_at") or 0,
+            reverse=True,
+        )
+        return trades[:limit]
+
+    def record_equity_snapshot(self) -> None:
+        """Guarda una foto del equity total (capital libre + collateral + P&L latente).
+
+        Llamar desde un daemon externo cada N segundos. Los datos se usan
+        para la gráfica de equity en el dashboard.
+        """
+        equity = self.wallet.usdc_total + self.unrealized_pnl
+        self._equity_log.append({
+            "timestamp": time.time(),
+            "equity": round(equity, 2),
+        })
+        # Mantener sólo las últimas 24h (≈288 muestras a 5 min)
+        if len(self._equity_log) > 300:
+            self._equity_log = self._equity_log[-300:]
+
+    def get_equity_history(self) -> list[dict]:
+        """Retorna el historial de equity en orden cronológico."""
+        return list(self._equity_log)
 
     @property
     def open_position_count(self) -> int:

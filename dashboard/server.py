@@ -187,6 +187,35 @@ def _register_routes(app: FastAPI) -> None:
             alloc = _mock_allocation()
         return alloc
 
+    @app.get("/api/portfolio/history")
+    async def portfolio_history(request: Request, limit: int = 200):
+        """Get the closed trade ledger (Trade Ledger).
+
+        Returns closed positions sorted by close date (newest first).
+        Each record includes: token_id, strategy, entry, exit, P&L ($/%),
+        commission, slippage, and close reason (sl, tp, tau, expired, manual).
+        """
+        orch = request.app.state.orchestrator
+        if orch and hasattr(orch, "paper_trading") and orch.paper_trading:
+            trades = orch.paper_trading.get_closed_trades(limit=limit)
+        else:
+            trades = _mock_trade_history()
+        return {"trades": trades, "count": len(trades)}
+
+    @app.get("/api/portfolio/performance")
+    async def portfolio_performance(request: Request):
+        """Get equity curve history for the portfolio dashboard chart.
+
+        Returns a list of {timestamp, equity} objects in chronological order,
+        sampled every 5 minutes. Use this to render the equity curve chart.
+        """
+        orch = request.app.state.orchestrator
+        if orch and hasattr(orch, "paper_trading") and orch.paper_trading:
+            history = orch.paper_trading.get_equity_history()
+        else:
+            history = _mock_equity_history()
+        return {"history": history, "count": len(history)}
+
     # ── Whales ───────────────────────────────────────────────────────────────────────────
 
     @app.get("/api/whales")
@@ -895,6 +924,71 @@ def _mock_wallet() -> dict:
         "ctf_allowance": True,
         "ctf_contract": "0x4D97DCd7C0408F728A009Ff07556F758a0969709",
     }
+
+
+def _mock_trade_history() -> list[dict]:
+    """Mock trade ledger for development without orchestrator."""
+    import time as _t
+    now = _t.time()
+    return [
+        {
+            "id": 5, "token_id": "[MM] Will Trump win in 2028?",
+            "strategy": "market_making", "market": "[MM] Will Trump win in 2028?",
+            "side": "YES", "size": 120.0, "entry": 0.630, "exit": 0.724,
+            "slippage_pct": 1.0, "slippage_usd": 0.12, "commission_usd": 0.0164,
+            "pnl": 11.28, "pnl_pct": 9.4, "reason": "tp",
+            "opened_at": now - 14400, "closed_at": now - 3600,
+        },
+        {
+            "id": 4, "token_id": "[MOM] BTC > $100K by Dec?",
+            "strategy": "momentum_follow", "market": "[MOM] BTC > $100K by Dec?",
+            "side": "NO", "size": 85.0, "entry": 0.440, "exit": 0.396,
+            "slippage_pct": 1.0, "slippage_usd": 0.08, "commission_usd": 0.0164,
+            "pnl": 3.74, "pnl_pct": 4.4, "reason": "tp",
+            "opened_at": now - 25200, "closed_at": now - 7200,
+        },
+        {
+            "id": 3, "token_id": "[SIG] Fed cuts rates Q3?",
+            "strategy": "contrarian", "market": "[SIG] Fed cuts rates Q3?",
+            "side": "YES", "size": 55.0, "entry": 0.710, "exit": 0.639,
+            "slippage_pct": 1.0, "slippage_usd": 0.05, "commission_usd": 0.0164,
+            "pnl": -3.91, "pnl_pct": -7.1, "reason": "sl",
+            "opened_at": now - 36000, "closed_at": now - 18000,
+        },
+        {
+            "id": 2, "token_id": "[MM] S&P 500 ATH Q3?",
+            "strategy": "market_making", "market": "[MM] S&P 500 ATH Q3?",
+            "side": "YES", "size": 60.0, "entry": 0.550, "exit": 0.583,
+            "slippage_pct": 1.0, "slippage_usd": 0.06, "commission_usd": 0.0164,
+            "pnl": 1.98, "pnl_pct": 3.3, "reason": "tp",
+            "opened_at": now - 72000, "closed_at": now - 43200,
+        },
+        {
+            "id": 1, "token_id": "[MOM] Oil > $80/barrel?",
+            "strategy": "momentum_follow", "market": "[MOM] Oil > $80/barrel?",
+            "side": "NO", "size": 40.0, "entry": 0.800, "exit": 0.720,
+            "slippage_pct": 1.0, "slippage_usd": 0.04, "commission_usd": 0.0164,
+            "pnl": -2.42, "pnl_pct": -6.0, "reason": "sl",
+            "opened_at": now - 86400, "closed_at": now - 57600,
+        },
+    ]
+
+
+def _mock_equity_history() -> list[dict]:
+    """Mock equity curve for development without orchestrator."""
+    import time as _t
+    now = _t.time()
+    # Simulate 4 hours of 5-min snapshots with realistic equity drift
+    points = []
+    equity = 10000.0
+    for i in range(48, -1, -1):
+        ts = now - i * 300  # 300s = 5 min
+        # Small random walk
+        import random as _r
+        equity += _r.gauss(0.5, 8.0)  # gentle upward drift
+        equity = max(9500.0, min(10800.0, equity))
+        points.append({"timestamp": ts, "equity": round(equity, 2)})
+    return points
 
 
 def _mock_spoofing() -> list[dict]:

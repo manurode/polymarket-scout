@@ -58,6 +58,7 @@ MM_QUOTE_INTERVAL = 10            # segundos entre cotizaciones de market making
 MM_TOP_MARKETS = 10               # cuántos mercados del Top 50 trackear con MM
 AUTONOMOUS_EXEC_INTERVAL = 15    # segundos entre ciclos del ejecutor autónomo
 L2_SEED_INTERVAL = 90            # segundos entre seedings de L2 desde REST
+EQUITY_LOG_INTERVAL = 300        # segundos entre snapshots de equity (5 min)
 
 # Estrategias que SIEMPRE compiten en el Bandit (mínimo dos brazos)
 BANDIT_PRIMARY_STRATEGIES = ["market_making", "momentum_follow"]
@@ -209,6 +210,7 @@ class ScoutOrchestrator:
             asyncio.create_task(self._market_making_loop()),
             asyncio.create_task(self._l2_seed_loop()),           # ← NUEVO: poblar L2 desde REST
             asyncio.create_task(self._autonomous_execution_loop()),  # ← NUEVO: MM quotes → paper trades
+            asyncio.create_task(self._equity_logger_loop()),     # ← NUEVO: Equity Curve
         ]
 
         # ── 9. Conectar WebSocket CLOB en background ──────────
@@ -446,6 +448,32 @@ class ScoutOrchestrator:
             except Exception as e:
                 logger.error("Error en paper auto-close: %s", e)
             await asyncio.sleep(PAPER_AUTO_CLOSE_INTERVAL)
+
+    async def _equity_logger_loop(self) -> None:
+        """Equity Logger Daemon: guarda una foto del equity total cada EQUITY_LOG_INTERVAL segundos.
+
+        El registro incluye Capital libre + Collateral + P&L latente, para que
+        la curva refleje el valor real de la cuenta en cada momento.
+        """
+        logger.info("Equity Logger daemon iniciado (intervalo: %ds)", EQUITY_LOG_INTERVAL)
+        # Registrar snapshot inicial
+        self.paper_trading.record_equity_snapshot()
+
+        while self._running:
+            try:
+                await asyncio.sleep(EQUITY_LOG_INTERVAL)
+                if self._running:
+                    self.paper_trading.record_equity_snapshot()
+                    history = self.paper_trading.get_equity_history()
+                    last_eq = history[-1]["equity"] if history else 0
+                    logger.debug(
+                        "Equity snapshot: $%.2f | total_snapshots=%d",
+                        last_eq, len(history),
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Error en equity logger: %s", e)
 
     async def _paper_signal_loop(self) -> None:
         """Pipeline de señales adaptativo — complementa al autonomous_execution_loop.

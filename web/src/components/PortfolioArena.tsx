@@ -1,6 +1,21 @@
+import {
+  Chart as ChartJS,
+  CategoryScale,
+  LinearScale,
+  PointElement,
+  LineElement,
+  Tooltip,
+  Filler,
+} from 'chart.js';
+import { Line } from 'react-chartjs-2';
+
 import { usePortfolio } from '../hooks/usePortfolio';
 import { useSystemStatus } from '../hooks/useSystemStatus';
+import { useTradeHistory } from '../hooks/useTradeHistory';
+import { useEquityHistory } from '../hooks/useEquityHistory';
 import type { StrategyState, StrategyRanking } from '../types';
+
+ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Tooltip, Filler);
 
 const STATE_ICONS: Record<StrategyState, string> = {
   active: '●', probation: '◐', frozen: '⊘', retired: '⊗',
@@ -20,14 +35,32 @@ const STATE_LABELS: Record<StrategyState, string> = {
   retired: 'Retired',
 };
 
+const REASON_LABELS: Record<string, { label: string; color: string }> = {
+  tp:      { label: 'TP',      color: 'text-profit' },
+  sl:      { label: 'SL',      color: 'text-loss' },
+  tau:     { label: 'τ-LIQD', color: 'text-warning' },
+  expired: { label: 'EXP',    color: 'text-text-tertiary' },
+  manual:  { label: 'MANU',   color: 'text-info' },
+};
+
 export function PortfolioArena() {
   const { strategies, allocation, loading, error } = usePortfolio(10000);
   const status = useSystemStatus(10000);
+  const { trades, loading: tradesLoading, totalPnl: closedPnl, winRate } = useTradeHistory(15000);
+  const {
+    points: equityPoints,
+    currentEquity,
+    totalPnl: equityPnl,
+    totalPnlPct,
+    maxDrawdown,
+    loading: equityLoading,
+  } = useEquityHistory(30000);
 
   if (loading && strategies.length === 0) {
     return (
       <div className="p-4 space-y-4 animate-pulse">
         <div className="h-6 w-48 bg-bg-tertiary rounded" />
+        <div className="h-32 bg-bg-tertiary rounded" />
         <div className="grid grid-cols-3 gap-4">
           <div className="col-span-2 h-64 bg-bg-tertiary rounded" />
           <div className="h-64 bg-bg-tertiary rounded" />
@@ -50,10 +83,74 @@ export function PortfolioArena() {
   const epochNum = status.portfolio_epoch || 0;
   const hasData = strategies.length > 0;
 
-  // Strategy state counts
   const activeCount = strategies.filter(s => s.state === 'active').length;
   const frozenCount = strategies.filter(s => s.state === 'frozen').length;
   const retiredCount = strategies.filter(s => s.state === 'retired').length;
+
+  // ── Equity Chart data ──────────────────────────────────────────────
+  const chartLabels = equityPoints.map(p => {
+    const d = new Date(p.timestamp * 1000);
+    return `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}`;
+  });
+  const chartValues = equityPoints.map(p => p.equity);
+
+  const pnlPositive = equityPnl >= 0;
+  const chartData = {
+    labels: chartLabels,
+    datasets: [
+      {
+        label: 'Equity ($)',
+        data: chartValues,
+        borderColor: pnlPositive ? '#22c55e' : '#ef4444',
+        backgroundColor: pnlPositive ? 'rgba(34,197,94,0.08)' : 'rgba(239,68,68,0.08)',
+        borderWidth: 1.5,
+        pointRadius: 0,
+        pointHoverRadius: 3,
+        fill: true,
+        tension: 0.3,
+      },
+    ],
+  };
+
+  const chartOptions = {
+    responsive: true,
+    maintainAspectRatio: false,
+    animation: false as const,
+    plugins: {
+      legend: { display: false },
+      tooltip: {
+        callbacks: {
+          label: (ctx: { parsed: { y: number } }) => `$${ctx.parsed.y.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`,
+        },
+        backgroundColor: 'rgba(15,20,30,0.95)',
+        borderColor: 'rgba(255,255,255,0.1)',
+        borderWidth: 1,
+        titleColor: '#a0aec0',
+        bodyColor: '#e2e8f0',
+        padding: 8,
+      },
+    },
+    scales: {
+      x: {
+        ticks: {
+          color: '#4a5568',
+          font: { size: 9, family: 'ui-monospace, monospace' },
+          maxTicksLimit: 8,
+          maxRotation: 0,
+        },
+        grid: { color: 'rgba(255,255,255,0.04)' },
+      },
+      y: {
+        ticks: {
+          color: '#4a5568',
+          font: { size: 9, family: 'ui-monospace, monospace' },
+          callback: (val: string | number) =>
+            `$${Number(val).toLocaleString(undefined, { maximumFractionDigits: 0 })}`,
+        },
+        grid: { color: 'rgba(255,255,255,0.04)' },
+      },
+    },
+  };
 
   return (
     <div className="p-4 space-y-4">
@@ -73,6 +170,49 @@ export function PortfolioArena() {
             <span className="text-[10px] font-mono text-text-tertiary">
               {activeCount}● {frozenCount > 0 ? `${frozenCount}⊘ ` : ''}{retiredCount > 0 ? `${retiredCount}⊗` : ''}
             </span>
+          )}
+        </div>
+      </div>
+
+      {/* ── Equity Curve ───────────────────────────────────────────── */}
+      <div className="bg-bg-secondary border border-bg-hover rounded p-3">
+        <div className="flex items-center justify-between mb-2">
+          <h3 className="text-[10px] text-text-tertiary tracking-wider">EQUITY CURVE</h3>
+          <div className="flex items-center gap-4 text-[10px] font-mono">
+            <span className="text-text-secondary">
+              Now: <span className="text-text-primary font-bold">
+                ${currentEquity.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+              </span>
+            </span>
+            <span className={pnlPositive ? 'text-profit' : 'text-loss'}>
+              {pnlPositive ? '+' : ''}${equityPnl.toFixed(2)} ({pnlPositive ? '+' : ''}{totalPnlPct.toFixed(2)}%)
+            </span>
+            {maxDrawdown > 0 && (
+              <span className="text-loss">
+                DD: -${maxDrawdown.toFixed(2)}
+              </span>
+            )}
+            {equityLoading && (
+              <span className="text-text-tertiary animate-pulse">Loading…</span>
+            )}
+            {equityPoints.length > 0 && (
+              <span className="text-text-tertiary">
+                {equityPoints.length} pts
+              </span>
+            )}
+          </div>
+        </div>
+        <div style={{ height: '120px' }}>
+          {equityPoints.length >= 2 ? (
+            <Line data={chartData} options={chartOptions} />
+          ) : (
+            <div className="h-full flex items-center justify-center text-text-tertiary text-[11px]">
+              {equityLoading
+                ? 'Loading equity data…'
+                : equityPoints.length === 1
+                ? 'Waiting for next snapshot (every 5 min)…'
+                : 'No equity data yet — equity logger running…'}
+            </div>
           )}
         </div>
       </div>
@@ -227,10 +367,100 @@ export function PortfolioArena() {
         </div>
       </div>
 
+      {/* ── Closed Trades Ledger ─────────────────────────────────── */}
+      <div className="bg-bg-secondary border border-bg-hover rounded p-3">
+        <div className="flex items-center justify-between mb-2">
+          <h3 className="text-[10px] text-text-tertiary tracking-wider">
+            CLOSED TRADES — TRADE LEDGER
+          </h3>
+          <div className="flex items-center gap-3 text-[10px] font-mono">
+            {trades.length > 0 && (
+              <>
+                <span className="text-text-secondary">
+                  {trades.length} trades
+                </span>
+                <span className={closedPnl >= 0 ? 'text-profit' : 'text-loss'}>
+                  Net: {closedPnl >= 0 ? '+' : ''}${closedPnl.toFixed(2)}
+                </span>
+                <span className="text-text-secondary">
+                  WR: {(winRate * 100).toFixed(0)}%
+                </span>
+              </>
+            )}
+            {tradesLoading && <span className="text-text-tertiary animate-pulse">Loading…</span>}
+          </div>
+        </div>
+
+        {trades.length > 0 ? (
+          <div className="overflow-x-auto">
+            <table className="w-full text-[10px] font-mono">
+              <thead>
+                <tr className="text-text-tertiary text-[9px] border-b border-bg-hover">
+                  <th className="text-left py-1 pr-2">#</th>
+                  <th className="text-left py-1 pr-2">Market</th>
+                  <th className="text-left py-1 pr-2">Strategy</th>
+                  <th className="text-center py-1 pr-2">Side</th>
+                  <th className="text-right py-1 pr-2">Size</th>
+                  <th className="text-right py-1 pr-2">Entry</th>
+                  <th className="text-right py-1 pr-2">Exit</th>
+                  <th className="text-right py-1 pr-2">P&L $</th>
+                  <th className="text-right py-1 pr-2">P&L %</th>
+                  <th className="text-right py-1 pr-2">Slip$</th>
+                  <th className="text-right py-1 pr-2">Fee$</th>
+                  <th className="text-center py-1 pr-2">Reason</th>
+                  <th className="text-right py-1">Closed</th>
+                </tr>
+              </thead>
+              <tbody>
+                {trades.map(t => {
+                  const pnlColor = t.pnl >= 0 ? 'text-profit' : 'text-loss';
+                  const reasonMeta = REASON_LABELS[t.reason] ?? { label: t.reason.toUpperCase(), color: 'text-text-secondary' };
+                  const closedDate = new Date(t.closed_at * 1000);
+                  const closedStr = `${closedDate.getMonth()+1}/${closedDate.getDate()} ${closedDate.getHours().toString().padStart(2,'0')}:${closedDate.getMinutes().toString().padStart(2,'0')}`;
+                  return (
+                    <tr
+                      key={`${t.id}-${t.closed_at}`}
+                      className="border-b border-bg-hover/30 hover:bg-bg-hover/20 transition-colors"
+                    >
+                      <td className="py-0.5 pr-2 text-text-tertiary">{t.id}</td>
+                      <td className="py-0.5 pr-2 text-text-secondary truncate max-w-[140px]" title={t.market}>
+                        {t.market.replace(/^\[(MM|MOM|SIG)\]\s*/, '').slice(0, 28)}
+                      </td>
+                      <td className="py-0.5 pr-2 text-info">{t.strategy.replace(/_/g,' ').slice(0,12)}</td>
+                      <td className={`py-0.5 pr-2 text-center font-bold ${t.side === 'YES' ? 'text-profit' : 'text-loss'}`}>
+                        {t.side}
+                      </td>
+                      <td className="py-0.5 pr-2 text-right text-text-secondary">${t.size.toFixed(0)}</td>
+                      <td className="py-0.5 pr-2 text-right text-text-secondary">{t.entry.toFixed(3)}</td>
+                      <td className="py-0.5 pr-2 text-right text-text-secondary">{t.exit.toFixed(3)}</td>
+                      <td className={`py-0.5 pr-2 text-right font-bold ${pnlColor}`}>
+                        {t.pnl >= 0 ? '+' : ''}${t.pnl.toFixed(2)}
+                      </td>
+                      <td className={`py-0.5 pr-2 text-right ${pnlColor}`}>
+                        {t.pnl_pct >= 0 ? '+' : ''}{t.pnl_pct.toFixed(1)}%
+                      </td>
+                      <td className="py-0.5 pr-2 text-right text-text-tertiary">${t.slippage_usd.toFixed(3)}</td>
+                      <td className="py-0.5 pr-2 text-right text-text-tertiary">${t.commission_usd.toFixed(3)}</td>
+                      <td className={`py-0.5 pr-2 text-center font-bold ${reasonMeta.color}`}>
+                        {reasonMeta.label}
+                      </td>
+                      <td className="py-0.5 text-right text-text-tertiary">{closedStr}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="text-center py-6 text-text-tertiary text-[11px]">
+            {tradesLoading
+              ? 'Loading trade history…'
+              : 'No closed trades yet — leave the bot running overnight!'}
+          </div>
+        )}
+      </div>
+
       {/* ── Kelly Position Sizing Pipeline ────────────────────── */}
-      {/* NOTE: This section displays the last signal computed by the auto-trader.
-               It is STATIC until the backend exposes a /api/portfolio/last_signal endpoint.
-               Context: paper_signal_loop runs every 30s and generates signals. */}
       <div className="bg-bg-secondary border border-bg-hover rounded p-3">
         <div className="flex items-center justify-between mb-2">
           <h3 className="text-[10px] text-text-tertiary tracking-wider">
@@ -277,7 +507,6 @@ function AllocationBar({
   barClass: string;
   valueClass: string;
 }) {
-  // BUG FIX: Guard division-by-zero
   const pct = total > 0 ? (value / total) * 100 : 0;
   return (
     <div className="mb-2">
