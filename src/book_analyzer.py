@@ -95,11 +95,30 @@ class _BookState:
         return float(self.bids[0, 0])
 
     @property
+    def best_bid_size(self) -> float:
+        """Tamaño en USD del mejor bid (o 0 si no hay bids)."""
+        if self.bid_count == 0:
+            return 0.0
+        return float(self.bids[0, 1])
+
+    @property
     def best_ask(self) -> float:
         """Mejor precio de venta (o 0 si no hay asks)."""
         if self.ask_count == 0:
             return 0.0
         return float(self.asks[0, 0])
+
+    @property
+    def best_ask_size(self) -> float:
+        """Tamaño en USD del mejor ask (o 0 si no hay asks)."""
+        if self.ask_count == 0:
+            return 0.0
+        return float(self.asks[0, 1])
+
+    @property
+    def top_size_total(self) -> float:
+        """Suma del tamaño del mejor bid + mejor ask (USD)."""
+        return self.best_bid_size + self.best_ask_size
 
     @property
     def mid_price(self) -> float:
@@ -316,11 +335,15 @@ class BookAnalyzer:
 
     # ── OBI Calculation ───────────────────────────────────────────
 
-    def get_obi(self, token_id: str, levels: int = 10) -> float:
+    def get_obi(self, token_id: str, levels: int = 10, min_total_size: float = 0.0) -> float:
         """Calcula Order Book Imbalance para los top N niveles.
 
         OBI = (Σ bid_volume - Σ ask_volume) / (Σ bid_volume + Σ ask_volume)
         Rango: [-1, +1]
+
+        Si min_total_size > 0 y la suma del mejor bid + mejor ask es inferior
+        a ese umbral, retorna 0.0 (filtro anti-"calderilla": desbalances con poco
+        dinero en juego no son indicativos de spoofing ni flujo tóxico).
 
         Parameters
         ----------
@@ -328,9 +351,16 @@ class BookAnalyzer:
             Identificador del mercado.
         levels : int
             Niveles a considerar (default 10).
+        min_total_size : float
+            Umbral mínimo de tamaño USD en el top del libro para considerar
+            el OBI válido. Default 0.0 (sin filtro).
         """
         book = self._books.get(token_id)
         if book is None:
+            return 0.0
+
+        # Filtro anti-"calderilla": si hay poco dinero en el mejor nivel, OBI no es fiable
+        if min_total_size > 0 and book.top_size_total < min_total_size:
             return 0.0
 
         n_bids = min(levels, book.bid_count)

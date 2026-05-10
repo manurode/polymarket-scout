@@ -27,7 +27,8 @@ logger = logging.getLogger(__name__)
 # ── Constantes ────────────────────────────────────────────────────
 
 DEFAULT_BASE_MULTIPLIER = 1.0     # constante de calibración
-MAX_OBI_FOR_QUOTING = 0.70        # |OBI| > 0.70 → cancelar órdenes
+MAX_OBI_FOR_QUOTING = 0.95        # |OBI| > 0.95 → cancelar órdenes (solo sesgo absoluto)
+MIN_TOTAL_SIZE_FOR_OBI = 1000.0   # USD mínimos en best bid+ask para considerar OBI válido
 FLASH_CRASH_THRESHOLD = 0.05      # 5% en < 30s
 FLASH_CRASH_WINDOW = 30           # segundos
 REENTRY_DELAY = 30                # segundos para reincorporarse tras pausa
@@ -84,7 +85,8 @@ class MarketMaker:
     base_multiplier : float
         Multiplicador base del quote width.
     max_obi : float
-        Umbral de |OBI| que dispara cancelación de órdenes.
+        Umbral de |OBI| que dispara cancelación de órdenes (default 0.95).
+        Solo se pausa si el libro está absolutamente sesgado hacia un lado.
     """
 
     def __init__(
@@ -293,8 +295,8 @@ class MarketMaker:
             self._pause(token_id, condition_id, REENTRY_DELAY, "book_reconciling", now)
             return False, "book in RECONCILING state"
 
-        # 3. OBI extremo
-        obi = self._books.get_obi(token_id)
+        # 3. OBI extremo (con filtro anti-"calderilla")
+        obi = self._books.get_obi(token_id, min_total_size=MIN_TOTAL_SIZE_FOR_OBI)
         if abs(obi) > self.max_obi:
             self._pause(token_id, condition_id, REENTRY_DELAY, f"extreme_obi={obi:.2f}", now)
             return False, f"extreme OBI: {obi:.2f}"

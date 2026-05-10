@@ -74,7 +74,7 @@ websocket:
 
 market_making:
   base_multiplier: 1.0
-  max_obi: 0.70
+  max_obi: 0.95
   reentry_delay_seconds: 30
 
 time_decay:

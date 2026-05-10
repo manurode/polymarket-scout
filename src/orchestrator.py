@@ -171,10 +171,12 @@ class ScoutOrchestrator:
         )
 
         # ── 4. Market Maker ───────────────────────────────────
+        mm_config = self.config.get("market_making", {})
         self.market_maker = MarketMaker(
             book_analyzer=self.book_analyzer,
             time_decay=self.time_decay,
             spoof_detector=self.spoof_detector,
+            max_obi=mm_config.get("max_obi", 0.95),
         )
 
         # ── 5. Markout Analyzer ───────────────────────────────

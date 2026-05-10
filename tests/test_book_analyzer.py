@@ -213,6 +213,58 @@ def test_obi_respects_levels_param(analyzer):
     assert analyzer.get_obi("t1", levels=2) == 0.0
 
 
+def test_obi_min_total_size_filter_ignores_small_books(analyzer):
+    """Filtro anti-calderilla: si best bid+ask < $1000, OBI = 0.0."""
+    # bid=500, ask=1 → total=501 < 1000
+    analyzer.initialize_book("t1", {
+        "bids": [[0.5, 500.0]],
+        "asks": [[0.6, 1.0]],
+    })
+    # Sin filtro → OBI = (500-1)/(501) ≈ 0.996
+    obi_raw = analyzer.get_obi("t1")
+    assert abs(obi_raw - 0.996) < 0.01
+
+    # Con filtro min_total_size=1000 → OBI = 0.0
+    obi_filtered = analyzer.get_obi("t1", min_total_size=1000.0)
+    assert obi_filtered == 0.0
+
+
+def test_obi_min_total_size_filter_passes_large_books(analyzer):
+    """Filtro anti-calderilla: si best bid+ask >= $1000, OBI se calcula normal."""
+    # bid=2000, ask=100 → total=2100 >= 1000
+    analyzer.initialize_book("t1", {
+        "bids": [[0.5, 2000.0]],
+        "asks": [[0.6, 100.0]],
+    })
+    # Con filtro → OBI = (2000-100)/(2100) = 1900/2100 ≈ 0.905
+    obi = analyzer.get_obi("t1", min_total_size=1000.0)
+    assert abs(obi - 0.905) < 0.01
+    assert obi != 0.0
+
+
+def test_best_bid_ask_size_properties(analyzer):
+    """Las propiedades best_bid_size y best_ask_size funcionan."""
+    analyzer.initialize_book("t1", {
+        "bids": [[0.5, 750.0], [0.4, 300.0]],
+        "asks": [[0.6, 250.0], [0.7, 100.0]],
+    })
+
+    from src.book_analyzer import _BookState
+    book = analyzer._books["t1"]
+    assert book.best_bid_size == 750.0
+    assert book.best_ask_size == 250.0
+    assert book.top_size_total == 1000.0
+
+
+def test_best_bid_ask_size_empty_book(analyzer):
+    """Libro vacío → tamaños 0."""
+    from src.book_analyzer import _BookState
+    book = _BookState(token_id="empty")
+    assert book.best_bid_size == 0.0
+    assert book.best_ask_size == 0.0
+    assert book.top_size_total == 0.0
+
+
 # ── Imbalance Direction ────────────────────────────────────────────
 
 def test_imbalance_direction_bullish(analyzer):

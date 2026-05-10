@@ -121,14 +121,54 @@ def test_should_quote_flash_crash(mm):
 
 
 def test_should_quote_extreme_obi(mm, book_analyzer):
-    """OBI extremo → pausar."""
-    # Crear book con OBI muy desbalanceado
+    """OBI extremo (>0.95) con tamaño adecuado → pausar."""
+    # Crear book con OBI muy desbalanceado (999/1001 ≈ 0.998)
     book_analyzer.initialize_book("token_extreme", {
         "bids": [[0.5, 1000.0]],
         "asks": [[0.6, 1.0]],
     })
     ok, reason = mm.should_quote("token_extreme")
     assert ok is False
+    assert "obi" in reason.lower()
+
+
+def test_should_quote_moderate_obi_allowed(mm, book_analyzer):
+    """OBI 0.80 con buen tamaño → NO pausar (antes se pausaba con 0.70)."""
+    # bid=900, ask=100 → OBI = 800/1000 = 0.80. Size total = 1000 → justo en el límite
+    book_analyzer.initialize_book("token_moderate", {
+        "bids": [[0.5, 900.0]],
+        "asks": [[0.6, 100.0]],
+    })
+    ok, reason = mm.should_quote("token_moderate")
+    assert ok is True, f"OBI 0.80 NO debería pausar. Reason: {reason}"
+
+
+def test_should_quote_small_size_ignored(mm, book_analyzer):
+    """OBI > 0.95 pero con calderilla (< $1000 total) → NO pausar."""
+    # bid=500, ask=1 → OBI = 499/501 ≈ 0.996, pero total size = 501 < 1000
+    # → get_obi retorna 0.0 por filtro anti-calderilla
+    book_analyzer.initialize_book("token_small", {
+        "bids": [[0.5, 500.0]],
+        "asks": [[0.6, 1.0]],
+    })
+    ok, reason = mm.should_quote("token_small")
+    assert ok is True, (
+        f"OBI con calderilla (<$1000 total) NO debería pausar. "
+        f"Reason: {reason}"
+    )
+
+
+def test_should_quote_large_imbalance_pauses(mm, book_analyzer):
+    """OBI > 0.95 con tamaño grande (>$1000) → SÍ pausar."""
+    # bid=5000, ask=5 → OBI = 4995/5005 ≈ 0.998, total size = 5005 > 1000
+    book_analyzer.initialize_book("token_large", {
+        "bids": [[0.5, 5000.0]],
+        "asks": [[0.6, 5.0]],
+    })
+    ok, reason = mm.should_quote("token_large")
+    assert ok is False, (
+        f"OBI 0.998 con $5005 size SÍ debería pausar. Reason: {reason}"
+    )
     assert "obi" in reason.lower()
 
 
