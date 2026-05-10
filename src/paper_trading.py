@@ -77,6 +77,7 @@ class VirtualPosition:
     side: str           # "YES" | "NO"
     size: float         # USD invertidos
     entry: float        # Precio de entrada
+    token_id: str = ""  # CLOB token ID para inventory lock (cross_and_fill)
     mark: float = 0.0   # Precio mark-to-market
     pnl: float = 0.0
     pnl_pct: float = 0.0
@@ -140,7 +141,10 @@ class PaperTradingEngine:
         self._lock = asyncio.Lock()
 
         # ── Virtual Limit Order Book (Cross Engine) ────────────────────────
-        self._open_orders: list[VirtualLimitOrder] = []
+        # _pending_quotes: dict token_id → VirtualLimitOrder.
+        # SOLO 1 orden activa por token. El MM sobrescribe en cada ciclo.
+        # El Cross Engine evalúa estas quotes cuando el CLOB real las cruza.
+        self._pending_quotes: dict[str, VirtualLimitOrder] = {}
         self._order_counter = 0
 
     # ── Cross Engine: Virtual Limit Orders ─────────────────────────────────────────
@@ -155,10 +159,11 @@ class PaperTradingEngine:
         ask_size: float,
         strategy: str = "market_making",
     ) -> VirtualLimitOrder:
-        """Registra un quote de Market Making como orden límite virtual activa.
+        """Registra un quote de Market Making como orden límite virtual.
 
-        El Cross Engine evaluará estas órdenes en cada `cross_and_fill()` para
-        determinar si el precio real del mercado las cruza y ejecutarlas.
+        ⚠️  SOLO 1 orden activa por token. Cada nuevo quote SOBRESCRIBE
+        el anterior en _pending_quotes[token_id]. El Cross Engine evalúa
+        estas órdenes en cross_and_fill() cuando el CLOB real las cruza.
 
         Parameters
         ----------
@@ -178,21 +183,6 @@ class PaperTradingEngine:
         VirtualLimitOrder
             La orden registrada.
         """
-        now = time.time()
-
-        # Cancelar órdenes antiguas (TTL expirado) para este token
-        self._open_orders = [
-            o for o in self._open_orders
-            if not (o.token_id == token_id and (now - o.created_at) > ORDER_TTL_SECONDS)
-        ]
-
-        # Limitar órdenes activas por token
-        token_orders = [o for o in self._open_orders if o.token_id == token_id]
-        if len(token_orders) >= MAX_OPEN_ORDERS_PER_TOKEN:
-            # Eliminar la más antigua
-            oldest = min(token_orders, key=lambda o: o.created_at)
-            self._open_orders.remove(oldest)
-
         self._order_counter += 1
         order = VirtualLimitOrder(
             id=self._order_counter,
@@ -204,9 +194,10 @@ class PaperTradingEngine:
             bid_size=bid_size,
             ask_size=ask_size,
         )
-        self._open_orders.append(order)
+        # SOBRESCRIBIR: solo 1 orden viva por mercado en el tablero
+        self._pending_quotes[token_id] = order
         logger.debug(
-            "CrossEngine: orden límite #%d registrada | %s | bid=%.4f ask=%.4f",
+            "CrossEngine: orden límite #%d registrada (sobrescrita) | %s | bid=%.4f ask=%.4f",
             order.id, token_id[:16], bid_price, ask_price,
         )
         return order
@@ -217,15 +208,17 @@ class PaperTradingEngine:
         real_best_bid: float,
         real_best_ask: float,
     ) -> list[VirtualPosition]:
-        """Cruza el precio real del mercado contra las órdenes límite virtuales.
+        """Cruza el precio real del mercado contra la orden límite virtual en _pending_quotes.
+
+        ⚠️  Evalúa ÚNICAMENTE la quote almacenada en _pending_quotes[token_id].
+        SOLO 1 orden por mercado. El MM sobrescribe en cada ciclo.
+
+        Inventory Lock: si ya existe una posición abierta para este token_id,
+        borra la quote de _pending_quotes y rechaza el fill.
 
         Lógica de cruce (market-making pasivo):
-        - Si el Best Ask real BAJA hasta cruzar nuestro Virtual Bid → Fill BID:
-          Alguien en el mercado está dispuesto a vender más barato que nuestro bid.
-          Simulamos que compramos YES → posición LONG YES.
-        - Si el Best Bid real SUBE hasta cruzar nuestro Virtual Ask → Fill ASK:
-          Alguien en el mercado paga más que nuestro ask.
-          Simulamos que vendemos NO → posición SHORT (LONG NO).
+        - Si el Best Ask real BAJA hasta cruzar nuestro Virtual Bid → Fill BID
+        - Si el Best Bid real SUBE hasta cruzar nuestro Virtual Ask → Fill ASK
 
         Parameters
         ----------
@@ -245,10 +238,7 @@ class PaperTradingEngine:
         if real_best_bid <= 0 or real_best_ask <= 0:
             return filled_positions
 
-        # ── FIX 2: Rechazo por spread ilíquido (> 5%) ─────────────────────────────
-        # Si el spread real del CLOB supera el 5%, el MTM caerá inmediatamente al
-        # abrir la posición, disparando el Stop-Loss de forma artificial.
-        # El Cross Engine NUNCA debe ejecutar fills en mercados con spreads así.
+        # ── Rechazo por spread ilíquido (> 5%) ─────────────────────────────
         MAX_FILL_SPREAD = 0.05  # 5%
         real_spread = real_best_ask - real_best_bid
         if real_spread > MAX_FILL_SPREAD:
@@ -258,75 +248,63 @@ class PaperTradingEngine:
             )
             return filled_positions
 
+        # ── INVENTORY LOCK: verificar que NO exista posición abierta para este token ──
+        open_positions = [p for p in self._positions if p.closed_at is None]
+        existing_positions = [p for p in open_positions if p.token_id == token_id]
+        if len(existing_positions) >= 1:
+            # Si ya hay posición → borrar la quote pendiente y rechazar
+            removed = self._pending_quotes.pop(token_id, None)
+            if removed:
+                logger.warning(
+                    "CrossEngine INV BLOCK %s: ya existe posición abierta [%s] — quote #%d eliminada, fill rechazado",
+                    token_id[:16],
+                    ", ".join(p.side for p in existing_positions),
+                    removed.id,
+                )
+            return filled_positions
+
+        # ── Recuperar la ÚNICA quote pendiente para este token ────────────
         now = time.time()
+        order = self._pending_quotes.get(token_id)
+        if order is None:
+            return filled_positions
+
+        # TTL check
+        if (now - order.created_at) > ORDER_TTL_SECONDS:
+            self._pending_quotes.pop(token_id, None)
+            logger.debug("CrossEngine TTL expired %s: quote #%d eliminada", token_id[:16], order.id)
+            return filled_positions
+
         orders_to_fill: list[tuple[VirtualLimitOrder, str, float, float]] = []
 
-        # Identificar órdenes a ejecutar (sin lock para la lectura)
-        for order in list(self._open_orders):
-            if order.token_id != token_id:
-                continue
-
-            # TTL check
-            if (now - order.created_at) > ORDER_TTL_SECONDS:
-                continue
-
-            # ── Fill BID: real_best_ask <= our_bid_price ─────────────────
-            # El mercado ofrece vender a un precio ≤ lo que nosotros pagamos.
-            # Esto significa que nuestra orden de compra se ejecuta.
-            if real_best_ask <= order.bid_price and order.bid_size >= 50:
-                # FIX 2 — Sanity Check: rechazar si el ask virtual ≤ real best bid
-                # (indica spread cruzado por lag de asincronía — cotización tóxica).
-                if order.ask_price <= real_best_bid:
-                    logger.warning(
-                        "CrossEngine SANITY FAIL %s: virtual_ask=%.4f <= real_bb=%.4f "
-                        "— spread cruzado por lag, fill BID rechazado",
-                        order.token_id[:16], order.ask_price, real_best_bid,
-                    )
-                    continue
+        # ── Fill BID: real_best_ask <= our_bid_price ─────────────────
+        if real_best_ask <= order.bid_price and order.bid_size >= 50:
+            # Sanity Check: rechazar si el ask virtual ≤ real best bid (spread cruzado por lag)
+            if order.ask_price <= real_best_bid:
+                logger.warning(
+                    "CrossEngine SANITY FAIL %s: virtual_ask=%.4f <= real_bb=%.4f "
+                    "— spread cruzado por lag, fill BID rechazado",
+                    order.token_id[:16], order.ask_price, real_best_bid,
+                )
+            else:
                 orders_to_fill.append((order, "YES", order.bid_price, order.bid_size))
 
-            # ── Fill ASK: real_best_bid >= our_ask_price ─────────────────
-            # El mercado quiere comprar a un precio ≥ lo que nosotros pedimos.
-            # Nuestra orden de venta se ejecuta → abrimos posición NO.
-            elif real_best_bid >= order.ask_price and order.ask_size >= 50:
-                # FIX 2 — Sanity Check: rechazar si el bid virtual ≥ real best ask
-                # (indica que cotizamos por encima del mercado — ejecución tóxica).
-                if order.bid_price >= real_best_ask:
-                    logger.warning(
-                        "CrossEngine SANITY FAIL %s: virtual_bid=%.4f >= real_ba=%.4f "
-                        "— spread cruzado por lag, fill ASK rechazado",
-                        order.token_id[:16], order.bid_price, real_best_ask,
-                    )
-                    continue
+        # ── Fill ASK: real_best_bid >= our_ask_price ─────────────────
+        elif real_best_bid >= order.ask_price and order.ask_size >= 50:
+            # Sanity Check: rechazar si el bid virtual ≥ real best ask
+            if order.bid_price >= real_best_ask:
+                logger.warning(
+                    "CrossEngine SANITY FAIL %s: virtual_bid=%.4f >= real_ba=%.4f "
+                    "— spread cruzado por lag, fill ASK rechazado",
+                    order.token_id[:16], order.bid_price, real_best_ask,
+                )
+            else:
                 orders_to_fill.append((order, "NO", order.ask_price, order.ask_size))
 
-        # Ejecutar fills
+        # ── Ejecutar fills ────────────────────────────────────────────────
         for order, side, fill_price, fill_size in orders_to_fill:
-            # ── FIX 1: Control de Inventario en Cross Engine ────────────────────────
-            # Antes de ejecutar el fill, verificar que no exista ya una posición
-            # abierta para este token (YES o NO). Esto cubre el lag WS-ejecución.
-            existing_for_token = [
-                p for p in self._positions
-                if p.closed_at is None and order.token_id in p.market
-            ]
-            if existing_for_token:
-                logger.warning(
-                    "CrossEngine INV BLOCK %s: ya existe posición abierta [%s] — fill %s rechazado",
-                    order.token_id[:16],
-                    ", ".join(p.side for p in existing_for_token),
-                    side,
-                )
-                try:
-                    self._open_orders.remove(order)
-                except ValueError:
-                    pass
-                continue
-
-            # Eliminar la orden del libro (ya ejecutada)
-            try:
-                self._open_orders.remove(order)
-            except ValueError:
-                continue  # ya fue eliminada por otro fill concurrente
+            # Eliminar la quote de _pending_quotes (ejecutada)
+            self._pending_quotes.pop(order.token_id, None)
 
             size = min(fill_size, self.wallet.usdc_free)
             if size < 50:
@@ -339,6 +317,7 @@ class PaperTradingEngine:
                 side=side,
                 size=size,
                 entry=fill_price,
+                token_id=order.token_id,
                 tau_pct=random.uniform(10, 55),
                 toxicity=random.uniform(0.03, 0.20),
             )
@@ -370,7 +349,7 @@ class PaperTradingEngine:
                 "ask_size": round(o.ask_size, 2),
                 "age_s": round(now - o.created_at, 1),
             }
-            for o in self._open_orders
+            for o in self._pending_quotes.values()
             if (now - o.created_at) <= ORDER_TTL_SECONDS
         ]
 
@@ -383,6 +362,7 @@ class PaperTradingEngine:
         side: str,
         size: float,
         entry: float,
+        token_id: str = "",
         tau_pct: float = 0.0,
         toxicity: float = 0.0,
     ) -> VirtualPosition | None:
@@ -406,6 +386,7 @@ class PaperTradingEngine:
                 side=side,
                 size=size,
                 entry=entry,
+                token_id=token_id,
                 mark=entry,
                 tau_pct=tau_pct,
                 toxicity=toxicity,
@@ -784,3 +765,43 @@ class PaperTradingEngine:
     @property
     def unrealized_pnl(self) -> float:
         return sum(p.pnl for p in self._positions if p.closed_at is None)
+
+    # ── Nuclear Reset ───────────────────────────────────────────────────
+
+    def reset_all_positions(self) -> dict:
+        """Resetea TODAS las posiciones, historial, equity log y pending quotes.
+
+        Usar tras detectar contaminación por trades falsos o bugs de inventario.
+        La billetera vuelve a su estado inicial (USDC + POL).
+
+        Returns
+        -------
+        dict
+            Resumen de lo eliminado: {positions_cleared, trades_cleared,
+            equity_snapshots_cleared, pending_quotes_cleared}
+        """
+        result = {
+            "positions_cleared": len(self._positions),
+            "trades_cleared": len(self._trade_history),
+            "equity_snapshots_cleared": len(self._equity_log),
+            "pending_quotes_cleared": len(self._pending_quotes),
+        }
+        self._positions.clear()
+        self._trade_history.clear()
+        self._equity_log.clear()
+        self._pending_quotes.clear()
+        self._position_counter = 0
+        self._order_counter = 0
+        # Resetear billetera a valores iniciales
+        self.wallet.usdc_free = DEFAULT_INITIAL_USDC
+        self.wallet.usdc_collateral = 0.0
+        self.wallet.pol_balance = DEFAULT_INITIAL_POL
+        logger.warning(
+            "🔴 PAPER TRADING NUCLEAR RESET: %d posiciones, %d trades, "
+            "%d equity snapshots, %d pending quotes eliminados. "
+            "Billetera resetada a $%.0f USDC + %.0f POL.",
+            result["positions_cleared"], result["trades_cleared"],
+            result["equity_snapshots_cleared"], result["pending_quotes_cleared"],
+            DEFAULT_INITIAL_USDC, DEFAULT_INITIAL_POL,
+        )
+        return result
