@@ -210,6 +210,9 @@ class BookAnalyzer:
             Identificador del mercado.
         snapshot : dict
             Snapshot REST del CLOB con bids/asks completos.
+            El CLOB devuelve entries como {"price": "0.55", "size": "150.0"}
+            (strings) sin orden garantizado — esta función los ordena
+            correctamente: bids DESC, asks ASC.
         """
         book = self._get_or_create_book(token_id)
         now = time.monotonic()
@@ -217,8 +220,8 @@ class BookAnalyzer:
         raw_bids = snapshot.get("bids", [])
         raw_asks = snapshot.get("asks", [])
 
-        book.bid_count = self._replace_levels(book.bids, raw_bids)
-        book.ask_count = self._replace_levels(book.asks, raw_asks)
+        book.bid_count = self._replace_levels(book.bids, raw_bids, sort_desc=True)
+        book.ask_count = self._replace_levels(book.asks, raw_asks, sort_desc=False)
 
         seq = snapshot.get("seq_num")
         if seq is not None:
@@ -229,16 +232,47 @@ class BookAnalyzer:
 
     # ── Level Management ──────────────────────────────────────────
 
-    def _replace_levels(self, arr: np.ndarray, levels: list) -> int:
-        """Reemplaza todos los niveles del array (ordenado)."""
-        count = min(len(levels), self.max_levels)
-        for i, level in enumerate(levels[:count]):
-            if isinstance(level, (list, tuple)):
-                arr[i, 0] = float(level[0])
-                arr[i, 1] = float(level[1])
-            elif isinstance(level, dict):
-                arr[i, 0] = float(level.get("price", level.get("p", 0)))
-                arr[i, 1] = float(level.get("size", level.get("s", 0)))
+    def _replace_levels(self, arr: np.ndarray, levels: list, sort_desc: bool | None = None) -> int:
+        """Reemplaza todos los niveles del array.
+
+        Parameters
+        ----------
+        arr : np.ndarray
+            Array pre-alocado de shape (max_levels, 2).
+        levels : list
+            Niveles raw del CLOB. Cada entry puede ser:
+            - list/tuple: [price, size]
+            - dict: {"price": "0.55", "size": "150.0"}  ← formato REST CLOB
+        sort_desc : bool | None
+            True  → ordenar por precio DESC (bids: mejor primero).
+            False → ordenar por precio ASC  (asks: mejor primero).
+            None  → respetar el orden recibido (deltas WS ya vienen ordenados).
+        """
+        parsed: list[tuple[float, float]] = []
+        for level in levels:
+            try:
+                if isinstance(level, (list, tuple)) and len(level) >= 2:
+                    price = float(level[0])
+                    size  = float(level[1])
+                elif isinstance(level, dict):
+                    price = float(level.get("price", level.get("p", 0)))
+                    size  = float(level.get("size",  level.get("s",  0)))
+                else:
+                    continue
+                if price > 0:  # ignorar entradas de precio cero
+                    parsed.append((price, size))
+            except (TypeError, ValueError):
+                continue
+
+        if sort_desc is True:
+            parsed.sort(key=lambda x: x[0], reverse=True)   # bids: mejor (más alto) primero
+        elif sort_desc is False:
+            parsed.sort(key=lambda x: x[0], reverse=False)  # asks: mejor (más bajo) primero
+
+        count = min(len(parsed), self.max_levels)
+        for i, (price, size) in enumerate(parsed[:count]):
+            arr[i, 0] = price
+            arr[i, 1] = size
         # Rellenar resto con cero
         if count < self.max_levels:
             arr[count:, :] = 0.0

@@ -834,10 +834,10 @@ class ScoutOrchestrator:
 
                         # Calcular Micro-Price: media ponderada por tamaño de bid/ask
                         if book_snap.bid_count > 0 and book_snap.ask_count > 0:
-                            bb = book_snap.bids[0, 0]
-                            bb_sz = book_snap.bids[0, 1]
-                            ba = book_snap.asks[0, 0]
-                            ba_sz = book_snap.asks[0, 1]
+                            bb = float(book_snap.bids[0, 0])
+                            bb_sz = float(book_snap.bids[0, 1])
+                            ba = float(book_snap.asks[0, 0])
+                            ba_sz = float(book_snap.asks[0, 1])
                             total_sz = bb_sz + ba_sz
                             if total_sz > 0:
                                 micro_price = (bb * ba_sz + ba * bb_sz) / total_sz
@@ -852,6 +852,21 @@ class ScoutOrchestrator:
                                 book_snap.bid_count, book_snap.ask_count,
                                 question[:50],
                             )
+
+                            # ── FALLO 2 FIX: propagar spread real al snapshot del radar ──
+                            # El SelectionEngine lee spread de _last_radar_snapshots.
+                            # Si no lo actualizamos aquí, el Radar seguirá viendo spread=None
+                            # y mostrará spread=N/A hasta el siguiente ciclo Gamma completo.
+                            order_count_clob = book_snap.bid_count + book_snap.ask_count
+                            for radar_snap in self._last_radar_snapshots:
+                                ct = radar_snap.get("clobTokenIds", [])
+                                if isinstance(ct, list) and len(ct) > 0 and ct[0] == token_id:
+                                    radar_snap["spread"] = spread_val
+                                    radar_snap["order_count"] = max(
+                                        radar_snap.get("order_count") or 0,
+                                        order_count_clob,
+                                    )
+                                    break
                         else:
                             logger.debug(
                                 "L2 Seed: %s solo con %d bids, %d asks",
