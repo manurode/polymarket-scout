@@ -55,7 +55,7 @@ PAPER_MTM_INTERVAL = 5            # segundos entre mark-to-market
 PAPER_AUTO_CLOSE_INTERVAL = 10    # segundos entre evaluaciones de auto-close
 PAPER_SIGNAL_INTERVAL = 30        # segundos entre señales de trading (demo)
 MM_QUOTE_INTERVAL = 10            # segundos entre cotizaciones de market making
-MM_TOP_MARKETS = 10               # cuántos mercados del Top 50 trackear con MM
+MM_TOP_MARKETS = 10               # cuántos mercados del Top MM trackear (legacy, usa SelectionEngine)
 AUTONOMOUS_EXEC_INTERVAL = 15    # segundos entre ciclos del ejecutor autónomo
 L2_SEED_INTERVAL = 90            # segundos entre seedings de L2 desde REST
 EQUITY_LOG_INTERVAL = 300        # segundos entre snapshots de equity (5 min)
@@ -87,7 +87,8 @@ class ScoutOrchestrator:
         self.scanner: Optional[AsyncPolymarketScanner] = None
         self.rate_limiter = RateLimiter()
         self.selection_engine = SelectionEngine(
-            top_n=config.get("selection", {}).get("top_n", 50),
+            top_n_mm=config.get("selection", {}).get("top_n_mm", 10),
+            top_n_directional=config.get("selection", {}).get("top_n_directional", 10),
         )
 
         # ── Phase 2: Real-Time Data ───────────────────────────
@@ -142,6 +143,8 @@ class ScoutOrchestrator:
         self._timings: dict[str, float] = {}
         self._market_prices: dict[str, float] = {}  # market_name → price
         self._last_radar_snapshots: list[dict] = []
+        self._last_mm_markets: list = []          # MarketScore list for MM
+        self._last_directional_markets: list = []  # MarketScore list for Directional
         self._last_l2_seed_time: float = 0.0  # timestamp del último seeding REST de L2
 
         # ── Market Making State ───────────────────────────────────────────────────
@@ -283,11 +286,16 @@ class ScoutOrchestrator:
                     min_volume=1000,
                 )
 
-                # Ranking Top 50
+                # Ranking Dual (MM + Direccional)
                 ranked = self.selection_engine.rank(snapshots)
 
                 elapsed_ms = (time.monotonic() - t0) * 1000
                 self._last_radar_elapsed_ms = elapsed_ms
+
+                # ── Guardar rankings para daemons ──
+                self._last_radar_snapshots = snapshots
+                self._last_mm_markets = ranked.mm_top
+                self._last_directional_markets = ranked.directional_top
 
                 # ── Guardar precios reales para mark-to-market ──
                 for snap in snapshots:
@@ -296,67 +304,85 @@ class ScoutOrchestrator:
                     if name and price is not None:
                         self._market_prices[name.lower()] = float(price)
 
-                # ── Guardar snapshots para el signal pipeline ──
-                self._last_radar_snapshots = snapshots
-
                 # ── Guardar historial persistente de precios ──
                 self.price_history.save_snapshots(snapshots)
 
+                # ── Log radar en consola ──
                 logger.info(
-                    "Radar: %d mercados escaneados, Top %d ranked (%dms)",
-                    len(snapshots), len(ranked.top), int(elapsed_ms),
+                    "Radar: %d mercados | MM=%d Direccional=%d (%dms)",
+                    len(snapshots),
+                    len(ranked.mm_top),
+                    len(ranked.directional_top),
+                    int(elapsed_ms),
                 )
-
-                # ── Log detallado del Top 10 tras cada scan ──────────
-                if ranked.top:
-                    logger.info("── TOP %d MERCADOS (score > 0) ──────────────────────────────────────────────────", len(ranked.top))
-                    for i, ms in enumerate(ranked.top[:10], 1):
+                # Top MM
+                if ranked.mm_top:
+                    logger.info("── TOP MM (%d) ────────────────────────────────────────────────────────────",
+                                len(ranked.mm_top))
+                    for i, ms in enumerate(ranked.mm_top[:10], 1):
                         snap = ms.snapshot
                         vol24 = snap.get("volume_24h") or 0
-                        vol_tot = snap.get("volume") or 0
                         liq = snap.get("liquidity") or 0
-                        spread = snap.get("spread")
                         price = snap.get("price_yes") or snap.get("price")
-                        spread_str = f"{spread*100:.1f}%" if spread is not None else "N/A"
+                        sports_flag = "⚽" if ms.is_sports else "  "
                         price_str = f"{price:.4f}" if price is not None else "N/A"
                         logger.info(
-                            "  #%02d [score=%.4f] vol24h=$%-9.0f vol=$%-11.0f liq=$%-8.0f spread=%-7s price=%-7s | %s",
-                            i, ms.score,
-                            vol24, vol_tot, liq,
-                            spread_str, price_str,
-                            ms.question[:70],
+                            "  MM #%02d [score=%.4f] vol24h=$%-7.0f liq=$%-7.0f price=%-7s %s | %s",
+                            i, ms.score, vol24, liq, price_str, sports_flag,
+                            ms.question[:65],
                         )
-                    # Mercados descartados (score=0)
-                    zeroed = [ms for ms in ranked.all_scored if ms.score == 0]
-                    if zeroed:
+                    logger.info("─" * 75)
+                # Top Direccional
+                if ranked.directional_top:
+                    logger.info("── TOP DIRECCIONAL (%d) ─────────────────────────────────────────────────────",
+                                len(ranked.directional_top))
+                    for i, ms in enumerate(ranked.directional_top[:10], 1):
+                        snap = ms.snapshot
+                        vol24 = snap.get("volume_24h") or 0
+                        price = snap.get("price_yes") or snap.get("price")
+                        hrs = ms.hours_to_expiry
+                        hrs_str = f"{hrs:.0f}h" if hrs is not None else "N/A"
+                        price_str = f"{price:.4f}" if price is not None else "N/A"
                         logger.info(
-                            "  ⛔ %d mercados con score=0 (liq<$500 / spread>10%% extremo / prob extrema)",
-                            len(zeroed),
+                            "  DIR #%02d [score=%.4f] vol24h=$%-7.0f price=%-7s expiry=%-6s | %s",
+                            i, ms.score, vol24, price_str, hrs_str,
+                            ms.question[:65],
                         )
-                    logger.info("─" * 80)
+                    logger.info("─" * 75)
 
                 # Publicar en el bus
                 if self._bus:
                     await self._bus.publish("radar:update", {
                         "timestamp": time.time(),
                         "market_count": len(snapshots),
-                        "top50": [ms.condition_id for ms in ranked.top],
-                        "enter": ranked.enter,
-                        "exit": ranked.exit,
+                        "mm_top": [ms.condition_id for ms in ranked.mm_top],
+                        "directional_top": [ms.condition_id for ms in ranked.directional_top],
+                        "mm_enter": ranked.mm_enter,
+                        "mm_exit": ranked.mm_exit,
+                        "dir_enter": ranked.directional_enter,
+                        "dir_exit": ranked.directional_exit,
                     })
 
-                # Notificar entradas/salidas del Top 50
-                for cid in ranked.enter:
+                # Notificar entradas/salidas
+                for cid in ranked.mm_enter:
                     if self._bus:
-                        await self._bus.publish("market:enter_top50", {
-                            "condition_id": cid,
-                            "timestamp": time.time(),
+                        await self._bus.publish("market:enter_mm", {
+                            "condition_id": cid, "timestamp": time.time(),
                         })
-                for cid in ranked.exit:
+                for cid in ranked.mm_exit:
                     if self._bus:
-                        await self._bus.publish("market:exit_top50", {
-                            "condition_id": cid,
-                            "timestamp": time.time(),
+                        await self._bus.publish("market:exit_mm", {
+                            "condition_id": cid, "timestamp": time.time(),
+                        })
+                for cid in ranked.directional_enter:
+                    if self._bus:
+                        await self._bus.publish("market:enter_dir", {
+                            "condition_id": cid, "timestamp": time.time(),
+                        })
+                for cid in ranked.directional_exit:
+                    if self._bus:
+                        await self._bus.publish("market:exit_dir", {
+                            "condition_id": cid, "timestamp": time.time(),
                         })
 
             except asyncio.CancelledError:
@@ -599,8 +625,8 @@ class ScoutOrchestrator:
         6. Imprime quote en INFO si es seguro cotizar
         """
         logger.info(
-            "Market Making daemon iniciado (intervalo: %ds, top: %d mercados, creds: %s)",
-            MM_QUOTE_INTERVAL, MM_TOP_MARKETS,
+            "Market Making daemon iniciado (intervalo: %ds, top: %d mercados MM, creds: %s)",
+            MM_QUOTE_INTERVAL, self.selection_engine.top_n_mm,
             "✅" if self.ws_manager._clob_authed else "❌ sin API keys",
         )
 
@@ -611,14 +637,11 @@ class ScoutOrchestrator:
                     await asyncio.sleep(2)
                     continue
 
-                # ── Obtener Top N mercados del radar ────────────
-                snapshots = getattr(self, '_last_radar_snapshots', [])
-                if not snapshots:
+                # ── Obtener Top N mercados MM del radar ──────
+                top_snapshots = self._last_mm_markets  # MarketScore list from SelectionEngine
+                if not top_snapshots:
                     await asyncio.sleep(5)
                     continue
-
-                ranked = self.selection_engine.rank(snapshots)
-                top_snapshots = ranked.top[:MM_TOP_MARKETS]
 
                 wanted_tokens: set[str] = set()
                 token_to_snap: dict[str, dict] = {}  # token_id → snapshot
@@ -907,10 +930,9 @@ class ScoutOrchestrator:
                             break
                     tokens_to_seed.append((token_id, question))
 
-                # Si no hay tokens MM aún, usar los Top 5 del radar
-                if not tokens_to_seed and self._last_radar_snapshots:
-                    ranked = self.selection_engine.rank(self._last_radar_snapshots)
-                    for ms in ranked.top[:5]:
+                # Si no hay tokens MM aún, usar los Top MM del SelectionEngine
+                if not tokens_to_seed and self._last_mm_markets:
+                    for ms in self._last_mm_markets[:5]:
                         ct = ms.snapshot.get("clobTokenIds", [])
                         if isinstance(ct, list) and len(ct) > 0:
                             tokens_to_seed.append((ct[0], ms.question[:60]))
@@ -920,7 +942,7 @@ class ScoutOrchestrator:
                     continue
 
                 seeded = 0
-                for token_id, question in tokens_to_seed[:MM_TOP_MARKETS]:
+                for token_id, question in tokens_to_seed[:self.selection_engine.top_n_mm]:
                     if not self._running:
                         break
                     try:
@@ -1029,6 +1051,18 @@ class ScoutOrchestrator:
                     await asyncio.sleep(5)
                     continue
 
+                # ── Filtrar snapshots a solo los del Top Direccional ──
+                dir_condition_ids = {
+                    ms.condition_id for ms in self._last_directional_markets
+                }
+                dir_filtered_snapshots = [
+                    s for s in self._last_radar_snapshots
+                    if s.get("condition_id") in dir_condition_ids
+                ]
+                # Si el filtro está vacío, usar todos (fallback)
+                if not dir_filtered_snapshots:
+                    dir_filtered_snapshots = self._last_radar_snapshots
+
                 equity = self.paper_trading.wallet.usdc_total
                 max_positions = 8
                 open_count = self.paper_trading.open_position_count
@@ -1047,10 +1081,10 @@ class ScoutOrchestrator:
                 executed_mom = 0
 
                 # ── TAKER: señales del pipeline adaptativo ──────────────
-                # Asegurar suficiente historial de precios
+                # Usar solo snapshots del Top Direccional
                 if self.adaptive_engine.pipeline.get_history_size() >= 3:
                     signals = self.adaptive_engine.generate_adaptive_signals(
-                        self._last_radar_snapshots,
+                        dir_filtered_snapshots,
                         cooldown_s=180,
                     )
 
@@ -1325,6 +1359,12 @@ class ScoutOrchestrator:
             "alpha_whales": len(self.whale_tracker.get_alpha_whales()) if self.whale_tracker else 0,
             "websocket_connected": self.ws_manager.is_connected if self.ws_manager else False,
             "clob_auth": self.ws_manager._clob_authed if self.ws_manager else False,
+            "selection": {
+                "mm_top_count": len(self._last_mm_markets),
+                "directional_top_count": len(self._last_directional_markets),
+                "mm_top_ids": [ms.condition_id[:16] for ms in self._last_mm_markets[:5]],
+                "directional_top_ids": [ms.condition_id[:16] for ms in self._last_directional_markets[:5]],
+            },
             "market_making": {
                 "markets_active": self._mm_markets_active,
                 "quotes_generated": self._mm_quotes_generated,
