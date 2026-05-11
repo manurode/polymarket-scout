@@ -1,146 +1,151 @@
 """
-Selection Engine — Ranking de mercados para el Top 50.
+Selection Engine — Ranking de mercados con Scoring Multidimensional (Doble Perfil).
 
-Arquitectura v4.0 — «Filtros Institucionales»:
-  1. Radar (Gamma API) escanea ~200 mercados.
-  2. Selection Engine aplica filtros institucionales y rankea el Top 50.
+Arquitectura v5.0 — «Bifurcación MM vs Direccional»:
 
-Criterios v4.0:
-  ┌─────────────────────────────────────────────────────────────────────┐
-  │ FILTRO DE RANGO CENTRAL (Target 0.50)                               │
-  │   Precio en 0.15–0.85 → multiplicador de recompensa x2.0.          │
-  │   Operamos donde el resultado sigue en disputa.                     │
-  ├─────────────────────────────────────────────────────────────────────┤
-  │ FILTRO DE LIQUIDEZ ACTIVA                                           │
-  │   order_count (Top del libro CLOB) < 10 → descartado.              │
-  │   Necesitamos «compañeros de juego» en el libro.                   │
-  ├─────────────────────────────────────────────────────────────────────┤
-  │ EXCLUSIÓN DE MERCADOS DE «COLA LARGA»                               │
-  │   precio < 0.02 → descartado (sin spread para MM rentable).        │
-  ├─────────────────────────────────────────────────────────────────────┤
-  │ DETECCIÓN DE ACTIVIDAD                                              │
-  │   Sin movimiento de precio en los últimos 30 min → penalización     │
-  │   drástica (multiplicador 0.05x sobre el score final).             │
-  └─────────────────────────────────────────────────────────────────────┘
+  Perfil MM (Market Making):
+    Premia: altísimo volumen 24h, alta liquidez L2, precios centrales (0.30–0.70).
+    Castiga: resolución en <48h, eventos deportivos (adverse selection por goles).
+    → El daemon _market_making_loop opera exclusivamente en estos mercados.
 
-Resto de filtros heredados (Filtro de Pulso v3.1):
-  - Hard Gate de Actividad: vol24h == 0 → score=0, excepto mercados nuevos (<48h).
-  - Hard limit de liquidez: liquidez < $500 → score=0.
-  - Penalización agresiva de spread: spreads > 10% → multiplicador 0.01x.
-  - Margen de cortesía: vol24h > $1 000 → pasa Gates de spread/order_count vacíos.
+  Perfil Direccional (Momentum / Catalyst):
+    Premia: mercados que expiran en ≤7 días, picos recientes de volumen,
+            eventos de noticias inminentes.
+    Castiga: mercados que expiran en 2025/2026 (líneas planas).
+    → El daemon _autonomous_execution_loop vigila exclusivamente estos mercados.
+
+Los castigos del Bandit (Hard Gates, spread, stale) permanecen INTACTOS en ambos
+perfiles. La única diferencia es QUÉ mercados se priorizan para cada estrategia.
 
 Usage:
-    engine = SelectionEngine(top_n=50)
+    engine = SelectionEngine(top_n_mm=10, top_n_directional=10)
     result = engine.rank(snapshots)
+    # result.mm_top, result.directional_top
 """
 
 import math
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Optional
 
 
-# ── Pesos del score ───────────────────────────────────────────────────────────
-# v4.0 «Filtros Institucionales»: el vol24h sigue dominando.
-# La densidad de órdenes sigue aportando, la recency completa el compuesto.
+# ═══════════════════════════════════════════════════════════════════════════════
+# Constantes — Perfil MM
+# ═══════════════════════════════════════════════════════════════════════════════
 
-SCORE_WEIGHTS = {
-    "volume_24h":    0.70,  # Volumen últimas 24h — señal de actividad real (dominante)
-    "order_density": 0.20,  # Densidad de órdenes en el CLOB (pulso del libro)
-    "recency":       0.10,  # Tiempo hasta expiración
+# Pesos del score MM: el volumen 24h es el rey para market making
+MM_SCORE_WEIGHTS = {
+    "volume_24h":      0.50,   # Volumen últimas 24h — pulso del mercado
+    "liquidity":       0.30,   # Liquidez en el book — profundidad para MM
+    "order_density":   0.15,   # Densidad de órdenes CLOB activas
+    "recency":         0.05,   # Tiempo hasta expiración (penaliza <48h)
 }
 
-# ── Umbrales globales ─────────────────────────────────────────────────────────
+# Rango central para MM: más estrecho que el general (0.30–0.70)
+MM_CENTRAL_LOW  = 0.30
+MM_CENTRAL_HIGH = 0.70
+MM_CENTRAL_MULTIPLIER = 2.0       # ×2 si el precio está en rango central
 
-# Spread
-SPREAD_PENALTY_THRESHOLD    = 0.10    # spreads > 10% → multiplicador 0.01x
-SPREAD_PENALTY_MULTIPLIER   = 0.01    # Factor de penalización AGRESIVO
+# Penalizaciones severas específicas de MM
+MM_SPORTS_PENALTY_MULTIPLIER    = 0.01   # ×0.01 si es evento deportivo
+MM_IMMINENT_EXPIRY_HOURS        = 48     # <48h para resolución → penalizar
+MM_IMMINENT_EXPIRY_MULTIPLIER   = 0.01   # ×0.01 si expira en <48h
 
-# Liquidez
-MIN_LIQUIDITY_USD           = 500.0   # Liquidez mínima — por debajo: score=0
-
-# Filtro de Cola Larga (Long Tail Exclusion)
-LONG_TAIL_PRICE_THRESHOLD   = 0.02    # Precio < 2% → evento «imposible» sin spread
-
-# Filtro de Rango Central (Central Range Reward)
-CENTRAL_RANGE_LOW           = 0.15   # Límite inferior del rango central
-CENTRAL_RANGE_HIGH          = 0.85   # Límite superior del rango central
-CENTRAL_RANGE_MULTIPLIER    = 2.0    # Recompensa x2 para mercados en disputa
-
-# Filtro de Liquidez Activa (Active Liquidity Gate)
-MIN_ACTIVE_ORDER_COUNT      = 10     # Mínimo de órdenes Top-of-book CLOB para operar
-
-# Detección de Actividad (Stale Market Penalty)
-STALE_MARKET_WINDOW_SEC     = 30 * 60   # 30 minutos sin movimiento → «zombie»
-STALE_MARKET_MULTIPLIER     = 0.05      # Penalización drástica si no hay actividad reciente
-
-# Margen de cortesía: vol24h > umbral → puede ignorar Gates de CLOB vacíos
-MIN_VOL24H_FOR_SPREAD_GRACE = 1_000.0   # $1 000
-
-# Ventanas de tiempo
-EXPIRY_WARN_HOURS           = 24     # Mercados que expiran en < 24h penalizados
-NEW_MARKET_WINDOW_HOURS     = 48     # Mercados creados en las últimas N horas son «nuevos»
-
-# Precio extremo alto (complementario al Long Tail)
-EXTREME_PRICE_HIGH          = 0.98   # Precio > 98% → evento dado por seguro
+# Hard Gates heredados del Bandit (INTACTOS)
+SPREAD_PENALTY_THRESHOLD    = 0.10
+SPREAD_PENALTY_MULTIPLIER   = 0.01
+MIN_LIQUIDITY_USD           = 500.0
+LONG_TAIL_PRICE_THRESHOLD   = 0.02
+EXTREME_PRICE_HIGH          = 0.98
+CENTRAL_RANGE_LOW           = 0.15
+CENTRAL_RANGE_HIGH          = 0.85
+CENTRAL_RANGE_MULTIPLIER    = 2.0
+MIN_ACTIVE_ORDER_COUNT      = 10
+STALE_MARKET_WINDOW_SEC     = 30 * 60
+STALE_MARKET_MULTIPLIER     = 0.05
+MIN_VOL24H_FOR_SPREAD_GRACE = 1_000.0
+EXPIRY_WARN_HOURS           = 24
+NEW_MARKET_WINDOW_HOURS     = 48
 
 
-# ── Dataclasses de resultado ──────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# Constantes — Perfil Direccional
+# ═══════════════════════════════════════════════════════════════════════════════
 
-@dataclass
-class MarketScore:
-    """Resultado del scoring para un mercado."""
-    condition_id: str
-    question: str
-    slug: str
-    volume: float
-    volume_24h: float
-    liquidity: float
-    spread: Optional[float]
-    order_count: int
-    price: Optional[float]
-    score: float
-    is_central_range: bool      # True si el precio está en el rango 0.15–0.85
-    is_stale: bool              # True si no ha habido movimiento en 30 min
-    snapshot: dict = field(repr=False)
+DIRECTIONAL_SCORE_WEIGHTS = {
+    "expiry_acceleration": 0.40,   # Expira pronto → máxima prioridad
+    "volume_surge":        0.35,   # Pico de volumen reciente vs media
+    "momentum":            0.20,   # Señal direccional (price delta reciente)
+    "liquidity":           0.05,   # Liquidez mínima para ejecutar
+}
 
-
-@dataclass
-class RankingResult:
-    """Resultado completo del ranking."""
-    top: list[MarketScore]
-    all_scored: list[MarketScore]
-    enter: list[str]   # condition_ids que ENTRAN al Top N
-    exit: list[str]    # condition_ids que SALEN del Top N
+DIRECTIONAL_NEAR_TERM_HOURS      = 7 * 24    # ≤7 días → premio máximo
+DIRECTIONAL_FAR_EXPIRY_DAYS      = 30        # >30 días → empieza a penalizar
+DIRECTIONAL_FAR_EXPIRY_MULTIPLIER = 0.01     # ×0.01 si expira en >6 meses (2025/2026)
+DIRECTIONAL_NEAR_TERM_MULTIPLIER  = 3.0      # ×3.0 si expira en ≤7 días
+DIRECTIONAL_MIN_LIQUIDITY         = 200.0     # Liquidez mínima más laxa para direccional
+DIRECTIONAL_MIN_VOL24H            = 500.0     # Volumen 24h mínimo
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# Detección de deportes
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def _is_new_market(snapshot: dict) -> bool:
-    """Retorna True si el mercado probablemente es nuevo (< NEW_MARKET_WINDOW_HOURS horas).
+SPORTS_TAGS = {
+    "sports", "soccer", "football", "nfl", "nba", "mlb", "nhl",
+    "cricket", "tennis", "f1", "formula 1", "mma", "ufc", "boxing",
+    "rugby", "golf", "basketball", "baseball", "hockey", "volleyball",
+    "esports", "olympics",
+}
+
+SPORTS_KEYWORDS_RE = re.compile(
+    r'\b(football|soccer|basketball|baseball|hockey|tennis|cricket|rugby|golf'
+    r'|ufc|mma|boxing|formula\s*1|grand prix|premier league|la\s*liga'
+    r'|serie\s*a|bundesliga|champions league|world cup|super bowl'
+    r'|nfl|nba|mlb|nhl|mls|epl|ipl|laliga|ligue\s*1|serie a'
+    r'|wimbledon|us open|australian open|french open|tour de france'
+    r'|olympics|fifa|uefa|ncaa|march madness|playoffs?)\b',
+    re.IGNORECASE,
+)
+
+
+def _is_sports_event(snapshot: dict) -> bool:
+    """Detecta si un mercado es un evento deportivo.
 
     Estrategia en dos pasos:
-    1. Si ``created_at`` (timestamp UNIX) está disponible, lo usa directamente.
-    2. Si no está disponible, usa una heurística:
-       volumen total bajo + vol24h == 0 es señal de mercado recién creado.
+    1. Revisa los tags del snapshot (Gamma API).
+    2. Si no hay tags, busca keywords en la pregunta y título del evento.
     """
+    tags = snapshot.get("tags", [])
+    if tags and isinstance(tags, list):
+        for tag in tags:
+            tag_lower = str(tag).lower().strip()
+            if tag_lower in SPORTS_TAGS:
+                return True
+
+    # Fallback: keyword matching en question + event_title
+    question = snapshot.get("question", "") or ""
+    event_title = snapshot.get("event_title", "") or ""
+    combined = f"{question} {event_title}"
+    return bool(SPORTS_KEYWORDS_RE.search(combined))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Helpers (heredados + nuevos)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _is_new_market(snapshot: dict) -> bool:
     created_at = snapshot.get("created_at")
     if created_at is not None and created_at > 0:
         age_hours = (time.time() - float(created_at)) / 3600
         return age_hours <= NEW_MARKET_WINDOW_HOURS
-
-    # Heurística: mercado con volumen total muy bajo y sin vol24h
     volume_total = snapshot.get("volume", 0) or 0
     volume_24h   = snapshot.get("volume_24h", 0) or 0
     return volume_total < 500 and volume_24h == 0
 
 
 def _parse_spread(snapshot: dict) -> Optional[float]:
-    """Extrae el spread del snapshot de forma robusta.
-
-    - None / «N/A» / string vacío → retorna None (libro vacío / sin datos).
-    - Numérico → retorna como float.
-    """
     raw = snapshot.get("spread")
     if raw is None:
         return None
@@ -159,8 +164,7 @@ def _parse_spread(snapshot: dict) -> Optional[float]:
 
 
 def _extract_price(snapshot: dict) -> Optional[float]:
-    """Extrae el precio mid del snapshot (price / price_yes / outcomePrices[0])."""
-    for key in ("price", "price_yes"):
+    for key in ("price", "price_yes", "price_yes"):
         val = snapshot.get(key)
         if val is not None:
             try:
@@ -171,15 +175,6 @@ def _extract_price(snapshot: dict) -> Optional[float]:
 
 
 def _is_stale_market(snapshot: dict) -> bool:
-    """Retorna True si el mercado no ha registrado actividad en STALE_MARKET_WINDOW_SEC.
-
-    Campos consultados (en orden de prioridad):
-      1. ``last_trade_timestamp`` — timestamp UNIX del último trade.
-      2. ``last_updated``         — timestamp UNIX de la última actualización del snapshot.
-      3. ``timestamp``            — timestamp del snapshot en sí.
-
-    Si ningún campo está disponible, devuelve False (beneficio de la duda).
-    """
     now = time.time()
     for key in ("last_trade_timestamp", "last_updated", "timestamp"):
         val = snapshot.get(key)
@@ -190,260 +185,464 @@ def _is_stale_market(snapshot: dict) -> bool:
                     return (now - last_ts) > STALE_MARKET_WINDOW_SEC
             except (TypeError, ValueError):
                 pass
-    return False  # sin datos → no penalizamos
+    return False
 
 
-# ── Motor principal ───────────────────────────────────────────────────────────
+def _hours_until_expiry(snapshot: dict) -> Optional[float]:
+    """Horas hasta la fecha de expiración. None si no hay end_date."""
+    end_date = snapshot.get("end_date")
+    if not end_date or end_date <= 0:
+        return None
+    return (end_date - time.time()) / 3600
+
+
+def _volume_surge_factor(snapshot: dict) -> float:
+    """Relación vol24h / volumen total como proxy de aceleración reciente."""
+    volume_24h = max(0.0, snapshot.get("volume_24h", 0) or 0)
+    volume_total = max(1.0, snapshot.get("volume", 0) or 0)
+    return volume_24h / volume_total
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Dataclasses
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class MarketScore:
+    """Resultado del scoring para un mercado."""
+    condition_id: str
+    question: str
+    slug: str
+    volume: float
+    volume_24h: float
+    liquidity: float
+    spread: Optional[float]
+    order_count: int
+    price: Optional[float]
+    score: float
+    is_central_range: bool
+    is_stale: bool
+    is_sports: bool = False
+    hours_to_expiry: Optional[float] = None
+    snapshot: dict = field(repr=False)
+
+
+@dataclass
+class RankingResult:
+    """Resultado completo del ranking (compatible con código existente)."""
+    top: list[MarketScore]
+    all_scored: list[MarketScore]
+    enter: list[str]
+    exit: list[str]
+
+
+@dataclass
+class DualRankingResult:
+    """Resultado de ranking dual (v5.0): MM + Direccional independientes."""
+    mm_top: list[MarketScore]
+    mm_all_scored: list[MarketScore]
+    mm_enter: list[str]
+    mm_exit: list[str]
+
+    directional_top: list[MarketScore]
+    directional_all_scored: list[MarketScore]
+    directional_enter: list[str]
+    directional_exit: list[str]
+
+    # Compatibilidad con código legacy: .top apunta a mm_top
+    @property
+    def top(self) -> list[MarketScore]:
+        return self.mm_top
+
+    @property
+    def all_scored(self) -> list[MarketScore]:
+        return self.mm_all_scored
+
+    @property
+    def enter(self) -> list[str]:
+        return self.mm_enter
+
+    @property
+    def exit(self) -> list[str]:
+        return self.mm_exit
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Selection Engine v5.0
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class SelectionEngine:
-    """Rankea mercados por score compuesto con filtros institucionales v4.0.
+    """Rankea mercados con scoring dual: MM + Direccional.
 
     Parameters
     ----------
-    top_n : int
-        Número de mercados en el Top (default 50).
-    weights : dict
-        Pesos para cada componente del score.
+    top_n_mm : int
+        Nº de mercados en el Top de Market Making (default 10).
+    top_n_directional : int
+        Nº de mercados en el Top Direccional (default 10).
     """
 
-    def __init__(self, top_n: int = 50, weights: dict | None = None):
-        self.top_n = top_n
-        self.weights = weights or SCORE_WEIGHTS.copy()
+    def __init__(
+        self,
+        top_n_mm: int = 10,
+        top_n_directional: int = 10,
+    ):
+        self.top_n_mm = top_n_mm
+        self.top_n_directional = top_n_directional
 
-        # Estado: condition_ids en el Top N del ranking anterior
-        self._previous_top: set[str] = set()
+        # Estado anterior para detectar entradas/salidas
+        self._previous_mm_top: set[str] = set()
+        self._previous_directional_top: set[str] = set()
 
-    # ── Scoring ───────────────────────────────────────────────────────────────
+    # ── Common Hard Gates (Bandit punishments — INTACTOS) ─────────────────────
 
-    def _compute_score(
+    def _passes_common_hard_gates(self, snapshot: dict) -> tuple[bool, str]:
+        """Hard Gates que aplican a AMBOS perfiles. Retorna (pasa, razón).
+
+        Estos son los castigos del Bandit que se mantienen intactos.
+        """
+        volume_24h = max(0.0, snapshot.get("volume_24h", 0) or 0)
+        liquidity  = max(0.0, snapshot.get("liquidity", 0) or 0)
+        order_count = max(0, snapshot.get("order_count", 0) or 0)
+        price       = _extract_price(snapshot)
+        spread      = _parse_spread(snapshot)
+        has_grace   = volume_24h >= MIN_VOL24H_FOR_SPREAD_GRACE
+
+        # G1 — Cola Larga
+        if price is not None and price < LONG_TAIL_PRICE_THRESHOLD:
+            return False, "long_tail"
+
+        # G2 — Precio extremo
+        if price is not None and price > EXTREME_PRICE_HIGH:
+            return False, "extreme_price"
+
+        # G3 — Sin pulso (zombi)
+        if volume_24h == 0 and not _is_new_market(snapshot):
+            return False, "no_pulse"
+
+        # G4 — Liquidez mínima
+        if liquidity < MIN_LIQUIDITY_USD:
+            return False, "low_liquidity"
+
+        # G5 — Sin liquidez activa (sin margen de cortesía)
+        if order_count < MIN_ACTIVE_ORDER_COUNT and not has_grace:
+            return False, "low_order_count"
+
+        # G6 — Spread desconocido (sin margen de cortesía)
+        if spread is None and not has_grace:
+            return False, "unknown_spread"
+
+        return True, "ok"
+
+    # ── Perfil MM: Scoring ────────────────────────────────────────────────────
+
+    def _compute_mm_score(
         self,
         snapshot: dict,
         max_volume_24h: float = 1.0,
+        max_liquidity: float = 1.0,
         max_order_count: float = 1.0,
-    ) -> tuple[float, bool, bool]:
-        """Calcula el score para un mercado individual.
+    ) -> tuple[float, bool, bool, bool, Optional[float]]:
+        """Calcula el score para el perfil Market Making.
 
         Returns
         -------
-        tuple[float, bool, bool]
-            (score, is_central_range, is_stale)
-
-        Hard Gates — score=0 inmediato:
-          G1. Precio < LONG_TAIL_PRICE_THRESHOLD (0.02) → cola larga, sin spread.
-          G2. Precio > EXTREME_PRICE_HIGH (0.98) → evento dado por seguro.
-          G3. vol24h == 0 y mercado NO es nuevo (<48h) → sin pulso.
-          G4. Liquidez < MIN_LIQUIDITY_USD ($500) → inoperable.
-          G5. order_count < MIN_ACTIVE_ORDER_COUNT (10) → sin liquidez activa,
-              SALVO margen de cortesía (vol24h > $1 000).
-          G6. spread == None y sin margen de cortesía → libro no consultado.
-
-        Multiplicadores post-score:
-          • Rango Central (0.15–0.85): ×2.0 (recompensa).
-          • Spread > 10%: ×0.01 (penalización agresiva).
-          • Mercado estancado > 30 min: ×0.05 (penalización drástica).
+        tuple[float, bool, bool, bool, Optional[float]]
+            (score, is_central_range, is_stale, is_sports, hours_to_expiry)
         """
-        # ── Datos base ────────────────────────────────────────────────────────
         volume_24h  = max(0.0, snapshot.get("volume_24h", 0) or 0)
         liquidity   = max(0.0, snapshot.get("liquidity", 0) or 0)
         order_count = max(0,   snapshot.get("order_count", 0) or 0)
         price       = _extract_price(snapshot)
         spread      = _parse_spread(snapshot)
 
-        # ── Señales derivadas ─────────────────────────────────────────────────
-        has_vol24h_grace = volume_24h >= MIN_VOL24H_FOR_SPREAD_GRACE
-
         is_central_range = (
             price is not None
-            and CENTRAL_RANGE_LOW <= price <= CENTRAL_RANGE_HIGH
+            and MM_CENTRAL_LOW <= price <= MM_CENTRAL_HIGH
         )
         is_stale = _is_stale_market(snapshot)
+        is_sports = _is_sports_event(snapshot)
+        hours_left = _hours_until_expiry(snapshot)
 
-        # ════════════════════════════════════════════════════════════════════
-        # HARD GATES (orden de mayor a menor severidad)
-        # ════════════════════════════════════════════════════════════════════
+        # ── Hard Gates (Bandit — INTACTOS) ──
+        passes, reason = self._passes_common_hard_gates(snapshot)
+        if not passes:
+            return 0.0, is_central_range, is_stale, is_sports, hours_left
 
-        # G1 — Exclusión de Cola Larga: precio < 0.02
-        #   Mercados con precio casi nulo no tienen spread suficiente para MM.
-        if price is not None and price < LONG_TAIL_PRICE_THRESHOLD:
-            return 0.0, is_central_range, is_stale
-
-        # G2 — Precio > 98%: evento ya resuelto por el mercado
-        #   No hay información ni margen para hacer MM.
-        if price is not None and price > EXTREME_PRICE_HIGH:
-            return 0.0, is_central_range, is_stale
-
-        # G3 — Hard Gate de Actividad: sin pulso hoy
-        #   vol24h == 0 → mercado zombi, a menos que sea recién creado.
-        if volume_24h == 0 and not _is_new_market(snapshot):
-            return 0.0, is_central_range, is_stale
-
-        # G4 — Liquidez mínima: libro sin profundidad suficiente
-        if liquidity < MIN_LIQUIDITY_USD:
-            return 0.0, is_central_range, is_stale
-
-        # G5 — Filtro de Liquidez Activa: orden_count < 10
-        #   Necesitamos contraparte en el libro para hacer MM.
-        #   Margen de cortesía: si aún no tenemos datos del CLOB pero el
-        #   mercado tiene vol24h > $1 000, lo dejamos pasar (L2 lo validará).
-        if order_count < MIN_ACTIVE_ORDER_COUNT and not has_vol24h_grace:
-            return 0.0, is_central_range, is_stale
-
-        # G6 — Spread desconocido: CLOB no consultado aún
-        if spread is None and not has_vol24h_grace:
-            return 0.0, is_central_range, is_stale
-
-        # ════════════════════════════════════════════════════════════════════
-        # SCORE BASE COMPUESTO
-        # ════════════════════════════════════════════════════════════════════
-
-        # Volume 24h: log10 normalizado contra el máximo del batch
-        vol_24h_score = (
+        # ── Score base compuesto ──────────────────────────────────────────
+        vol_score = (
             math.log10(volume_24h + 1) / math.log10(max_volume_24h + 1)
             if max_volume_24h > 1 else 0.0
         )
 
-        # Order Density: log10 normalizado del número de órdenes CLOB activas
-        order_density_score = (
+        liq_score = (
+            math.log10(liquidity + 1) / math.log10(max_liquidity + 1)
+            if max_liquidity > 1 else 0.0
+        )
+
+        order_score = (
             math.log10(order_count + 1) / math.log10(max_order_count + 1)
             if max_order_count > 1 else 0.0
         )
 
-        # Recency: penalización por cercanía a expiración
+        # Recency: caída lineal cuando quedan <24h
         recency_score = 1.0
-        end_date = snapshot.get("end_date")
-        if end_date:
-            hours_left = (end_date - time.time()) / 3600
+        if hours_left is not None:
             if hours_left <= 0:
                 recency_score = 0.0
             elif hours_left < EXPIRY_WARN_HOURS:
                 recency_score = hours_left / EXPIRY_WARN_HOURS
 
         base_score = (
-            vol_24h_score        * self.weights["volume_24h"]
-            + order_density_score  * self.weights["order_density"]
-            + recency_score        * self.weights["recency"]
+            vol_score   * MM_SCORE_WEIGHTS["volume_24h"]
+            + liq_score   * MM_SCORE_WEIGHTS["liquidity"]
+            + order_score * MM_SCORE_WEIGHTS["order_density"]
+            + recency_score * MM_SCORE_WEIGHTS["recency"]
         )
 
-        # ════════════════════════════════════════════════════════════════════
-        # MULTIPLICADORES POST-SCORE
-        # ════════════════════════════════════════════════════════════════════
-
-        # 1. Recompensa de Rango Central (×2.0)
-        #    Precio en 0.15–0.85: resultado aún en disputa → máxima prioridad.
+        # ── Multiplicadores ───────────────────────────────────────────────
+        # 1. Recompensa de Rango Central (0.30–0.70)
         if is_central_range:
-            base_score *= CENTRAL_RANGE_MULTIPLIER
+            base_score *= MM_CENTRAL_MULTIPLIER
 
-        # 2. Penalización agresiva de spread (×0.01)
-        #    Spread > 10%: mercado ilíquido o zombi → hundir al fondo.
+        # 2. Penalización de spread > 10% (Bandit — INTACTO)
         if spread is not None and spread > SPREAD_PENALTY_THRESHOLD:
             base_score *= SPREAD_PENALTY_MULTIPLIER
 
-        # 3. Penalización de mercado estancado (×0.05)
-        #    Sin actividad en los últimos 30 min → degradar drásticamente.
+        # 3. Penalización de mercado estancado (Bandit — INTACTO)
         if is_stale:
             base_score *= STALE_MARKET_MULTIPLIER
 
-        return base_score, is_central_range, is_stale
+        # 4. ⛔ Penalización SEVERA por evento deportivo (adverse selection)
+        if is_sports:
+            base_score *= MM_SPORTS_PENALTY_MULTIPLIER
+
+        # 5. ⛔ Penalización SEVERA por expiración inminente (<48h)
+        if hours_left is not None and 0 < hours_left < MM_IMMINENT_EXPIRY_HOURS:
+            base_score *= MM_IMMINENT_EXPIRY_MULTIPLIER
+
+        return base_score, is_central_range, is_stale, is_sports, hours_left
+
+    # ── Perfil Direccional: Scoring ───────────────────────────────────────────
+
+    def _compute_directional_score(
+        self,
+        snapshot: dict,
+        max_volume_24h: float = 1.0,
+        max_volume_surge: float = 1.0,
+    ) -> tuple[float, Optional[float], float]:
+        """Calcula el score para el perfil Direccional (Momentum/Catalyst).
+
+        Returns
+        -------
+        tuple[float, Optional[float], float]
+            (score, hours_to_expiry, volume_surge)
+        """
+        volume_24h = max(0.0, snapshot.get("volume_24h", 0) or 0)
+        liquidity  = max(0.0, snapshot.get("liquidity", 0) or 0)
+        price      = _extract_price(snapshot)
+        hours_left = _hours_until_expiry(snapshot)
+        vol_surge  = _volume_surge_factor(snapshot)
+
+        # ── Hard Gates específicos del perfil direccional ──
+        # Gate D1: Liquidez mínima (más laxa que MM)
+        if liquidity < DIRECTIONAL_MIN_LIQUIDITY:
+            return 0.0, hours_left, vol_surge
+
+        # Gate D2: Volumen 24h mínimo
+        if volume_24h < DIRECTIONAL_MIN_VOL24H:
+            return 0.0, hours_left, vol_surge
+
+        # Gate D3: Precio extremo (sin oportunidad direccional)
+        if price is not None and (price < 0.02 or price > 0.98):
+            return 0.0, hours_left, vol_surge
+
+        # ── Score base compuesto ──────────────────────────────────────────
+
+        # Expiry acceleration: máximo para ≤7 días, decae con el tiempo
+        if hours_left is None:
+            expiry_score = 0.5  # sin fecha → neutro
+        elif hours_left <= 0:
+            expiry_score = 0.0  # ya expiró
+        elif hours_left <= DIRECTIONAL_NEAR_TERM_HOURS:
+            # 0–7 días: score máximo (1.0 a 0.5)
+            expiry_score = 1.0 - (hours_left / DIRECTIONAL_NEAR_TERM_HOURS) * 0.5
+        elif hours_left <= DIRECTIONAL_FAR_EXPIRY_DAYS * 24:
+            # 7–30 días: decaimiento gradual
+            extra = hours_left - DIRECTIONAL_NEAR_TERM_HOURS
+            max_extra = DIRECTIONAL_FAR_EXPIRY_DAYS * 24 - DIRECTIONAL_NEAR_TERM_HOURS
+            expiry_score = 0.5 * (1.0 - extra / max_extra) if max_extra > 0 else 0.0
+        else:
+            # >30 días o >6 meses: casi nulo
+            expiry_score = 0.05
+
+        # Volume surge: ratio vol24h/vol_total
+        surge_score = (
+            vol_surge / max_volume_surge if max_volume_surge > 0 else 0.0
+        )
+
+        # Momentum proxy: si hay price_yes, usamos la distancia desde 0.50
+        # Mercados en movimiento tienen precio lejos del centro
+        momentum_score = 0.0
+        if price is not None:
+            momentum_score = abs(price - 0.50) * 2.0  # 0 en 0.50, 1.0 en 0 o 1
+
+        # Liquidez normalizada (solo para asegurar ejecución)
+        liq_score = min(1.0, liquidity / 10_000.0)
+
+        base_score = (
+            expiry_score   * DIRECTIONAL_SCORE_WEIGHTS["expiry_acceleration"]
+            + surge_score    * DIRECTIONAL_SCORE_WEIGHTS["volume_surge"]
+            + momentum_score * DIRECTIONAL_SCORE_WEIGHTS["momentum"]
+            + liq_score      * DIRECTIONAL_SCORE_WEIGHTS["liquidity"]
+        )
+
+        # ── Multiplicadores ───────────────────────────────────────────────
+
+        # Premio por expiración cercana (≤7 días)
+        if hours_left is not None and 0 < hours_left <= DIRECTIONAL_NEAR_TERM_HOURS:
+            base_score *= DIRECTIONAL_NEAR_TERM_MULTIPLIER
+
+        # ⛔ Castigo SEVERO por expiración lejana (>6 meses → 2025/2026)
+        if hours_left is not None and hours_left > 180 * 24:
+            base_score *= DIRECTIONAL_FAR_EXPIRY_MULTIPLIER
+
+        return base_score, hours_left, vol_surge
 
     # ── Ranking ───────────────────────────────────────────────────────────────
 
-    def rank(self, snapshots: list[dict]) -> RankingResult:
-        """Rankea todos los snapshots y retorna el Top N + eventos de cambio.
+    def rank(self, snapshots: list[dict]) -> DualRankingResult:
+        """Rankea mercados para ambos perfiles: MM y Direccional.
 
         Parameters
         ----------
         snapshots : list[dict]
-            Lista de snapshots de mercado (formato scanner). Campos esperados:
-            ``volume``, ``volume_24h``, ``liquidity``, ``spread``,
-            ``order_count`` (órdenes CLOB activas), ``price`` / ``price_yes``,
-            ``last_trade_timestamp`` (opcional, para detección de actividad),
-            ``created_at`` (timestamp UNIX de creación).
+            Lista de snapshots de mercado del scanner.
 
         Returns
         -------
-        RankingResult
-            Con el Top N, todos los scores, y listas de entradas/salidas.
-
-        Pipeline v4.0:
-          1. Hard Gates institucionales (Long Tail, Actividad, Liquidez Activa…).
-          2. Score compuesto: vol24h × 70% + order_density × 20% + recency × 10%.
-          3. Multiplicadores: ×2.0 si rango central, ×0.01 si spread alto,
-             ×0.05 si mercado estancado > 30 min.
-          4. Filtro de elegibilidad: score > 0 AND liquidez ≥ $500.
-          5. Ranking final por vol24h DESC (actividad real, no score histórico).
+        DualRankingResult
+            Con rankings independientes para MM y Direccional.
         """
         if not snapshots:
-            return RankingResult(top=[], all_scored=[], enter=[], exit=[])
+            return DualRankingResult(
+                mm_top=[], mm_all_scored=[], mm_enter=[], mm_exit=[],
+                directional_top=[], directional_all_scored=[],
+                directional_enter=[], directional_exit=[],
+            )
 
-        # Normalización del batch
+        # ── Normalización batch ──────────────────────────────────────────
         max_vol_24h     = max((s.get("volume_24h", 0) or 0) for s in snapshots)
         max_order_count = max((s.get("order_count", 0) or 0) for s in snapshots)
+        max_liquidity   = max((s.get("liquidity", 0) or 0) for s in snapshots)
+        max_vol_surge   = max(_volume_surge_factor(s) for s in snapshots)
 
-        # Scoring
-        scored: list[MarketScore] = []
+        mm_scored: list[MarketScore] = []
+        dir_scored: list[MarketScore] = []
+
         for s in snapshots:
-            score, is_central, is_stale = self._compute_score(
-                s, max_vol_24h, max_order_count
+            # ── MM Score ──────────────────────────────────────────────
+            mm_score, is_central, is_stale, is_sports, hrs_left = self._compute_mm_score(
+                s, max_vol_24h, max_liquidity, max_order_count,
             )
-            spread_parsed = _parse_spread(s)
-            price         = _extract_price(s)
-            scored.append(MarketScore(
+            mm_scored.append(MarketScore(
                 condition_id=s.get("condition_id", ""),
                 question=s.get("question", ""),
                 slug=s.get("slug", ""),
                 volume=s.get("volume", 0) or 0,
                 volume_24h=s.get("volume_24h", 0) or 0,
                 liquidity=s.get("liquidity", 0) or 0,
-                spread=spread_parsed,
+                spread=_parse_spread(s),
                 order_count=s.get("order_count", 0) or 0,
-                price=price,
-                score=score,
+                price=_extract_price(s),
+                score=mm_score,
                 is_central_range=is_central,
                 is_stale=is_stale,
+                is_sports=is_sports,
+                hours_to_expiry=hrs_left,
                 snapshot=s,
             ))
 
-        # ── Filtro de elegibilidad ────────────────────────────────────────────
-        # score > 0 garantiza que pasaron todos los Hard Gates.
-        # La barrera de liquidez es redundante pero explícita por claridad.
-        eligible = [
-            ms for ms in scored
+            # ── Direccional Score ──────────────────────────────────────
+            dir_score, dir_hrs, dir_surge = self._compute_directional_score(
+                s, max_vol_24h, max_vol_surge,
+            )
+            dir_scored.append(MarketScore(
+                condition_id=s.get("condition_id", ""),
+                question=s.get("question", ""),
+                slug=s.get("slug", ""),
+                volume=s.get("volume", 0) or 0,
+                volume_24h=s.get("volume_24h", 0) or 0,
+                liquidity=s.get("liquidity", 0) or 0,
+                spread=_parse_spread(s),
+                order_count=s.get("order_count", 0) or 0,
+                price=_extract_price(s),
+                score=dir_score,
+                is_central_range=_extract_price(s) is not None and MM_CENTRAL_LOW <= (_extract_price(s) or 0) <= MM_CENTRAL_HIGH,
+                is_stale=_is_stale_market(s),
+                is_sports=_is_sports_event(s),
+                hours_to_expiry=dir_hrs,
+                snapshot=s,
+            ))
+
+        # ── Filtro de elegibilidad + ranking ────────────────────────────
+
+        # MM: score > 0 + liquidez mínima, ordenado por vol24h DESC
+        mm_eligible = [
+            ms for ms in mm_scored
             if ms.score > 0 and ms.liquidity >= MIN_LIQUIDITY_USD
         ]
+        mm_eligible.sort(key=lambda ms: ms.volume_24h, reverse=True)
+        mm_top = mm_eligible[:self.top_n_mm]
 
-        # ── Ranking Final: Pulso = vol24h DESC ───────────────────────────────
-        # Ordenamos por volumen de las últimas 24h (actividad real HOY),
-        # no por score compuesto, para evitar que el multiplicador ×2.0
-        # eleve artificialmente mercados de bajo volumen con precio central.
-        eligible.sort(key=lambda ms: ms.volume_24h, reverse=True)
+        # Direccional: score > 0, ordenado por score DESC
+        dir_eligible = [
+            ms for ms in dir_scored
+            if ms.score > 0
+        ]
+        dir_eligible.sort(key=lambda ms: ms.score, reverse=True)
+        dir_top = dir_eligible[:self.top_n_directional]
 
-        # all_scored también ordenado por score (para logs/debugging)
-        scored.sort(key=lambda ms: ms.score, reverse=True)
+        # all_scored ordenados por score
+        mm_scored.sort(key=lambda ms: ms.score, reverse=True)
+        dir_scored.sort(key=lambda ms: ms.score, reverse=True)
 
-        # Top N
-        top = eligible[:self.top_n]
-        current_ids = {ms.condition_id for ms in top}
+        # ── Entradas / Salidas ─────────────────────────────────────────
+        mm_current_ids = {ms.condition_id for ms in mm_top}
+        mm_enter = list(mm_current_ids - self._previous_mm_top)
+        mm_exit  = list(self._previous_mm_top - mm_current_ids)
+        self._previous_mm_top = mm_current_ids
 
-        # Detectar entradas y salidas
-        enter_ids = current_ids - self._previous_top
-        exit_ids  = self._previous_top - current_ids
+        dir_current_ids = {ms.condition_id for ms in dir_top}
+        dir_enter = list(dir_current_ids - self._previous_directional_top)
+        dir_exit  = list(self._previous_directional_top - dir_current_ids)
+        self._previous_directional_top = dir_current_ids
 
-        # Actualizar estado
-        self._previous_top = current_ids
-
-        return RankingResult(
-            top=top,
-            all_scored=scored,
-            enter=list(enter_ids),
-            exit=list(exit_ids),
+        return DualRankingResult(
+            mm_top=mm_top,
+            mm_all_scored=mm_scored,
+            mm_enter=mm_enter,
+            mm_exit=mm_exit,
+            directional_top=dir_top,
+            directional_all_scored=dir_scored,
+            directional_enter=dir_enter,
+            directional_exit=dir_exit,
         )
 
-    # ── Consulta ──────────────────────────────────────────────────────────────
+    # ── Consultas ─────────────────────────────────────────────────────────────
 
     def is_top(self, condition_id: str) -> bool:
-        """Verifica si un condition_id está actualmente en el Top N."""
-        return condition_id in self._previous_top
+        """Verifica si un condition_id está en el Top MM."""
+        return condition_id in self._previous_mm_top
 
     def get_top_ids(self) -> set[str]:
-        """Retorna los condition_ids del Top N actual."""
-        return self._previous_top.copy()
+        """Retorna los condition_ids del Top MM actual."""
+        return self._previous_mm_top.copy()
+
+    def get_mm_top_ids(self) -> set[str]:
+        """Retorna los condition_ids del Top MM."""
+        return self._previous_mm_top.copy()
+
+    def get_directional_top_ids(self) -> set[str]:
+        """Retorna los condition_ids del Top Direccional."""
+        return self._previous_directional_top.copy()
