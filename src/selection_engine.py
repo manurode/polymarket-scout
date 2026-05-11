@@ -224,7 +224,7 @@ class MarketScore:
     is_stale: bool
     is_sports: bool = False
     hours_to_expiry: Optional[float] = None
-    snapshot: dict = field(repr=False)
+    snapshot: dict = field(default_factory=dict, repr=False)
 
 
 @dataclass
