@@ -356,6 +356,21 @@ class AsyncPolymarketScanner:
                     else None
                 )
 
+                # ── Tags & category ──
+                market_tags = market.get("tags") or []
+                if isinstance(market_tags, str):
+                    market_tags = self.parse_json_field(market_tags)
+                if not isinstance(market_tags, list):
+                    market_tags = []
+                event_tags = event.get("tags") or []
+                if isinstance(event_tags, str):
+                    event_tags = self.parse_json_field(event_tags)
+                if not isinstance(event_tags, list):
+                    event_tags = []
+                # Merge tags de market y event, deduplicando
+                tags = list(dict.fromkeys([str(t) for t in event_tags + market_tags]))
+                category = market.get("category") or event.get("category") or ""
+
                 snapshots.append({
                     "condition_id": market.get("conditionId", ""),
                     "question": market.get("question", ""),
@@ -372,6 +387,8 @@ class AsyncPolymarketScanner:
                     "timestamp": now,
                     "clobTokenIds": tokens,        # para MM suscripción WS
                     "end_date": self._parse_end_date(market.get("endDate", "")),
+                    "tags": tags,                   # para detección de deportes/política
+                    "category": category,           # categoría del mercado
                 })
 
         return snapshots
