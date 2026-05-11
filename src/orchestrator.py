@@ -919,14 +919,6 @@ class ScoutOrchestrator:
                                 ask_size=quote.ask_size,
                                 strategy="market_making",
                             )
-                            trading_log.mm_quote_registered(
-                                token_id=token_id,
-                                market=f"[MM] {question[:55]}",
-                                bid_price=quote.bid_price,
-                                ask_price=quote.ask_price,
-                                bid_size=quote.bid_size,
-                                ask_size=quote.ask_size,
-                            )
 
                 if quotes_this_cycle > 0:
                     logger.info(
