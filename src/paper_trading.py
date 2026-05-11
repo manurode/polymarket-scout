@@ -249,6 +249,18 @@ class PaperTradingEngine:
             )
             return filled_positions
 
+        # ── Recuperar la ÚNICA quote pendiente para este token ────────────
+        now = time.time()
+        order = self._pending_quotes.get(token_id)
+        if order is None:
+            return filled_positions
+
+        # TTL check
+        if (now - order.created_at) > ORDER_TTL_SECONDS:
+            self._pending_quotes.pop(token_id, None)
+            logger.debug("CrossEngine TTL expired %s: quote #%d eliminada", token_id[:16], order.id)
+            return filled_positions
+
         # ── INVENTORY LOCK: verificar que no haya conflicto de slots ──
         # INDEPENDENT SLOTS (Paper Trading Test): 2 posiciones por token
         #   - Slot MM: exclusivo para strategy="market_making"
@@ -294,18 +306,6 @@ class PaperTradingEngine:
                 token_id[:16], len(mm_positions), len(dir_positions),
                 "MM" if is_mm_fill else "Direccional",
             )
-
-        # ── Recuperar la ÚNICA quote pendiente para este token ────────────
-        now = time.time()
-        order = self._pending_quotes.get(token_id)
-        if order is None:
-            return filled_positions
-
-        # TTL check
-        if (now - order.created_at) > ORDER_TTL_SECONDS:
-            self._pending_quotes.pop(token_id, None)
-            logger.debug("CrossEngine TTL expired %s: quote #%d eliminada", token_id[:16], order.id)
-            return filled_positions
 
         orders_to_fill: list[tuple[VirtualLimitOrder, str, float, float]] = []
 
