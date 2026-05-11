@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+from src.trading_logger import trading_log
 
 # Máximo de órdenes límite activas por token (evita acumulación ilimitada)
 MAX_OPEN_ORDERS_PER_TOKEN = 4
@@ -324,6 +325,13 @@ class PaperTradingEngine:
 
             if pos:
                 filled_positions.append(pos)
+                trading_log.cross_fill(
+                    token_id=token_id,
+                    side=side,
+                    price=fill_price,
+                    size=size,
+                    strategy=order.strategy,
+                )
                 logger.info(
                     "PAPER TRADE EXECUTED | Side: %s | Price: %.4f | Size: $%.0f | "
                     "Market: %s | token: %s | real_bb=%.4f real_ba=%.4f",
@@ -533,6 +541,16 @@ class PaperTradingEngine:
                 except Exception as e:
                     logger.error("Error en on_trade_close callback: %s", e)
 
+            trading_log.position_closed(
+                pos_id=pos.id,
+                strategy=pos.strategy,
+                market=pos.market,
+                pnl=pnl,
+                pnl_pct=pos.pnl_pct / 100.0,
+                reason=reason,
+                exit_price=round(price, 6),
+            )
+
             logger.info(
                 "PaperTrade CLOSE #%d [%s] %s P&L=$%.2f (%.1f%%) slippage=%.1f%% reason=%s",
                 pos.id, pos.strategy, pos.market[:40],
@@ -557,6 +575,12 @@ class PaperTradingEngine:
                 "🎰 BANDIT UPDATE [%s] sortino=%.3f | Asignaciones: %s",
                 updated_strategy, sortino, "  ".join(parts),
             )
+            # ── Trading log ──
+            alloc_dicts = [
+                {"strategy": alloc.strategy, "fraction": alloc.fraction}
+                for alloc in allocations[:4]
+            ]
+            trading_log.bandit_update(alloc_dicts, equity)
         except Exception as e:
             logger.debug("Error logging bandit: %s", e)
 

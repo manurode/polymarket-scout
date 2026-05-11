@@ -42,6 +42,7 @@ from src.paper_trading import PaperTradingEngine
 from src.signal_pipeline import SignalPipeline
 from src.price_history import PriceHistory
 from src.adaptive_strategy_engine import AdaptiveStrategyEngine
+from src.trading_logger import trading_log
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +161,7 @@ class ScoutOrchestrator:
     async def start(self) -> None:
         """Arranca todos los daemons del sistema."""
         logger.info("Scout Lab v2.0 — Arrancando...")
+        trading_log.system_start()
 
         # ── 1. Message Bus ────────────────────────────────────
         if self._bus is None:
@@ -243,6 +245,7 @@ class ScoutOrchestrator:
     async def stop(self) -> None:
         """Detiene todos los daemons."""
         logger.info("Scout Lab v2.0 — Deteniendo...")
+        trading_log.system_stop("user requested")
         self._running = False
 
         for task in self._tasks:
@@ -385,6 +388,38 @@ class ScoutOrchestrator:
                             "condition_id": cid, "timestamp": time.time(),
                         })
 
+                # ── Trading log: descubrimientos ──
+                for cid in ranked.mm_enter:
+                    ms = next((m for m in ranked.mm_top if m.condition_id == cid), None)
+                    if ms and ms.snapshot:
+                        tokens = ms.snapshot.get("clobTokenIds", [])
+                        tid = tokens[0] if isinstance(tokens, list) and tokens else ""
+                        trading_log.market_discovered(
+                            token_id=tid,
+                            condition_id=cid,
+                            question=ms.question,
+                            score=ms.score,
+                            profile="MM",
+                            volume_24h=ms.volume_24h,
+                            price=ms.price,
+                            tags=ms.snapshot.get("tags", []),
+                        )
+                for cid in ranked.directional_enter:
+                    ms = next((m for m in ranked.directional_top if m.condition_id == cid), None)
+                    if ms and ms.snapshot:
+                        tokens = ms.snapshot.get("clobTokenIds", [])
+                        tid = tokens[0] if isinstance(tokens, list) and tokens else ""
+                        trading_log.market_discovered(
+                            token_id=tid,
+                            condition_id=cid,
+                            question=ms.question,
+                            score=ms.score,
+                            profile="DIRECTIONAL",
+                            volume_24h=ms.volume_24h,
+                            price=ms.price,
+                            tags=ms.snapshot.get("tags", []),
+                        )
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -504,6 +539,12 @@ class ScoutOrchestrator:
                     self.paper_trading.record_equity_snapshot()
                     history = self.paper_trading.get_equity_history()
                     last_eq = history[-1]["equity"] if history else 0
+                    trading_log.equity_snapshot(
+                        equity=self.paper_trading.wallet.usdc_total,
+                        total_pnl=self.paper_trading.total_pnl,
+                        unrealized_pnl=self.paper_trading.unrealized_pnl,
+                        open_positions=self.paper_trading.open_position_count,
+                    )
                     logger.debug(
                         "Equity snapshot: $%.2f | total_snapshots=%d",
                         last_eq, len(history),
@@ -598,6 +639,14 @@ class ScoutOrchestrator:
 
                     if pos:
                         executed += 1
+                        trading_log.position_opened(
+                            pos_id=pos.id,
+                            strategy=bandit_strategy,
+                            market=f"[SIG] {sig.question[:55]}",
+                            side=side,
+                            size=size,
+                            entry=entry,
+                        )
                         logger.info(
                             "PaperTrade SIG [%s→%s] %s @ $%.3f size=$%.2f conf=%.2f | %s",
                             sig.strategy, bandit_strategy, side, entry, size,
@@ -870,6 +919,14 @@ class ScoutOrchestrator:
                                 ask_size=quote.ask_size,
                                 strategy="market_making",
                             )
+                            trading_log.mm_quote_registered(
+                                token_id=token_id,
+                                market=f"[MM] {question[:55]}",
+                                bid_price=quote.bid_price,
+                                ask_price=quote.ask_price,
+                                bid_size=quote.bid_size,
+                                ask_size=quote.ask_size,
+                            )
 
                 if quotes_this_cycle > 0:
                     logger.info(
@@ -885,6 +942,7 @@ class ScoutOrchestrator:
             except Exception as e:
                 self._mm_errors += 1
                 logger.error("Error en market making loop: %s", e)
+                trading_log.error("market_making", str(e)[:120])
 
             await asyncio.sleep(MM_QUOTE_INTERVAL)
 
@@ -1123,6 +1181,14 @@ class ScoutOrchestrator:
 
                         if pos:
                             executed_mom += 1
+                            trading_log.position_opened(
+                                pos_id=pos.id,
+                                strategy="momentum_follow",
+                                market=market_name,
+                                side=sig.side,
+                                size=size,
+                                entry=entry,
+                            )
                             logger.info(
                                 "AutExec MOM TRADE #%d [momentum_follow] %s @ %.4f "
                                 "conf=%.2f size=$%.2f | %s",
