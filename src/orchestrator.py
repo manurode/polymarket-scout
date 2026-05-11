@@ -656,6 +656,39 @@ class ScoutOrchestrator:
                     if entry <= 0.01 or entry >= 0.99:
                         continue  # precio extremo
 
+                    # ── Extraer token_id del snapshot para inventory tracking ──
+                    token_id = ""
+                    cid = sig.condition_id
+                    for snap in snapshots:
+                        if snap.get("condition_id") == cid:
+                            tokens = snap.get("clobTokenIds", [])
+                            if isinstance(tokens, list) and tokens:
+                                token_id = tokens[0]
+                            break
+
+                    # ── EXECUTION_BLOCK: verificar inventory slots ──
+                    if token_id:
+                        open_for_token = [
+                            p for p in self.paper_trading._positions
+                            if p.closed_at is None and p.token_id == token_id
+                        ]
+                        dir_slot_occ = any(
+                            p.strategy != "market_making" for p in open_for_token
+                        )
+                        mm_slot_occ = any(
+                            p.strategy == "market_making" for p in open_for_token
+                        )
+                        if dir_slot_occ:
+                            logger.info(
+                                "[EXECUTION_BLOCK] Token=%s Strategy=%s | "
+                                "Reason: Direccional slot occupied (%d pos) | "
+                                "mm_slot=%s",
+                                token_id[:16], sig.strategy,
+                                len([p for p in open_for_token if p.strategy != "market_making"]),
+                                "occupied" if mm_slot_occ else "free",
+                            )
+                            continue
+
                     # Kelly position sizing
                     edge = abs(sig.confidence * 0.07)
                     kelly = self.portfolio_manager.position_size(
@@ -667,6 +700,11 @@ class ScoutOrchestrator:
                     size = min(kelly.size_final, self.paper_trading.wallet.usdc_free * 0.08)
 
                     if size < 50:
+                        logger.debug(
+                            "[DISCARD] SIZE_TOO_SMALL | Strategy=%s Token=%s | "
+                            "size=$%.2f < $50 min",
+                            sig.strategy, token_id[:16] if token_id else cid[:16], size,
+                        )
                         continue  # demasiado pequeño
 
                     pos = await self.paper_trading.open_position(
@@ -675,6 +713,7 @@ class ScoutOrchestrator:
                         side=side,
                         size=size,
                         entry=entry,
+                        token_id=token_id,
                         tau_pct=random.uniform(10, 60),
                         toxicity=random.uniform(0.05, 0.3),
                     )
@@ -967,19 +1006,31 @@ class ScoutOrchestrator:
                             quote.time_decay_scalar,
                         )
 
-                        # ── FIX: Control de Inventario en _market_making_loop ──────
-                        # Bloquear si ya hay posición abierta para este token_id.
+                        # ── FIX: Control de Inventario con Independent Slots ──────
+                        # INDEPENDENT SLOTS (Paper Trading Test): 2 slots por token
+                        #   - Slot MM: strategy="market_making" → exclusivo para MM
+                        #   - Slot Direccional: cualquier otra estrategia → para señales
+                        # Bloquear SOLO si el slot correspondiente ya está ocupado.
                         open_for_token = [
                             p for p in self.paper_trading._positions
                             if p.closed_at is None and p.token_id == token_id
                         ]
-                        if open_for_token:
+                        mm_slot_occupied = any(
+                            p.strategy == "market_making" for p in open_for_token
+                        )
+                        dir_slot_occupied = any(
+                            p.strategy != "market_making" for p in open_for_token
+                        )
+
+                        if mm_slot_occupied:
                             self._mm_quotes_skipped += 1
                             logger.debug(
-                                "MM INV BLOCK %s: ya hay %d posición(es) abierta(s) [%s] — quote no registrada",
+                                "MM INV BLOCK [MM Slot] %s: slot MM ocupado [%s] — quote no registrada",
                                 token_id[:16],
-                                len(open_for_token),
-                                ", ".join(p.side for p in open_for_token),
+                                ", ".join(
+                                    f"{p.side}({p.strategy})" for p in open_for_token
+                                    if p.strategy == "market_making"
+                                ),
                             )
                         else:
                             # ── Cross Engine: registrar como orden límite virtual ────
@@ -1215,55 +1266,100 @@ class ScoutOrchestrator:
                         cooldown_s=180,
                     )
 
-                    for sig in signals:
-                        if open_count + executed_mom >= max_positions:
-                            break
-                        if executed_mom >= 2:  # máx 2 trades momentum por ciclo
+                for sig in signals:
+                    if open_count + executed_mom >= max_positions:
+                        break
+                    if executed_mom >= 2:  # máx 2 trades momentum por ciclo
+                        break
+
+                    entry = sig.entry_price
+                    if entry <= 0.02 or entry >= 0.98:
+                        continue
+
+                    # ── Extraer token_id del snapshot para inventory tracking ──
+                    token_id = ""
+                    cid = sig.condition_id
+                    for snap in dir_filtered_snapshots:
+                        if snap.get("condition_id") == cid:
+                            tokens = snap.get("clobTokenIds", [])
+                            if isinstance(tokens, list) and tokens:
+                                token_id = tokens[0]
                             break
 
-                        entry = sig.entry_price
-                        if entry <= 0.02 or entry >= 0.98:
-                            continue
-
-                        kelly = self.portfolio_manager.position_size(
-                            strategy_name="momentum_follow",
-                            edge=abs(sig.confidence * 0.06),
-                            price=entry,
-                            equity=equity,
+                    # ── EXECUTION_BLOCK: verificar inventory slots ──
+                    if token_id:
+                        open_for_token = [
+                            p for p in self.paper_trading._positions
+                            if p.closed_at is None and p.token_id == token_id
+                        ]
+                        mm_slot_occ = any(
+                            p.strategy == "market_making" for p in open_for_token
                         )
-                        size = min(kelly.size_final, self.paper_trading.wallet.usdc_free * 0.10)
-
-                        if size < 50:
+                        dir_slot_occ = any(
+                            p.strategy != "market_making" for p in open_for_token
+                        )
+                        if dir_slot_occ:
+                            logger.info(
+                                "[EXECUTION_BLOCK] Token=%s Strategy=%s | "
+                                "Reason: Direccional slot occupied (%d pos) | "
+                                "mm_slot=%s",
+                                token_id[:16], sig.strategy,
+                                len([p for p in open_for_token if p.strategy != "market_making"]),
+                                "occupied" if mm_slot_occ else "free",
+                            )
                             continue
+                        if mm_slot_occ:
+                            logger.debug(
+                                "[EXECUTION_BLOCK] Token=%s Strategy=%s | "
+                                "Reason: MM slot occupied BUT dir slot free → proceeding",
+                                token_id[:16], sig.strategy,
+                            )
 
-                        market_name = f"[MOM] {sig.question[:55]}"
+                    kelly = self.portfolio_manager.position_size(
+                        strategy_name="momentum_follow",
+                        edge=abs(sig.confidence * 0.06),
+                        price=entry,
+                        equity=equity,
+                    )
+                    size = min(kelly.size_final, self.paper_trading.wallet.usdc_free * 0.10)
 
-                        pos = await self.paper_trading.open_position(
+                    if size < 50:
+                        logger.debug(
+                            "[DISCARD] SIZE_TOO_SMALL | Strategy=%s Token=%s | "
+                            "size=$%.2f < $50 min",
+                            sig.strategy, token_id[:16] if token_id else cid[:16], size,
+                        )
+                        continue
+
+                    market_name = f"[MOM] {sig.question[:55]}"
+
+                    pos = await self.paper_trading.open_position(
+                        strategy="momentum_follow",
+                        market=market_name,
+                        side=sig.side,
+                        size=size,
+                        entry=entry,
+                        token_id=token_id,
+                        tau_pct=random.uniform(10, 60),
+                        toxicity=random.uniform(0.05, 0.30),
+                    )
+
+                    if pos:
+                        executed_mom += 1
+                        trading_log.position_opened(
+                            pos_id=pos.id,
                             strategy="momentum_follow",
                             market=market_name,
                             side=sig.side,
                             size=size,
                             entry=entry,
-                            tau_pct=random.uniform(10, 60),
-                            toxicity=random.uniform(0.05, 0.30),
                         )
-
-                        if pos:
-                            executed_mom += 1
-                            trading_log.position_opened(
-                                pos_id=pos.id,
-                                strategy="momentum_follow",
-                                market=market_name,
-                                side=sig.side,
-                                size=size,
-                                entry=entry,
-                            )
-                            logger.info(
-                                "AutExec MOM TRADE #%d [momentum_follow] %s @ %.4f "
-                                "conf=%.2f size=$%.2f | %s",
-                                pos.id, sig.side, entry, sig.confidence, size,
-                                sig.reason[:60],
-                            )
+                        logger.info(
+                            "AutExec MOM TRADE #%d [momentum_follow] %s @ %.4f "
+                            "conf=%.2f size=$%.2f | %s",
+                            pos.id, sig.side, entry, sig.confidence, size,
+                            sig.reason[:60],
+                        )
 
                 # ── Log del estado del Bandit cada ciclo ───────────────────────────
                 if executed_mom > 0:

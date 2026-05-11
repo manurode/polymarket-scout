@@ -242,6 +242,9 @@ class PortfolioManager:
         list[Allocation]
             Asignación para cada estrategia.
         """
+        import logging
+        _log = logging.getLogger("portfolio_manager.bandit")
+
         # Muestrear theta_i ~ Beta(1+S_i, 1+F_i) para cada estrategia
         thetas = {}
         for name, state in self._strategies.items():
@@ -255,6 +258,12 @@ class PortfolioManager:
                 alpha = BETA_PRIOR_A + state.successes
                 beta_param = BETA_PRIOR_B + state.failures
                 thetas[name] = random.betavariate(alpha, beta_param)
+
+        # ── BANDIT_CHECK: loggear peso de cada estrategia ──
+        from src.adaptive_strategy_engine import (
+            PAPER_TRADING_HYPERACTIVE, _PT_WEIGHT_CUTOFF,
+        )
+        _weight_cutoff = _PT_WEIGHT_CUTOFF if PAPER_TRADING_HYPERACTIVE else 0.15
 
         # Normalizar y asignar
         total_theta = sum(thetas.values())
@@ -277,6 +286,15 @@ class PortfolioManager:
         allocations = []
         for name, theta in thetas.items():
             fraction = theta / total_theta
+            state = self._strategies[name]
+            status = "BLOCKED" if fraction < _weight_cutoff else "READY"
+            _log.info(
+                "[BANDIT_CHECK] Strategy=%s | Weight=%.4f | "
+                "Threshold=%.4f | Status=%s | "
+                "successes=%d failures=%d state=%s",
+                name, fraction, _weight_cutoff, status,
+                state.successes, state.failures, state.status.value,
+            )
             allocations.append(Allocation(
                 strategy=name,
                 fraction=fraction,

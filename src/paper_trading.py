@@ -249,20 +249,51 @@ class PaperTradingEngine:
             )
             return filled_positions
 
-        # ── INVENTORY LOCK: verificar que NO exista posición abierta para este token ──
+        # ── INVENTORY LOCK: verificar que no haya conflicto de slots ──
+        # INDEPENDENT SLOTS (Paper Trading Test): 2 posiciones por token
+        #   - Slot MM: exclusivo para strategy="market_making"
+        #   - Slot Direccional: para estrategias direccionales (momentum_follow, contrarian, etc.)
+        # Si ambos slots están ocupados, bloquear. Si solo uno está ocupado,
+        # permitir la operación en el otro slot.
         open_positions = [p for p in self._positions if p.closed_at is None]
-        existing_positions = [p for p in open_positions if p.token_id == token_id]
-        if len(existing_positions) >= 1:
-            # Si ya hay posición → borrar la quote pendiente y rechazar
+        token_positions = [p for p in open_positions if p.token_id == token_id]
+
+        is_mm_fill = order.strategy == "market_making"
+        mm_positions = [p for p in token_positions if p.strategy == "market_making"]
+        dir_positions = [p for p in token_positions if p.strategy != "market_making"]
+
+        if is_mm_fill and len(mm_positions) >= 1:
+            # Slot MM ya ocupado → bloquear
             removed = self._pending_quotes.pop(token_id, None)
             if removed:
                 logger.warning(
-                    "CrossEngine INV BLOCK %s: ya existe posición abierta [%s] — quote #%d eliminada, fill rechazado",
+                    "CrossEngine INV BLOCK [MM Slot] %s: slot MM ocupado [%s] — quote #%d rechazada",
                     token_id[:16],
-                    ", ".join(p.side for p in existing_positions),
+                    ", ".join(p.side for p in mm_positions),
                     removed.id,
                 )
             return filled_positions
+
+        if not is_mm_fill and len(dir_positions) >= 1:
+            # Slot Direccional ya ocupado → bloquear
+            removed = self._pending_quotes.pop(token_id, None)
+            if removed:
+                logger.warning(
+                    "CrossEngine INV BLOCK [Dir Slot] %s: slot Direccional ocupado [%s] — quote #%d rechazada",
+                    token_id[:16],
+                    ", ".join(p.side for p in dir_positions),
+                    removed.id,
+                )
+            return filled_positions
+
+        # Slot libre (o el otro slot está libre) → proceder
+        if token_positions:
+            logger.debug(
+                "CrossEngine INDEPENDENT SLOT %s: otro slot ocupado pero este libre | "
+                "mm_slot=%d dir_slot=%d | continuando con %s",
+                token_id[:16], len(mm_positions), len(dir_positions),
+                "MM" if is_mm_fill else "Direccional",
+            )
 
         # ── Recuperar la ÚNICA quote pendiente para este token ────────────
         now = time.time()

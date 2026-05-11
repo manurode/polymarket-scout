@@ -7,3 +7,4 @@ data/polymarket.db-shm
 data/polymarket.db-wal
 data/history/
 .env
+*.log

@@ -341,25 +341,52 @@ class AdaptiveStrategyEngine:
         # 1. Verificar si la estrategia está habilitada
         thresh = self.adaptive_thresholds.get(signal.strategy)
         if thresh and not thresh.enabled:
-            return False, f"Estrategia {signal.strategy} desactivada por bajo rendimiento"
+            reason = f"Estrategia {signal.strategy} desactivada por bajo rendimiento"
+            logger.warning("[DISCARD] %s | Signal=%s conf=%.2f", reason, signal.strategy, signal.confidence)
+            return False, reason
         
         # 2. Verificar confianza mínima adaptativa
         if thresh and signal.confidence < thresh.min_confidence:
-            return False, f"Confianza {signal.confidence:.2f} < mínimo adaptativo {thresh.min_confidence:.2f}"
+            reason = f"Confianza {signal.confidence:.2f} < mínimo adaptativo {thresh.min_confidence:.2f}"
+            logger.info(
+                "[DISCARD] LOW_CONF | Strategy=%s Token=%s | conf=%.4f < min_conf=%.4f",
+                signal.strategy, signal.condition_id[:16],
+                signal.confidence, thresh.min_confidence,
+            )
+            return False, reason
         
         # 3. Verificar fit con régimen del mercado
         regime = self.detect_regime(history)
         
         if regime == MarketRegime.TRENDING and signal.strategy == "mean_reversion":
-            return False, "Mean reversion desactivado en mercado trending"
+            reason = "Mean reversion desactivado en mercado trending"
+            logger.info(
+                "[DISCARD] REGIME_MISMATCH | Strategy=mean_reversion Token=%s | "
+                "Regime=TRENDING → mean_reversion bloqueado",
+                signal.condition_id[:16],
+            )
+            return False, reason
         
         if regime == MarketRegime.RANGING and signal.strategy == "momentum":
-            return False, "Momentum desactivado en mercado ranging"
+            reason = "Momentum desactivado en mercado ranging"
+            logger.info(
+                "[DISCARD] REGIME_MISMATCH | Strategy=momentum Token=%s | "
+                "Regime=RANGING → momentum bloqueado",
+                signal.condition_id[:16],
+            )
+            return False, reason
         
         # 4. Verificar confianza histórica de la estrategia
         perf = self.strategy_perf.get(signal.strategy)
         if perf and perf.confidence < 0.2 and (perf.wins + perf.losses) > 10:
-            return False, f"Confianza histórica baja ({perf.confidence:.2f})"
+            reason = f"Confianza histórica baja ({perf.confidence:.2f})"
+            logger.warning(
+                "[DISCARD] LOW_HISTORICAL_CONF | Strategy=%s | "
+                "historical_conf=%.2f trades=%d win_rate=%.1f%%",
+                signal.strategy, perf.confidence,
+                perf.wins + perf.losses, perf.win_rate * 100,
+            )
+            return False, reason
         
         return True, "OK"
 
@@ -439,8 +466,18 @@ class AdaptiveStrategyEngine:
                 weighted = self.calculate_signal_weight(signal, regime)
                 
                 # Solo incluir si el peso final es suficiente
-                if weighted.final_weight > 0.15:
+                # Usar el cutoff correcto según modo (no hardcodear 0.15)
+                _signal_weight_cutoff = _PT_WEIGHT_CUTOFF if PAPER_TRADING_HYPERACTIVE else 0.15
+                if weighted.final_weight > _signal_weight_cutoff:
                     all_weighted_signals.append(weighted)
+                else:
+                    logger.debug(
+                        "DEBUG: [WEIGHT_DISCARD] Strategy=%s Token=%s | final_weight=%.4f < cutoff=%.4f | "
+                        "conf=%.2f strategy_conf=%.2f regime_fit=%.2f",
+                        signal.strategy, cid[:16],
+                        weighted.final_weight, _signal_weight_cutoff,
+                        signal.confidence, weighted.strategy_confidence, weighted.regime_fit,
+                    )
         
         # Ordenar por peso final y limitar
         all_weighted_signals.sort(key=lambda w: w.final_weight, reverse=True)
@@ -455,7 +492,15 @@ class AdaptiveStrategyEngine:
         for ws in all_weighted_signals[:max_signals]:
             cid = ws.signal.condition_id
             if cid in self.pipeline._last_signal_time:
-                if now - self.pipeline._last_signal_time[cid] < cooldown_s:
+                elapsed = now - self.pipeline._last_signal_time[cid]
+                if elapsed < cooldown_s:
+                    remaining = cooldown_s - elapsed
+                    logger.info(
+                        "[COOLDOWN_BLOCK] Token=%s Strategy=%s | "
+                        "elapsed=%.1fs remaining=%.1fs cooldown=%.0fs",
+                        cid[:16], ws.signal.strategy,
+                        elapsed, remaining, cooldown_s,
+                    )
                     continue
             self.pipeline._last_signal_time[cid] = now
             result.append(ws.signal)
@@ -477,6 +522,9 @@ class AdaptiveStrategyEngine:
         t = thresh.get("momentum")
         if t and t.enabled and mom is not None:
             threshold = t.momentum_threshold
+            # ── Tick Size Check: comparar umbral con movimiento mínimo posible (1/price) ──
+            current_price = history.current_price or 0.5
+            min_tick_impact = (1.0 / current_price) if current_price > 0 else float('inf')
             if abs(mom) > threshold:
                 side = "YES" if mom > 0 else "NO"
                 conf = min(abs(mom) / (threshold * 3), 0.9)
@@ -491,12 +539,24 @@ class AdaptiveStrategyEngine:
                         confidence=round(conf, 2),
                         reason=f"Momentum {mom:+.1%} (umbral: {threshold:.1%})",
                     ))
+            # Siempre loggear el check de tick size para diagnóstico
+            tick_status = "INSIGNIFICANT" if abs(mom) < min_tick_impact else "VALID"
+            logger.debug(
+                "[STRATEGY_SIG] Momentum Token=%s | mom=%.6f | "
+                "threshold=%.6f | min_tick_impact=%.6f (1/price=%.3f) | "
+                "Status=%s",
+                cid[:16], mom, threshold,
+                min_tick_impact, current_price,
+                tick_status,
+            )
         
         # 2. Mean Reversion con umbral adaptativo
         t = thresh.get("mean_reversion")
         if t and t.enabled and history.ma and history.current_price and len(history.prices) >= 8:
             deviation = (history.current_price - history.ma) / history.ma if history.ma > 0 else 0
             threshold = t.mean_rev_deviation
+            # ── Tick Size Check ──
+            min_tick_dev = (1.0 / history.current_price) if history.current_price > 0 else float('inf')
             if abs(deviation) > threshold:
                 side = "NO" if deviation > 0 else "YES"
                 conf = min(abs(deviation) / (threshold * 2), 0.8)
@@ -511,6 +571,15 @@ class AdaptiveStrategyEngine:
                         confidence=round(conf, 2),
                         reason=f"Reversion {deviation:+.1%} de MA (umbral: {threshold:.1%})",
                     ))
+            tick_status_mr = "INSIGNIFICANT" if abs(deviation) < min_tick_dev else "VALID"
+            logger.debug(
+                "[STRATEGY_SIG] MeanReversion Token=%s | dev=%.6f | "
+                "threshold=%.6f | min_tick_impact=%.6f | "
+                "price=%.4f MA=%.4f | Status=%s",
+                cid[:16], deviation, threshold, min_tick_dev,
+                history.current_price, history.ma,
+                tick_status_mr,
+            )
         
         # 3. Volume Breakout con umbral adaptativo
         t = thresh.get("volume_breakout")
