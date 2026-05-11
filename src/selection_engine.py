@@ -68,6 +68,16 @@ MIN_VOL24H_FOR_SPREAD_GRACE = 1_000.0
 EXPIRY_WARN_HOURS           = 24
 NEW_MARKET_WINDOW_HOURS     = 48
 
+# ── Filtro de Seguridad de Volumen Mínimo ────────────────────────────────────
+# Mercados con vol24h por debajo de este umbral son «fantasmas»:
+# sin liquidez orgánica real, generan señales falsas y slippage inasumible.
+MIN_VOLUME_24H_THRESHOLD    = 5_000.0  # USD — umbral de seguridad global
+MM_NICHE_CLOB_DEPTH         = 2_000.0  # USD — excepción MM: si el book CLOB
+                                        #   tiene >$2K de profundidad, el MM
+                                        #   puede operar aunque vol24h sea bajo
+MM_LOW_VOL_PENALTY          = 0.10     # ×0.10 — penalización soft para MM en
+                                        #   mercados con vol24h < umbral
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Constantes — Perfil Direccional
@@ -85,7 +95,7 @@ DIRECTIONAL_FAR_EXPIRY_DAYS      = 30        # >30 días → empieza a penalizar
 DIRECTIONAL_FAR_EXPIRY_MULTIPLIER = 0.01     # ×0.01 si expira en >6 meses (2025/2026)
 DIRECTIONAL_NEAR_TERM_MULTIPLIER  = 3.0      # ×3.0 si expira en ≤7 días
 DIRECTIONAL_MIN_LIQUIDITY         = 200.0     # Liquidez mínima más laxa para direccional
-DIRECTIONAL_MIN_VOL24H            = 500.0     # Volumen 24h mínimo
+DIRECTIONAL_MIN_VOL24H            = MIN_VOLUME_24H_THRESHOLD  # $5K — umbral de seguridad
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -224,6 +234,7 @@ class MarketScore:
     is_stale: bool
     is_sports: bool = False
     hours_to_expiry: Optional[float] = None
+    is_low_vol: bool = False            # True si vol24h < MIN_VOLUME_24H_THRESHOLD
     snapshot: dict = field(default_factory=dict, repr=False)
 
 
@@ -248,6 +259,9 @@ class DualRankingResult:
     directional_all_scored: list[MarketScore]
     directional_enter: list[str]
     directional_exit: list[str]
+
+    # Watchlist para MM niche: mercados con vol24h bajo pero potencial CLOB profundo
+    mm_low_vol_watchlist: list[MarketScore] = field(default_factory=list)
 
     # Compatibilidad con código legacy: .top apunta a mm_top
     @property
@@ -421,6 +435,12 @@ class SelectionEngine:
         if hours_left is not None and 0 < hours_left < MM_IMMINENT_EXPIRY_HOURS:
             base_score *= MM_IMMINENT_EXPIRY_MULTIPLIER
 
+        # 6. ⛔ Filtro de Seguridad: penalización soft por volumen bajo
+        #    Mercados con vol24h < $5K son «fantasmas» — el MM solo opera
+        #    si el CLOB confirma >$2K de profundidad (vía MM loop).
+        if volume_24h < MIN_VOLUME_24H_THRESHOLD:
+            base_score *= MM_LOW_VOL_PENALTY  # ×0.10
+
         return base_score, is_central_range, is_stale, is_sports, hours_left
 
     # ── Perfil Direccional: Scoring ───────────────────────────────────────────
@@ -541,6 +561,9 @@ class SelectionEngine:
         dir_scored: list[MarketScore] = []
 
         for s in snapshots:
+            vol24 = s.get("volume_24h", 0) or 0
+            is_low_vol = vol24 < MIN_VOLUME_24H_THRESHOLD
+
             # ── MM Score ──────────────────────────────────────────────
             mm_score, is_central, is_stale, is_sports, hrs_left = self._compute_mm_score(
                 s, max_vol_24h, max_liquidity, max_order_count,
@@ -550,7 +573,7 @@ class SelectionEngine:
                 question=s.get("question", ""),
                 slug=s.get("slug", ""),
                 volume=s.get("volume", 0) or 0,
-                volume_24h=s.get("volume_24h", 0) or 0,
+                volume_24h=vol24,
                 liquidity=s.get("liquidity", 0) or 0,
                 spread=_parse_spread(s),
                 order_count=s.get("order_count", 0) or 0,
@@ -560,6 +583,7 @@ class SelectionEngine:
                 is_stale=is_stale,
                 is_sports=is_sports,
                 hours_to_expiry=hrs_left,
+                is_low_vol=is_low_vol,
                 snapshot=s,
             ))
 
@@ -572,7 +596,7 @@ class SelectionEngine:
                 question=s.get("question", ""),
                 slug=s.get("slug", ""),
                 volume=s.get("volume", 0) or 0,
-                volume_24h=s.get("volume_24h", 0) or 0,
+                volume_24h=vol24,
                 liquidity=s.get("liquidity", 0) or 0,
                 spread=_parse_spread(s),
                 order_count=s.get("order_count", 0) or 0,
@@ -582,6 +606,7 @@ class SelectionEngine:
                 is_stale=_is_stale_market(s),
                 is_sports=_is_sports_event(s),
                 hours_to_expiry=dir_hrs,
+                is_low_vol=is_low_vol,
                 snapshot=s,
             ))
 
@@ -618,6 +643,14 @@ class SelectionEngine:
         dir_exit  = list(self._previous_directional_top - dir_current_ids)
         self._previous_directional_top = dir_current_ids
 
+        # ── MM Niche Watchlist ────────────────────────────────────────
+        # Mercados con vol24h bajo pero que pasaron los demás Hard Gates.
+        # El MM loop los revisará contra el CLOB: si depth > $2K, los promueve.
+        mm_low_vol_watchlist = [
+            ms for ms in mm_scored
+            if ms.is_low_vol and ms.score > 0 and ms.liquidity >= MIN_LIQUIDITY_USD
+        ]
+
         return DualRankingResult(
             mm_top=mm_top,
             mm_all_scored=mm_scored,
@@ -627,6 +660,7 @@ class SelectionEngine:
             directional_all_scored=dir_scored,
             directional_enter=dir_enter,
             directional_exit=dir_exit,
+            mm_low_vol_watchlist=mm_low_vol_watchlist,
         )
 
     # ── Consultas ─────────────────────────────────────────────────────────────

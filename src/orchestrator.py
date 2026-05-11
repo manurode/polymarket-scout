@@ -25,7 +25,7 @@ import time
 from typing import Optional
 
 from src.async_scanner import AsyncPolymarketScanner
-from src.selection_engine import SelectionEngine
+from src.selection_engine import SelectionEngine, MIN_VOLUME_24H_THRESHOLD, MM_NICHE_CLOB_DEPTH
 from src.rate_limiter import RateLimiter
 from src.book_analyzer import BookAnalyzer
 from src.trade_aggregator import TradeAggregator
@@ -146,6 +146,7 @@ class ScoutOrchestrator:
         self._last_radar_snapshots: list[dict] = []
         self._last_mm_markets: list = []          # MarketScore list for MM
         self._last_directional_markets: list = []  # MarketScore list for Directional
+        self._mm_low_vol_watchlist: list = []      # MM niche: low vol pero potencial CLOB profundo
         self._last_l2_seed_time: float = 0.0  # timestamp del último seeding REST de L2
 
         # ── Market Making State ───────────────────────────────────────────────────
@@ -299,6 +300,7 @@ class ScoutOrchestrator:
                 self._last_radar_snapshots = snapshots
                 self._last_mm_markets = ranked.mm_top
                 self._last_directional_markets = ranked.directional_top
+                self._mm_low_vol_watchlist = ranked.mm_low_vol_watchlist
 
                 # ── Guardar precios reales para mark-to-market ──
                 for snap in snapshots:
@@ -352,6 +354,31 @@ class ScoutOrchestrator:
                             ms.question[:65],
                         )
                     logger.info("─" * 75)
+
+                # ── Liquidity Guard: log de descartes por volumen ──
+                dir_discarded = [
+                    ms for ms in ranked.directional_all_scored
+                    if ms.score == 0 and ms.is_low_vol
+                ]
+                if dir_discarded:
+                    logger.debug(
+                        "[LIQUIDITY_GUARD] Direccional: %d mercados descartados por vol24h < $%d",
+                        len(dir_discarded), int(MIN_VOLUME_24H_THRESHOLD),
+                    )
+                    for ms in dir_discarded[:5]:  # solo los primeros 5 para no spamear
+                        tid = ""
+                        tokens = ms.snapshot.get("clobTokenIds", [])
+                        if isinstance(tokens, list) and tokens:
+                            tid = str(tokens[0])[:16]
+                        logger.debug(
+                            "[LIQUIDITY_GUARD] Descartado token=%s | Vol24h=$%.0f | Razón: Low Liquidity (Dir)",
+                            tid, ms.volume_24h,
+                        )
+                if ranked.mm_low_vol_watchlist:
+                    logger.debug(
+                        "[LIQUIDITY_GUARD] MM watchlist: %d mercados con vol24h bajo pendientes de validación CLOB",
+                        len(ranked.mm_low_vol_watchlist),
+                    )
 
                 # Publicar en el bus
                 if self._bus:
@@ -476,7 +503,22 @@ class ScoutOrchestrator:
                 await asyncio.sleep(epoch_seconds)
                 if self._running:
                     self.portfolio_manager.epoch_tick()
-                    logger.info("Portfolio: época %d avanzada", self.portfolio_manager.current_epoch)
+                    # ── Capital Preservation Check ──
+                    # Si no hubo trades, es por el filtro de liquidez, no por fallo.
+                    active_strats = self.portfolio_manager.get_active_strategies()
+                    total_trades = sum(
+                        len(self.paper_trading._trade_history) for _ in [1]
+                    ) if self.paper_trading else 0
+                    if total_trades == 0 and self.paper_trading:
+                        # Contar trades reales
+                        total_trades = len(self.paper_trading._trade_history)
+                    logger.info(
+                        "Portfolio: época %d avanzada | trades=%d | estrategias activas=%d | %s",
+                        self.portfolio_manager.current_epoch,
+                        total_trades,
+                        len(active_strats),
+                        "🛡️ CAPITAL PRESERVATION" if total_trades == 0 else "⚡ ACTIVE TRADING",
+                    )
             except asyncio.CancelledError:
                 break
 
@@ -750,6 +792,41 @@ class ScoutOrchestrator:
                         await self.ws_manager._flush_market_subscription()
                     except Exception as e:
                         logger.debug("MM flush market error: %s", e)
+
+                # ── MM Niche: promover mercados de watchlist con CLOB profundo ──
+                # Mercados con vol24h < $5K pero book depth > $2K merecen MM.
+                for niche_ms in self._mm_low_vol_watchlist[:5]:  # máx 5 por ciclo
+                    tokens = niche_ms.snapshot.get("clobTokenIds", [])
+                    if not isinstance(tokens, list) or not tokens:
+                        continue
+                    tid = tokens[0]
+                    if tid in self._mm_active_tokens:
+                        continue  # ya está suscrito
+                    # Verificar si el BookAnalyzer ya tiene datos (vía L2 seed o WS)
+                    book_snap = self.book_analyzer.get_book(tid) if self.book_analyzer else None
+                    if not book_snap or book_snap.bid_count == 0 or book_snap.ask_count == 0:
+                        continue
+                    bb_size = float(book_snap.bids[0, 1])
+                    ba_size = float(book_snap.asks[0, 1])
+                    clob_depth = bb_size + ba_size
+                    if clob_depth >= MM_NICHE_CLOB_DEPTH:
+                        # Promover: suscribir al WS y añadir a activos
+                        try:
+                            await self.ws_manager.subscribe_book(
+                                tid,
+                                condition_id=niche_ms.condition_id,
+                                fetch_snapshot=True,
+                            )
+                            self._mm_active_tokens.add(tid)
+                            token_to_snap[tid] = niche_ms.snapshot
+                            logger.info(
+                                "🔬 MM NICHE PROMOTED token=%s | vol24h=$%.0f < $%d BUT clob_depth=$%.0f ≥ $%d | %s",
+                                tid[:16], niche_ms.volume_24h, int(MIN_VOLUME_24H_THRESHOLD),
+                                clob_depth, int(MM_NICHE_CLOB_DEPTH),
+                                niche_ms.question[:60],
+                            )
+                        except Exception as e:
+                            logger.debug("MM niche subscribe error %s: %s", tid, e)
 
                 # ── Generar quotes para mercados activos ────────
                 quotes_this_cycle = 0
