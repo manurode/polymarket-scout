@@ -688,6 +688,16 @@ class ScoutOrchestrator:
                                 "occupied" if mm_slot_occ else "free",
                             )
                             continue
+                        # ── M3: Override — DIRECTIONAL > MM ──
+                        if mm_slot_occ:
+                            cancelled = self.cancel_active_quotes(token_id)
+                            logger.info(
+                                "[OVERRIDE] Token=%s | Action=Halting MM | "
+                                "Reason=Directional Signal Triggered (%s) | "
+                                "MM quotes_cancelled=%s",
+                                token_id[:16], sig.strategy,
+                                "yes" if cancelled else "no quotes",
+                            )
 
                     # Kelly position sizing
                     edge = abs(sig.confidence * 0.07)
@@ -706,6 +716,32 @@ class ScoutOrchestrator:
                             sig.strategy, token_id[:16] if token_id else cid[:16], size,
                         )
                         continue  # demasiado pequeño
+
+                    # ── M4: Slippage & Economic Validation ────────────────────
+                    if token_id and self.book_analyzer:
+                        book_snap = self.book_analyzer.get_book(token_id)
+                        if book_snap and book_snap.bid_count > 0 and book_snap.ask_count > 0:
+                            real_ba = float(book_snap.asks[0, 0])
+                            real_bb = float(book_snap.bids[0, 0])
+                            bb_sz = float(book_snap.bids[0, 1])
+                            ba_sz = float(book_snap.asks[0, 1])
+                            total_sz = bb_sz + ba_sz
+                            if total_sz > 0 and real_ba > real_bb:
+                                real_micro_price = (real_bb * ba_sz + real_ba * bb_sz) / total_sz
+                                expected_spread_cost = (real_ba - real_bb) / real_micro_price if real_micro_price > 0 else 1.0
+                                target_pnl = sig.confidence * size * 0.05
+                                if target_pnl <= expected_spread_cost * size:
+                                    logger.debug(
+                                        "[SKIP_DIR] Token=%s | Reason=Spread_Too_Wide "
+                                        "(Spread: %.1f%% > Target: %.1f%%) | "
+                                        "expected_spread_cost=$%.2f > target_pnl=$%.2f",
+                                        token_id[:16],
+                                        expected_spread_cost * 100,
+                                        (target_pnl / size * 100) if size > 0 else 0,
+                                        expected_spread_cost * size,
+                                        target_pnl,
+                                    )
+                                    continue
 
                     pos = await self.paper_trading.open_position(
                         strategy=bandit_strategy,
@@ -1309,12 +1345,18 @@ class ScoutOrchestrator:
                                 "occupied" if mm_slot_occ else "free",
                             )
                             continue
+                        # ── M3: Override — DIRECTIONAL > MM ──
                         if mm_slot_occ:
-                            logger.debug(
-                                "[EXECUTION_BLOCK] Token=%s Strategy=%s | "
-                                "Reason: MM slot occupied BUT dir slot free → proceeding",
+                            # Cancelar quotes activas del MM y liberar el slot
+                            cancelled = self.cancel_active_quotes(token_id)
+                            logger.info(
+                                "[OVERRIDE] Token=%s | Action=Halting MM | "
+                                "Reason=Directional Signal Triggered (%s) | "
+                                "MM quotes_cancelled=%s | dir_slot=free → proceeding",
                                 token_id[:16], sig.strategy,
+                                "yes" if cancelled else "no quotes",
                             )
+                            # El MM slot queda liberado; el direccional puede operar
 
                     kelly = self.portfolio_manager.position_size(
                         strategy_name="momentum_follow",
@@ -1331,6 +1373,34 @@ class ScoutOrchestrator:
                             sig.strategy, token_id[:16] if token_id else cid[:16], size,
                         )
                         continue
+
+                    # ── M4: Slippage & Economic Validation ────────────────────
+                    # Antes de ejecutar: Expected_Spread_Cost vs Target_PnL
+                    if token_id and self.book_analyzer:
+                        book_snap = self.book_analyzer.get_book(token_id)
+                        if book_snap and book_snap.bid_count > 0 and book_snap.ask_count > 0:
+                            real_ba = float(book_snap.asks[0, 0])
+                            real_bb = float(book_snap.bids[0, 0])
+                            bb_sz = float(book_snap.bids[0, 1])
+                            ba_sz = float(book_snap.asks[0, 1])
+                            total_sz = bb_sz + ba_sz
+                            if total_sz > 0 and real_ba > real_bb:
+                                real_micro_price = (real_bb * ba_sz + real_ba * bb_sz) / total_sz
+                                expected_spread_cost = (real_ba - real_bb) / real_micro_price if real_micro_price > 0 else 1.0
+                                # Target_PnL estimado: señal conf * size * 0.05
+                                target_pnl = sig.confidence * size * 0.05
+                                if target_pnl <= expected_spread_cost * size:
+                                    logger.debug(
+                                        "[SKIP_DIR] Token=%s | Reason=Spread_Too_Wide "
+                                        "(Spread: %.1f%% > Target: %.1f%%) | "
+                                        "expected_spread_cost=$%.2f > target_pnl=$%.2f",
+                                        token_id[:16],
+                                        expected_spread_cost * 100,
+                                        (target_pnl / size * 100) if size > 0 else 0,
+                                        expected_spread_cost * size,
+                                        target_pnl,
+                                    )
+                                    continue
 
                     market_name = f"[MOM] {sig.question[:55]}"
 
@@ -1462,6 +1532,61 @@ class ScoutOrchestrator:
             self.adaptive_engine.update_from_trade(strategy, pnl)
         except Exception as e:
             logger.error("Error actualizando adaptive engine desde trade: %s", e)
+
+    # ── M3: Inventory Manager — Jerarquía Anti-Canibalización ───────────────────
+    # DIRECTIONAL > MM: cuando una estrategia direccional emite una señal válida,
+    # el MM debe ceder el slot. Este método cancela las quotes activas del MM
+    # y libera el _pending_quotes para que el direccional pueda operar.
+
+    def cancel_active_quotes(self, token_id: str) -> bool:
+        """Cancela las quotes activas del Market Maker para un token específico.
+
+        Parameters
+        ----------
+        token_id : str
+            ID del token cuyas quotes de MM se cancelan.
+
+        Returns
+        -------
+        bool
+            True si se canceló al menos una quote, False si no había ninguna.
+        """
+        cancelled = False
+
+        # 1. Cancelar en PaperTradingEngine (pending quotes)
+        if token_id in self.paper_trading._pending_quotes:
+            removed = self.paper_trading._pending_quotes.pop(token_id, None)
+            if removed:
+                cancelled = True
+                logger.info(
+                    "[OVERRIDE] Token=%s | Action=Halting MM | "
+                    "Reason=Directional Signal Triggered | "
+                    "MM quote #%d cancelada (bid=%.4f ask=%.4f)",
+                    token_id[:16], removed.id,
+                    removed.bid_price, removed.ask_price,
+                )
+
+        # 2. Cancelar en MarketMaker (pausar + limpiar estado)
+        if self.market_maker:
+            try:
+                from src.market_making import REENTRY_DELAY as MM_REENTRY_DELAY
+                state = self.market_maker.get_state(token_id)
+                if state:
+                    import time as _time
+                    self.market_maker._pause(
+                        token_id, "",
+                        MM_REENTRY_DELAY * 2,  # 60s de pausa
+                        "directional_override",
+                        _time.time(),
+                    )
+                    logger.debug(
+                        "[OVERRIDE] Token=%s | MM pausado %ds por directional_override",
+                        token_id[:16], MM_REENTRY_DELAY * 2,
+                    )
+            except Exception as e:
+                logger.debug("Error pausando MM en override: %s", e)
+
+        return cancelled
 
     # ── Trading Pipeline ──────────────────────────────────────────────────────────────────────────────
 

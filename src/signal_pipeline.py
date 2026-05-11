@@ -92,6 +92,21 @@ class MarketHistory:
             return None
         return sum(self.spreads) / len(self.spreads)
 
+    @property
+    def recent_volume_ma(self) -> float | None:
+        """Media móvil de volumen en la ventana de historia. Usado para confluencia."""
+        if len(self.volumes) < 3:
+            return None
+        # Excluir el último (volumen actual) de la MA para evitar sesgo
+        if len(self.volumes) >= 4:
+            return sum(self.volumes[:-1]) / (len(self.volumes) - 1)
+        return sum(self.volumes) / len(self.volumes)
+
+    @property
+    def recent_volume_3min(self) -> float:
+        """Volumen más reciente (último snapshot)."""
+        return self.volumes[-1] if self.volumes else 0.0
+
 
 @dataclass
 class Signal:

@@ -47,6 +47,15 @@ _PT_MIN_CONFIDENCE     = 0.05        # 5%    (vs 30% en prod)
 _PT_WEIGHT_CUTOFF      = 0.05        # 5%    (vs 15% en prod)
 _PT_SIGNAL_COOLDOWN    = 30          # 30s   (vs 120s en prod)
 
+# ── M2: Tick-Size Dinámico — Paradoja del centavo ──────────────────────
+# En tokens con precio < $0.10, un umbral fijo del 0.2% es matemáticamente
+# imposible: 1 tick ($0.001) ya representa ~3.3%. En lugar de porcentaje,
+# exigimos CONFLUENCIA: volumen anómalo + movimiento real de al menos 1 tick.
+TICK_SIZE_PRICE_CUTOFF = 0.10        # Precio bajo este umbral → usar confluencia
+TICK_SIZE = 0.001                    # Tick size de Polymarket (mínimo movimiento)
+TICK_CONFLUENCE_VOL_RATIO = 2.5      # Vol_3min / MA_1h debe exceder este ratio
+TICK_CONFLUENCE_MIN_TICKS = 1.0      # Mínimo de ticks de movimiento direccional
+
 
 # ── Tipos ──────────────────────────────────────────────────────────────────
 
@@ -517,69 +526,184 @@ class AdaptiveStrategyEngine:
         signals = []
         thresh = self.adaptive_thresholds
         
-        # 1. Momentum con umbral adaptativo
+        # 1. Momentum con umbral adaptativo (o confluencia para precios < $0.10)
         mom = history.momentum
         t = thresh.get("momentum")
         if t and t.enabled and mom is not None:
             threshold = t.momentum_threshold
-            # ── Tick Size Check: comparar umbral con movimiento mínimo posible (1/price) ──
             current_price = history.current_price or 0.5
-            min_tick_impact = (1.0 / current_price) if current_price > 0 else float('inf')
-            if abs(mom) > threshold:
-                side = "YES" if mom > 0 else "NO"
-                conf = min(abs(mom) / (threshold * 3), 0.9)
-                if conf > t.min_confidence:
-                    signals.append(Signal(
-                        market=history.question[:60],
-                        question=history.question,
-                        condition_id=cid,
-                        strategy="momentum",
-                        side=side,
-                        entry_price=history.current_price or 0,
-                        confidence=round(conf, 2),
-                        reason=f"Momentum {mom:+.1%} (umbral: {threshold:.1%})",
-                    ))
-            # Siempre loggear el check de tick size para diagnóstico
-            tick_status = "INSIGNIFICANT" if abs(mom) < min_tick_impact else "VALID"
-            logger.debug(
-                "[STRATEGY_SIG] Momentum Token=%s | mom=%.6f | "
-                "threshold=%.6f | min_tick_impact=%.6f (1/price=%.3f) | "
-                "Status=%s",
-                cid[:16], mom, threshold,
-                min_tick_impact, current_price,
-                tick_status,
-            )
+            min_tick_impact = (TICK_SIZE / current_price) if current_price > 0 else float('inf')
+
+            # ── M2: Tick-Size Dinámico — Confluencia para precios < TICK_SIZE_PRICE_CUTOFF ──
+            use_confluence = current_price > 0 and current_price < TICK_SIZE_PRICE_CUTOFF
+
+            if use_confluence:
+                # Condición A (Volumen): vol_3min > 2.5× MA_1h
+                vol_ma = history.recent_volume_ma
+                vol_3min = history.recent_volume_3min
+                cond_vol = (
+                    vol_ma is not None and vol_ma > 0
+                    and (vol_3min / vol_ma) >= TICK_CONFLUENCE_VOL_RATIO
+                )
+                # Condición B (Precio): movimiento ≥ 1 tick en la dirección de la tendencia
+                price_move_tickworthy = abs(mom) >= min_tick_impact
+
+                if cond_vol and price_move_tickworthy:
+                    side = "YES" if mom > 0 else "NO"
+                    conf = min(abs(mom) / (min_tick_impact * 3), 0.9)
+                    if conf > t.min_confidence:
+                        signals.append(Signal(
+                            market=history.question[:60],
+                            question=history.question,
+                            condition_id=cid,
+                            strategy="momentum",
+                            side=side,
+                            entry_price=current_price,
+                            confidence=round(conf, 2),
+                            reason=(
+                                f"TickConfluence mom={mom:+.1%} tick_impact={min_tick_impact:.1%} "
+                                f"vol={vol_3min:.0f}/{vol_ma:.0f}={vol_3min/vol_ma:.1f}x"
+                            ),
+                        ))
+                    tick_status = "VALID (CONFLUENCE)"
+                else:
+                    reason_parts = []
+                    if not cond_vol:
+                        reason_parts.append(f"volume={vol_3min/vol_ma:.1f}x < {TICK_CONFLUENCE_VOL_RATIO}x" if vol_ma and vol_ma > 0 else "vol_ma=None")
+                    if not price_move_tickworthy:
+                        reason_parts.append(f"mom={abs(mom):.6f} < tick_impact={min_tick_impact:.6f}")
+                    tick_status = f"INSIGNIFICANT (confluence failed: {'; '.join(reason_parts)})"
+                    logger.debug(
+                        "[SKIP_DIR] Token=%s | Reason=Tick_Size_Conflict "
+                        "(Threshold=%.6f < Min_Tick=%.6f, Price=$%.4f) | "
+                        "vol_3min=%.0f vol_MA=%.0f cond_vol=%s cond_price=%s",
+                        cid[:16], abs(mom), min_tick_impact, current_price,
+                        vol_3min, vol_ma or 0, cond_vol, price_move_tickworthy,
+                    )
+
+                logger.debug(
+                    "[STRATEGY_SIG] Momentum Token=%s | mom=%.6f | "
+                    "threshold=%.6f | min_tick_impact=%.6f (1/price=%.3f) | "
+                    "confluence=%s | Status=%s",
+                    cid[:16], mom, threshold,
+                    min_tick_impact, current_price,
+                    "ON" if use_confluence else "OFF",
+                    tick_status,
+                )
+            else:
+                # ── Ruta clásica (precio ≥ $0.10): umbral porcentual fijo ──
+                if abs(mom) > threshold:
+                    side = "YES" if mom > 0 else "NO"
+                    conf = min(abs(mom) / (threshold * 3), 0.9)
+                    if conf > t.min_confidence:
+                        signals.append(Signal(
+                            market=history.question[:60],
+                            question=history.question,
+                            condition_id=cid,
+                            strategy="momentum",
+                            side=side,
+                            entry_price=history.current_price or 0,
+                            confidence=round(conf, 2),
+                            reason=f"Momentum {mom:+.1%} (umbral: {threshold:.1%})",
+                        ))
+                tick_status = "INSIGNIFICANT" if abs(mom) < min_tick_impact else "VALID"
+                logger.debug(
+                    "[STRATEGY_SIG] Momentum Token=%s | mom=%.6f | "
+                    "threshold=%.6f | min_tick_impact=%.6f (1/price=%.3f) | "
+                    "confluence=OFF | Status=%s",
+                    cid[:16], mom, threshold,
+                    min_tick_impact, current_price,
+                    tick_status,
+                )
         
-        # 2. Mean Reversion con umbral adaptativo
+        # 2. Mean Reversion con umbral adaptativo (o confluencia para precios < $0.10)
         t = thresh.get("mean_reversion")
         if t and t.enabled and history.ma and history.current_price and len(history.prices) >= 8:
             deviation = (history.current_price - history.ma) / history.ma if history.ma > 0 else 0
             threshold = t.mean_rev_deviation
             # ── Tick Size Check ──
-            min_tick_dev = (1.0 / history.current_price) if history.current_price > 0 else float('inf')
-            if abs(deviation) > threshold:
-                side = "NO" if deviation > 0 else "YES"
-                conf = min(abs(deviation) / (threshold * 2), 0.8)
-                if conf > t.min_confidence:
-                    signals.append(Signal(
-                        market=history.question[:60],
-                        question=history.question,
-                        condition_id=cid,
-                        strategy="mean_reversion",
-                        side=side,
-                        entry_price=history.current_price,
-                        confidence=round(conf, 2),
-                        reason=f"Reversion {deviation:+.1%} de MA (umbral: {threshold:.1%})",
-                    ))
-            tick_status_mr = "INSIGNIFICANT" if abs(deviation) < min_tick_dev else "VALID"
-            logger.debug(
-                "[STRATEGY_SIG] MeanReversion Token=%s | dev=%.6f | "
-                "threshold=%.6f | min_tick_impact=%.6f | "
-                "price=%.4f MA=%.4f | Status=%s",
-                cid[:16], deviation, threshold, min_tick_dev,
-                history.current_price, history.ma,
-                tick_status_mr,
-            )
+            current_price = history.current_price
+            min_tick_dev = (TICK_SIZE / current_price) if current_price > 0 else float('inf')
+            use_confluence = current_price > 0 and current_price < TICK_SIZE_PRICE_CUTOFF
+
+            if use_confluence:
+                # Condición A (Volumen): vol_3min > 2.5× MA_1h
+                vol_ma = history.recent_volume_ma
+                vol_3min = history.recent_volume_3min
+                cond_vol = (
+                    vol_ma is not None and vol_ma > 0
+                    and (vol_3min / vol_ma) >= TICK_CONFLUENCE_VOL_RATIO
+                )
+                # Condición B (Precio): desviación ≥ 1 tick
+                price_dev_tickworthy = abs(deviation) >= min_tick_dev
+
+                if cond_vol and price_dev_tickworthy:
+                    side = "NO" if deviation > 0 else "YES"
+                    conf = min(abs(deviation) / (min_tick_dev * 2), 0.8)
+                    if conf > t.min_confidence:
+                        signals.append(Signal(
+                            market=history.question[:60],
+                            question=history.question,
+                            condition_id=cid,
+                            strategy="mean_reversion",
+                            side=side,
+                            entry_price=current_price,
+                            confidence=round(conf, 2),
+                            reason=(
+                                f"TickConfluence dev={deviation:+.1%} tick_dev={min_tick_dev:.1%} "
+                                f"vol={vol_3min:.0f}/{vol_ma:.0f}={vol_3min/vol_ma:.1f}x"
+                            ),
+                        ))
+                    tick_status_mr = "VALID (CONFLUENCE)"
+                else:
+                    reason_parts = []
+                    if not cond_vol:
+                        reason_parts.append(f"volume insensitive")
+                    if not price_dev_tickworthy:
+                        reason_parts.append(f"dev={abs(deviation):.6f} < tick_dev={min_tick_dev:.6f}")
+                    tick_status_mr = f"INSIGNIFICANT (confluence failed)"
+                    logger.debug(
+                        "[SKIP_DIR] Token=%s | Reason=Tick_Size_Conflict_MR "
+                        "(Deviation=%.6f < Min_Tick=%.6f, Price=$%.4f) | "
+                        "vol_3min=%.0f vol_MA=%.0f",
+                        cid[:16], abs(deviation), min_tick_dev, current_price,
+                        vol_3min, vol_ma or 0,
+                    )
+
+                logger.debug(
+                    "[STRATEGY_SIG] MeanReversion Token=%s | dev=%.6f | "
+                    "threshold=%.6f | min_tick_impact=%.6f | "
+                    "price=%.4f MA=%.4f | confluence=%s | Status=%s",
+                    cid[:16], deviation, threshold, min_tick_dev,
+                    current_price, history.ma,
+                    "ON" if use_confluence else "OFF",
+                    tick_status_mr,
+                )
+            else:
+                # ── Ruta clásica (precio ≥ $0.10): umbral porcentual fijo ──
+                if abs(deviation) > threshold:
+                    side = "NO" if deviation > 0 else "YES"
+                    conf = min(abs(deviation) / (threshold * 2), 0.8)
+                    if conf > t.min_confidence:
+                        signals.append(Signal(
+                            market=history.question[:60],
+                            question=history.question,
+                            condition_id=cid,
+                            strategy="mean_reversion",
+                            side=side,
+                            entry_price=current_price,
+                            confidence=round(conf, 2),
+                            reason=f"Reversion {deviation:+.1%} de MA (umbral: {threshold:.1%})",
+                        ))
+                tick_status_mr = "INSIGNIFICANT" if abs(deviation) < min_tick_dev else "VALID"
+                logger.debug(
+                    "[STRATEGY_SIG] MeanReversion Token=%s | dev=%.6f | "
+                    "threshold=%.6f | min_tick_impact=%.6f | "
+                    "price=%.4f MA=%.4f | confluence=OFF | Status=%s",
+                    cid[:16], deviation, threshold, min_tick_dev,
+                    current_price, history.ma,
+                    tick_status_mr,
+                )
         
         # 3. Volume Breakout con umbral adaptativo
         t = thresh.get("volume_breakout")

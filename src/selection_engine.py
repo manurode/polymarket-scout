@@ -23,11 +23,14 @@ Usage:
     # result.mm_top, result.directional_top
 """
 
+import logging
 import math
 import re
 import time
 from dataclasses import dataclass, field
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -471,10 +474,23 @@ class SelectionEngine:
 
         # Gate D2: Volumen 24h mínimo
         if volume_24h < DIRECTIONAL_MIN_VOL24H:
+            logger.debug(
+                "[SKIP_DIR] Token=%s | Reason=Low_Volume_24h (Vol24h=$%.0f < $%d) | %s",
+                snapshot.get("condition_id", "")[:16],
+                volume_24h,
+                int(DIRECTIONAL_MIN_VOL24H),
+                snapshot.get("question", "")[:50],
+            )
             return 0.0, hours_left, vol_surge
 
         # Gate D3: Precio extremo (sin oportunidad direccional)
         if price is not None and (price < 0.02 or price > 0.98):
+            logger.debug(
+                "[SKIP_DIR] Token=%s | Reason=Extreme_Price (Price=%.4f) | %s",
+                snapshot.get("condition_id", "")[:16],
+                price,
+                snapshot.get("question", "")[:50],
+            )
             return 0.0, hours_left, vol_surge
 
         # ── Score base compuesto ──────────────────────────────────────────
