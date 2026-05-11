@@ -1260,6 +1260,7 @@ class ScoutOrchestrator:
 
                 # ── TAKER: señales del pipeline adaptativo ──────────────
                 # Usar solo snapshots del Top Direccional
+                signals = []
                 if self.adaptive_engine.pipeline.get_history_size() >= 3:
                     signals = self.adaptive_engine.generate_adaptive_signals(
                         dir_filtered_snapshots,
