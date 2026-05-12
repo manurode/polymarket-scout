@@ -211,35 +211,46 @@ class CorrelationGraph:
                     ))
 
     def _detect_implications(self) -> None:
-        """Detecta implicaciones por similitud de texto entre mercados."""
+        """Detecta implicaciones por similitud de texto entre mercados.
+
+        Usa un set para O(1) lookup de pares ya procesados, evitando
+        el O(n³) que bloqueaba el event loop con ~200 mercados."""
         nodes = list(self._nodes.values())
         if len(nodes) < 2:
             return
 
+        # ── Set de pares ya existentes (orden-agnóstico) ──
+        existing_pairs: set[frozenset[str]] = {
+            frozenset([r.market_a, r.market_b])
+            for r in self._relations
+        }
+
+        # ── Límite de seguridad: no procesar más de MAX_IMPLICATION_PAIRS ──
+        MAX_IMPLICATION_PAIRS = 5000
+        pairs_checked = 0
+
         for i, node_a in enumerate(nodes):
             for node_b in nodes[i + 1:]:
-                # Saltar si ya tienen relación (mismo evento)
-                if any(
-                    r.market_a == node_a.condition_id and r.market_b == node_b.condition_id
-                    for r in self._relations
-                ):
+                pairs_checked += 1
+                if pairs_checked > MAX_IMPLICATION_PAIRS:
+                    return  # early exit para no bloquear el event loop
+
+                # O(1) lookup en vez de O(n) any() scan
+                pair = frozenset([node_a.condition_id, node_b.condition_id])
+                if pair in existing_pairs:
                     continue
+                existing_pairs.add(pair)
 
                 sim = compute_text_similarity(node_a.question, node_b.question)
 
                 if sim >= self.similarity_threshold:
-                    # Determinar tipo de relación por heurística
-                    # Si los precios son consistentes con implicación (P(A) > P(B)),
-                    # podría ser A ⊆ B
                     rel_type = RelationType.CONDITIONAL_INDEP
                     confidence = sim
 
                     if node_a.price_yes > node_b.price_yes + 0.05:
-                        # A más probable que B → posible A ⊆ B
                         rel_type = RelationType.IMPLICATION
                         confidence = min(1.0, sim + 0.1)
                     elif node_b.price_yes > node_a.price_yes + 0.05:
-                        # B más probable que A → posible B ⊆ A
                         rel_type = RelationType.IMPLICATION
                         confidence = min(1.0, sim + 0.1)
 

@@ -528,6 +528,87 @@ class AdaptiveStrategyEngine:
                         signal.confidence, weighted.strategy_confidence, weighted.regime_fit,
                     )
         
+        # ── 5. Correlation Arbitrage: una vez por ciclo, no por snapshot ──
+        t = self.adaptive_thresholds.get("correlation_arb")
+        if t and t.enabled and self._correlation_graph is not None:
+            try:
+                arb_opps = self._correlation_graph.find_arbitrage_opportunities()
+                for opp in arb_opps:
+                    if not opp.meets_hurdle:
+                        continue
+                    for cid in opp.markets:
+                        history = self.pipeline._history.get(cid)
+                        if not history or len(history.prices) < 4:
+                            continue
+                        conf = min(opp.gross_profit_pct / 10.0, 0.85)
+                        if conf <= t.min_confidence:
+                            continue
+                        signal = Signal(
+                            market=history.question[:60],
+                            question=history.question,
+                            condition_id=cid,
+                            strategy="correlation_arb",
+                            side="YES" if opp.gross_profit_pct > 0 else "NO",
+                            entry_price=history.current_price or 0.5,
+                            confidence=round(conf, 2),
+                            reason=f"Arb {opp.type} profit={opp.gross_profit_pct:.1%} annual={opp.annualized_return:.1%}",
+                        )
+                        ok, reason = self.should_trade(history, signal)
+                        if ok:
+                            regime = self.market_regimes.get(cid, MarketRegime.UNKNOWN)
+                            weighted = self.calculate_signal_weight(signal, regime)
+                            if weighted.final_weight > _signal_weight_cutoff:
+                                all_weighted_signals.append(weighted)
+            except Exception as e:
+                logger.debug("Correlation arb signal error: %s", e)
+
+        # ── 6. Whale Follow: una vez por ciclo ──
+        t = self.adaptive_thresholds.get("whale_follow")
+        if t and t.enabled and self._whale_tracker is not None:
+            for snap in snapshots:
+                cid = snap.get("condition_id", "")
+                if not cid:
+                    continue
+                history = self.pipeline._history.get(cid)
+                if not history or len(history.prices) < 4:
+                    continue
+                try:
+                    flow = self._whale_tracker.get_whale_flow(cid)
+                    if not flow or flow.timestamp <= 0:
+                        continue
+                    if flow.active_whales < 2 or flow.whale_consensus <= 0.6:
+                        continue
+                    side = "YES" if flow.bullish_whales > flow.bearish_whales else "NO"
+                    zscore_norm = min(abs(flow.whale_zscore) / 3.0, 1.0)
+                    conf = min(
+                        zscore_norm * 0.4 + flow.whale_consensus * 0.4 + min(flow.active_whales / 10.0, 1.0) * 0.2,
+                        0.85,
+                    )
+                    if conf <= t.min_confidence:
+                        continue
+                    signal = Signal(
+                        market=history.question[:60],
+                        question=history.question,
+                        condition_id=cid,
+                        strategy="whale_follow",
+                        side=side,
+                        entry_price=history.current_price or 0.5,
+                        confidence=round(conf, 2),
+                        reason=(
+                            f"Whales: {flow.active_whales} activas "
+                            f"({flow.bullish_whales}B/{flow.bearish_whales}S) "
+                            f"consenso={flow.whale_consensus:.0%} z={flow.whale_zscore:.1f}"
+                        ),
+                    )
+                    ok, reason = self.should_trade(history, signal)
+                    if ok:
+                        regime = self.market_regimes.get(cid, MarketRegime.UNKNOWN)
+                        weighted = self.calculate_signal_weight(signal, regime)
+                        if weighted.final_weight > _signal_weight_cutoff:
+                            all_weighted_signals.append(weighted)
+                except Exception as e:
+                    logger.debug("Whale follow signal error for %s: %s", cid[:16], e)
+
         # Ordenar por peso final y limitar
         all_weighted_signals.sort(key=lambda w: w.final_weight, reverse=True)
         
@@ -792,65 +873,8 @@ class AdaptiveStrategyEngine:
                         reason=f"Consenso {len(sides)}/3 estrategias ({', '.join(active_strats)}) → {sides[0]}",
                     ))
 
-        # 5. Correlation Arbitrage — busca discrepancias entre mercados relacionados
-        # Necesita acceso al CorrelationGraph, que se inyecta vía set_external_context().
-        t = thresh.get("correlation_arb")
-        if t and t.enabled and self._correlation_graph is not None:
-            try:
-                arb_opps = self._correlation_graph.find_arbitrage_opportunities()
-                for opp in arb_opps:
-                    if not opp.meets_hurdle:
-                        continue
-                    # Buscar si alguno de los mercados del arb coincide con este cid
-                    if cid in opp.markets:
-                        conf = min(opp.gross_profit_pct / 10.0, 0.85)
-                        if conf > t.min_confidence:
-                            signals.append(Signal(
-                                market=history.question[:60],
-                                question=history.question,
-                                condition_id=cid,
-                                strategy="correlation_arb",
-                                side="YES" if opp.gross_profit_pct > 0 else "NO",
-                                entry_price=history.current_price or 0,
-                                confidence=round(conf, 2),
-                                reason=f"Arb {opp.type} profit={opp.gross_profit_pct:.1%} annual={opp.annualized_return:.1%}",
-                            ))
-            except Exception as e:
-                logger.debug("Correlation arb signal error: %s", e)
-
-        # 6. Whale Follow — sigue el flujo de ballenas on-chain
-        # Necesita acceso al WhaleTracker, inyectado vía set_external_context().
-        t = thresh.get("whale_follow")
-        if t and t.enabled and self._whale_tracker is not None:
-            try:
-                flow = self._whale_tracker.get_whale_flow(cid)
-                if flow and flow.timestamp > 0:
-                    # Señal solo si hay ballenas activas y consenso claro
-                    if flow.active_whales >= 2 and flow.whale_consensus > 0.6:
-                        side = "YES" if flow.bullish_whales > flow.bearish_whales else "NO"
-                        # Confianza: combinación de zscore + consenso + num whales
-                        zscore_norm = min(abs(flow.whale_zscore) / 3.0, 1.0)
-                        conf = min(
-                            zscore_norm * 0.4 + flow.whale_consensus * 0.4 + min(flow.active_whales / 10.0, 1.0) * 0.2,
-                            0.85,
-                        )
-                        if conf > t.min_confidence:
-                            signals.append(Signal(
-                                market=history.question[:60],
-                                question=history.question,
-                                condition_id=cid,
-                                strategy="whale_follow",
-                                side=side,
-                                entry_price=history.current_price or 0,
-                                confidence=round(conf, 2),
-                                reason=(
-                                    f"Whales: {flow.active_whales} activas "
-                                    f"({flow.bullish_whales}B/{flow.bearish_whales}S) "
-                                    f"consenso={flow.whale_consensus:.0%} z={flow.whale_zscore:.1f}"
-                                ),
-                            ))
-            except Exception as e:
-                logger.debug("Whale follow signal error: %s", e)
+        # 5-6: correlation_arb y whale_follow se generan en generate_adaptive_signals()
+        #       (una vez por ciclo, no por snapshot) para evitar bloquear el event loop.
 
         return signals
 
