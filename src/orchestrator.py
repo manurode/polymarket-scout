@@ -829,6 +829,14 @@ class ScoutOrchestrator:
                             sig.strategy, bandit_strategy, side, entry, size,
                             sig.confidence, sig.reason[:60],
                         )
+                        # ── v3.0 POST-TRADE COOLDOWN ──────────────────────
+                        # Solo marcar cooldown DESPUÉS de ejecución exitosa.
+                        # Si la señal fue rechazada, el token queda libre.
+                        self.adaptive_engine.mark_trade_executed(
+                            condition_id=cid,
+                            strategy=bandit_strategy,
+                            cooldown_s=600,
+                        )
 
             except asyncio.CancelledError:
                 break
@@ -1535,6 +1543,13 @@ class ScoutOrchestrator:
                             "conf=%.2f size=$%.2f | %s",
                             pos.id, sig.side, entry, sig.confidence, size,
                             sig.reason[:60],
+                        )
+                        # ── v3.0 POST-TRADE COOLDOWN ──────────────────────
+                        # Solo marcar cooldown DESPUÉS de ejecución exitosa.
+                        self.adaptive_engine.mark_trade_executed(
+                            condition_id=cid,
+                            strategy="momentum_follow",
+                            cooldown_s=180,
                         )
 
                 # ── Log del estado del Bandit cada ciclo ───────────────────────────

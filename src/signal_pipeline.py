@@ -260,12 +260,14 @@ class SignalPipeline:
                         reason=f"Volume spike {vol_spike:.1f}x avg (${hist.volumes[-1]:.0f} vs ${hist.avg_volume:.0f})",
                     ))
 
-        # ── Ordenar por confianza y limitar ──
+        # Ordenar por confianza y limitar
         signals.sort(key=lambda s: s.confidence, reverse=True)
 
-        # Marcar cooldown
-        for sig in signals[:5]:  # solo las top 5
-            self._last_signal_time[sig.condition_id] = time.time()
+        # ── v3.0 POST-TRADE COOLDOWN ─────────────────────────────────────────
+        # YA NO marcamos cooldown aquí (era preventivo → causaba "Falso Cooldown").
+        # El cooldown ahora se aplica vía AdaptiveStrategyEngine.mark_trade_executed()
+        # solo después de que el motor de ejecución confirma un trade exitoso.
+        # Si una señal es rechazada, el token queda libre para el siguiente ciclo.
 
         return signals[:5]  # máximo 5 señales por ciclo
 

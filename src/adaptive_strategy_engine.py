@@ -642,26 +642,47 @@ class AdaptiveStrategyEngine:
         weight_cutoff = _PT_WEIGHT_CUTOFF if PAPER_TRADING_HYPERACTIVE else 0.15
         all_weighted_signals = [w for w in all_weighted_signals if w.final_weight > weight_cutoff]
         
-        # Aplicar cooldown
-        now = time.time()
-        result = []
-        for ws in all_weighted_signals[:max_signals]:
-            cid = ws.signal.condition_id
-            if cid in self.pipeline._last_signal_time:
-                elapsed = now - self.pipeline._last_signal_time[cid]
-                if elapsed < cooldown_s:
-                    remaining = cooldown_s - elapsed
-                    logger.info(
-                        "[COOLDOWN_BLOCK] Token=%s Strategy=%s | "
-                        "elapsed=%.1fs remaining=%.1fs cooldown=%.0fs",
-                        cid[:16], ws.signal.strategy,
-                        elapsed, remaining, cooldown_s,
-                    )
-                    continue
-            self.pipeline._last_signal_time[cid] = now
-            result.append(ws.signal)
+        # ── v3.0 POST-TRADE COOLDOWN ────────────────────────────────────────
+        # El cooldown YA NO se aplica al generar la señal (preventivo).
+        # Solo se activa cuando el motor de ejecución confirma un trade exitoso
+        # (ORDER_FILLED / POSITION_OPENED), vía mark_trade_executed().
+        # Si una señal es rechazada (slippage, inventario, etc.), el token
+        # queda libre para reevaluarse en el siguiente ciclo.
+        #
+        # Ver documentación: el "Falso Cooldown" bloqueaba estrategias
+        # direccionales y de arbitraje que generaban señales válidas pero
+        # eran rechazadas aguas abajo por el motor de ejecución.
         
-        return result[:max_signals]
+        result = [ws.signal for ws in all_weighted_signals[:max_signals]]
+        return result
+
+    def mark_trade_executed(
+        self,
+        condition_id: str,
+        strategy: str,
+        cooldown_s: float = 120,
+    ) -> None:
+        """Marca cooldown POST-trade para un token y estrategia específicos.
+
+        SOLO se llama después de que el motor de ejecución confirma un trade
+        exitoso (ORDER_FILLED / POSITION_OPENED). Esto implementa el principio
+        de "solo descansar si realmente has trabajado".
+
+        Si una señal es rechazada (slippage, falta de liquidez, inventory block),
+        este método NO se llama → el token queda libre para reevaluarse en el
+        siguiente ciclo.
+
+        La clave es compuesta: ``{condition_id}:{strategy}``, permitiendo que
+        distintas estrategias operen el mismo token de forma independiente.
+        """
+        key = f"{condition_id}:{strategy}"
+        self.pipeline._last_signal_time[key] = time.time()
+        logger.debug(
+            "[POST-TRADE COOLDOWN] Token=%s Strategy=%s cooldown=%.0fs — "
+            "trade confirmado, descanso hasta %s",
+            condition_id[:16], strategy, cooldown_s,
+            time.strftime("%H:%M:%S", time.localtime(time.time() + cooldown_s)),
+        )
 
     def _generate_raw_signals(
         self,
