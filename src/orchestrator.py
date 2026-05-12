@@ -933,8 +933,10 @@ class ScoutOrchestrator:
                 # Si el Bandit ha congelado o retirado market_making,
                 # no generamos quotes. La suscripción WS sigue activa
                 # para que el L2 book esté caliente si se reactiva.
+                # v2.0: RECOVERY mode permite operar con tamaño reducido.
                 mm_state = self.portfolio_manager.get_strategy_state("market_making")
                 mm_blocked = mm_state is not None and mm_state.status.value in ("frozen", "retired")
+                mm_recovery = mm_state is not None and mm_state.status.value == "recovery"
                 if mm_blocked != self._mm_bandit_blocked:
                     self._mm_bandit_blocked = mm_blocked
                     if mm_blocked:
@@ -947,6 +949,10 @@ class ScoutOrchestrator:
                 if mm_blocked:
                     await asyncio.sleep(MM_QUOTE_INTERVAL)
                     continue
+
+                # v2.0: RECOVERY mode — double cooldown, reduced sizes handled in calculate_quote
+                if mm_recovery:
+                    await asyncio.sleep(MM_QUOTE_INTERVAL * 2)  # double SIGNAL_COOLDOWN
 
                 for token_id in list(self._mm_active_tokens):
                     if not self._running:
@@ -1037,6 +1043,7 @@ class ScoutOrchestrator:
                         fair_price=fair_price,
                         spread=spread,
                         now=now,
+                        recovery_mode=mm_recovery,
                     )
 
                     if quote and not quote.paused:
@@ -1069,7 +1076,8 @@ class ScoutOrchestrator:
                             "CLOB bb=%.4f ba=%.4f | "
                             "gamma=%.4f | "
                             "bid=%.4f (size=$%.0f) ask=%.4f (size=$%.0f) | "
-                            "qw=%.2fx vol=%.2f inv=%.2f td=%.2f",
+                            "qw=%.2fx vol=%.2f inv=%.2f td=%.2f obi=%.2f | "
+                            "Inv: %+.0f | Skew: %+.4f | Mode: %s",
                             token_id[:12],
                             fair_price, spread,
                             best_bid_price, best_ask_price,
@@ -1080,6 +1088,10 @@ class ScoutOrchestrator:
                             quote.volatility_scalar,
                             quote.inventory_scalar,
                             quote.time_decay_scalar,
+                            quote.obi_scalar,
+                            quote.net_inventory,
+                            quote.inventory_skew,
+                            quote.mode,
                         )
 
                         # ── FIX: Control de Inventario con Independent Slots ──────
@@ -1546,18 +1558,26 @@ class ScoutOrchestrator:
             logger.error("WS book callback error: %s", e, exc_info=True)
 
     def _on_ws_price(self, data: dict) -> None:
-        """Callback: WS price event → TradeAggregator."""
+        """Callback: WS price event → TradeAggregator.
+
+        v2.0: También alimenta el tracker de volumen del MarketMaker para
+        detección de flujo tóxico.
+        """
         try:
             if self.trade_aggregator:
                 asset_id = data.get("asset_id", "")
                 price = data.get("price", data.get("last_trade_price", 0))
+                size = float(data.get("size", 0))
                 if asset_id and price:
                     self.trade_aggregator.add_trade(asset_id, {
                         "price": float(price),
-                        "size": float(data.get("size", 0)),
+                        "size": size,
                         "side": data.get("side", ""),
                         "timestamp": data.get("timestamp", ""),
                     })
+                    # v2.0: Feed MarketMaker volume tracker for toxic flow detection
+                    if self.market_maker and size > 0:
+                        self.market_maker.record_volume(asset_id, size)
         except Exception as e:
             logger.debug("WS price callback error: %s", e)
 

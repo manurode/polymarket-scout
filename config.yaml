@@ -76,6 +76,13 @@ market_making:
   base_multiplier: 1.0
   max_obi: 0.95
   reentry_delay_seconds: 30
+  # v2.0: Inventory & Risk Parameters
+  max_inventory: 10000           # USD max para skew completo
+  skew_risk_factor: 0.5          # factor de riesgo del skew (0-1)
+  obi_spread_widen_threshold: 0.8  # |OBI| > 0.8 → ensanchar spread
+  obi_spread_widen_factor: 1.5   # multiplicador del spread OBI
+  toxic_flow_volume_ratio: 3.0   # ratio volumen 1min / media 20min
+  toxic_flow_pause_duration: 60  # segundos de pausa por flujo tóxico
 
 time_decay:
   base_inventory_cap: 500         # USD
@@ -88,6 +95,8 @@ portfolio:
   ruin_limit: 0.02                # 2% max loss per trade
   epoch_hours: 6
   probation_epochs: 4
+  recovery_allocation: 0.04       # v2.0: 4% del capital durante RECOVERY
+  recovery_trades_required: 10    # v2.0: trades necesarios para evaluar salida de RECOVERY
   hurdle_rate: 0.20               # 20% annualized minimum
 
 whale_tracker:
