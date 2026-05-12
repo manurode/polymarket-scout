@@ -43,7 +43,8 @@ class MarketHistory:
             self.spreads.append(spread)
         if len(self.prices) > self.max_history:
             self.prices.pop(0)
-            self.volumes.pop(0)
+            if self.volumes:
+                self.volumes.pop(0)
             if self.spreads:
                 self.spreads.pop(0)
 

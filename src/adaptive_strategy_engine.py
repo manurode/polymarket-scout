@@ -493,6 +493,10 @@ class AdaptiveStrategyEngine:
         
         all_weighted_signals: list[WeightedSignal] = []
         
+        # Pre-inicializar para que correlation_arb/whale_follow tengan acceso
+        # incluso si el bucle de snapshots está vacío.
+        _signal_weight_cutoff = _PT_WEIGHT_CUTOFF if PAPER_TRADING_HYPERACTIVE else 0.15
+
         for snap in snapshots:
             cid = snap.get("condition_id", "")
             if not cid:
@@ -507,7 +511,14 @@ class AdaptiveStrategyEngine:
             self.market_regimes[cid] = regime
             
             # Generar señales crudas usando el pipeline base
-            raw_signals = self._generate_raw_signals(history, snap, cid)
+            try:
+                raw_signals = self._generate_raw_signals(history, snap, cid)
+            except Exception as e:
+                logger.error(
+                    "Error generando raw signals para %s: %s",
+                    cid[:16], e, exc_info=True,
+                )
+                continue
             
             for signal in raw_signals:
                 # Verificar si deberíamos trade

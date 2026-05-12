@@ -833,7 +833,7 @@ class ScoutOrchestrator:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("Error en paper signal loop: %s", e)
+                logger.error("Error en paper signal loop: %s", e, exc_info=True)
 
             await asyncio.sleep(PAPER_SIGNAL_INTERVAL)
 
@@ -1561,7 +1561,7 @@ class ScoutOrchestrator:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error("Error en autonomous execution loop: %s", e)
+                logger.error("Error en autonomous execution loop: %s", e, exc_info=True)
 
             await asyncio.sleep(AUTONOMOUS_EXEC_INTERVAL)
 
@@ -1602,8 +1602,9 @@ class ScoutOrchestrator:
                     question=question,
                 )
                 pipeline._history[cid] = history
-            # Reemplazar precios con la serie CLOB
-            history.prices = list(micro_prices)
+            # Reemplazar precios con la serie CLOB (truncada a max_history
+            # para que add_snapshot no pierda los volúmenes que añada)
+            history.prices = list(micro_prices)[-history.max_history:]
             synced += 1
         return synced
 
