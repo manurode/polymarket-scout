@@ -440,10 +440,19 @@ class AdaptiveStrategyEngine:
         return True, "OK"
 
     def calculate_signal_weight(self, signal: Signal, regime: str) -> WeightedSignal:
-        """Calcula el peso final de una señal para el ensemble."""
+        """Calcula el peso final de una señal para el ensemble.
+
+        Para estrategias en cold-start (menos de MIN_TRADES_FOR_ADAPTATION trades),
+        usa un prior Bayesiano generoso de 0.75 en vez de castigarlas con 0.5.
+        Esto evita el círculo vicioso donde una estrategia sin historial nunca
+        opera porque su peso base es demasiado bajo."""
         # Confianza de la estrategia
         perf = self.strategy_perf.get(signal.strategy)
-        strategy_conf = perf.confidence if perf else 0.5
+        total_trades = (perf.wins + perf.losses) if perf else 0
+        if total_trades < MIN_TRADES_FOR_ADAPTATION:
+            strategy_conf = 0.75  # prior generoso para cold-start
+        else:
+            strategy_conf = perf.confidence
         
         # Fit con el régimen
         regime_fit = 0.5
@@ -532,7 +541,11 @@ class AdaptiveStrategyEngine:
         t = self.adaptive_thresholds.get("correlation_arb")
         if t and t.enabled and self._correlation_graph is not None:
             try:
-                arb_opps = self._correlation_graph.find_arbitrage_opportunities()
+                # MAINNET ALIGNMENT: hurdle 8% (realista para Polymarket)
+                # En vez de 20% que solo cazaba unicornios.
+                arb_opps = self._correlation_graph.find_arbitrage_opportunities(
+                    hurdle_rate=0.08
+                )
                 for opp in arb_opps:
                     if not opp.meets_hurdle:
                         continue

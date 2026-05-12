@@ -22,8 +22,8 @@ import asyncio
 import logging
 import random
 import time
+from collections import defaultdict, deque
 from typing import Optional
-
 from src.async_scanner import AsyncPolymarketScanner
 from src.selection_engine import SelectionEngine, MIN_VOLUME_24H_THRESHOLD, MM_NICHE_CLOB_DEPTH
 from src.rate_limiter import RateLimiter
@@ -141,6 +141,17 @@ class ScoutOrchestrator:
             whale_tracker=self.whale_tracker,
         )
 
+        # ── MAINNET ALIGNMENT: whale_follow desactivada hasta RPC real ──
+        # Sin datos on-chain (Alchemy/QuickNode), esta estrategia no puede
+        # operar con señales reales. Se desactiva hasta integrar un provider.
+        wt = self.adaptive_engine.adaptive_thresholds.get("whale_follow")
+        if wt:
+            wt.enabled = False
+            logger.warning(
+                "whale_follow DESACTIVADA — requiere provider RPC on-chain "
+                "(Alchemy/QuickNode). Se reactivará al integrar datos reales."
+            )
+
         # ── Price History ───────────────────────────────────────────────────
         self.price_history = PriceHistory()
 
@@ -167,6 +178,14 @@ class ScoutOrchestrator:
         self._mm_errors: int = 0
         self._mm_active_tokens: set = set()  # token_ids actualmente suscritos
         self._mm_bandit_blocked: bool = False  # trackear cambios de estado MM en el Bandit
+
+        # ── CLOB Micro-Price History (para estrategias direccionales) ──────
+        # Alimentado en tiempo real desde _on_ws_book. Reemplaza a Gamma
+        # como fuente de precios para momentum/mean_reversion/volume_breakout.
+        self._clob_micro_prices: dict[str, deque[float]] = defaultdict(
+            lambda: deque(maxlen=50)
+        )  # token_id → rolling window de micro-prices
+        self._token_to_cid: dict[str, str] = {}  # token_id → condition_id
 
     # ── Lifecycle ─────────────────────────────────────────────────
 
@@ -322,6 +341,13 @@ class ScoutOrchestrator:
 
                 # ── Guardar historial persistente de precios ──
                 self.price_history.save_snapshots(snapshots)
+
+                # ── Mapeo token_id → condition_id (para CLOB micro-prices) ──
+                for snap in snapshots:
+                    cid = snap.get("condition_id", "")
+                    tokens = snap.get("clobTokenIds", [])
+                    if cid and isinstance(tokens, list) and tokens:
+                        self._token_to_cid[tokens[0]] = cid
 
                 # ── Reconstruir grafo de correlación con datos frescos ──
                 if snapshots:
@@ -656,6 +682,9 @@ class ScoutOrchestrator:
                     await asyncio.sleep(5)
                     continue
 
+                # ── Sincronizar precios CLOB al pipeline ────────────────
+                self._sync_clob_prices_to_pipeline()
+
                 # Usar cooldown más largo para no colisionar con autonomous loop
                 signals = self.adaptive_engine.generate_adaptive_signals(snapshots, cooldown_s=600)
 
@@ -720,8 +749,43 @@ class ScoutOrchestrator:
                                 "yes" if cancelled else "no quotes",
                             )
 
-                    # Kelly position sizing
+                    # Kelly position sizing — con adjusted_confidence tras slippage
                     edge = abs(sig.confidence * 0.07)
+                    
+                    # ── M4 REFACTOR: Slippage descuenta el edge, no bloquea ──────
+                    # En vez de rechazar la señal, ajustamos la confianza
+                    # proporcionalmente al coste del spread y reducimos el tamaño.
+                    adjusted_confidence = sig.confidence
+                    if token_id and self.book_analyzer:
+                        book_snap = self.book_analyzer.get_book(token_id)
+                        if book_snap and book_snap.bid_count > 0 and book_snap.ask_count > 0:
+                            real_ba = float(book_snap.asks[0, 0])
+                            real_bb = float(book_snap.bids[0, 0])
+                            bb_sz = float(book_snap.bids[0, 1])
+                            ba_sz = float(book_snap.asks[0, 1])
+                            total_sz = bb_sz + ba_sz
+                            if total_sz > 0 and real_ba > real_bb:
+                                real_micro_price = (real_bb * ba_sz + real_ba * bb_sz) / total_sz
+                                expected_spread_cost = (real_ba - real_bb) / real_micro_price if real_micro_price > 0 else 0.0
+                                adjusted_confidence = sig.confidence * (1.0 - expected_spread_cost)
+                                if adjusted_confidence <= 0.01:
+                                    logger.debug(
+                                        "[SKIP_DIR] Token=%s | Reason=Spread_Too_Wide "
+                                        "(spread=%.1f%% adjusted_conf=%.4f — spread eats all edge)",
+                                        token_id[:16],
+                                        expected_spread_cost * 100,
+                                        adjusted_confidence,
+                                    )
+                                    continue
+                                logger.debug(
+                                    "[SPREAD_DISCOUNT] Token=%s | spread=%.1f%% | "
+                                    "conf %.3f→%.3f | size scaled down",
+                                    token_id[:16],
+                                    expected_spread_cost * 100,
+                                    sig.confidence, adjusted_confidence,
+                                )
+                    
+                    edge = abs(adjusted_confidence * 0.07)
                     kelly = self.portfolio_manager.position_size(
                         strategy_name=bandit_strategy,
                         edge=edge,
@@ -733,36 +797,11 @@ class ScoutOrchestrator:
                     if size < 50:
                         logger.debug(
                             "[DISCARD] SIZE_TOO_SMALL | Strategy=%s Token=%s | "
-                            "size=$%.2f < $50 min",
+                            "size=$%.2f < $50 min (adj_conf=%.4f)",
                             sig.strategy, token_id[:16] if token_id else cid[:16], size,
+                            adjusted_confidence,
                         )
                         continue  # demasiado pequeño
-
-                    # ── M4: Slippage & Economic Validation ────────────────────
-                    if token_id and self.book_analyzer:
-                        book_snap = self.book_analyzer.get_book(token_id)
-                        if book_snap and book_snap.bid_count > 0 and book_snap.ask_count > 0:
-                            real_ba = float(book_snap.asks[0, 0])
-                            real_bb = float(book_snap.bids[0, 0])
-                            bb_sz = float(book_snap.bids[0, 1])
-                            ba_sz = float(book_snap.asks[0, 1])
-                            total_sz = bb_sz + ba_sz
-                            if total_sz > 0 and real_ba > real_bb:
-                                real_micro_price = (real_bb * ba_sz + real_ba * bb_sz) / total_sz
-                                expected_spread_cost = (real_ba - real_bb) / real_micro_price if real_micro_price > 0 else 1.0
-                                target_pnl = sig.confidence * size * 0.05
-                                if target_pnl <= expected_spread_cost * size:
-                                    logger.debug(
-                                        "[SKIP_DIR] Token=%s | Reason=Spread_Too_Wide "
-                                        "(Spread: %.1f%% > Target: %.1f%%) | "
-                                        "expected_spread_cost=$%.2f > target_pnl=$%.2f",
-                                        token_id[:16],
-                                        expected_spread_cost * 100,
-                                        (target_pnl / size * 100) if size > 0 else 0,
-                                        expected_spread_cost * size,
-                                        target_pnl,
-                                    )
-                                    continue
 
                     pos = await self.paper_trading.open_position(
                         strategy=bandit_strategy,
@@ -1346,6 +1385,16 @@ class ScoutOrchestrator:
                 now = _time.time()
                 executed_mom = 0
 
+                # ── Sincronizar precios CLOB al pipeline direccional ─────
+                # Los micro-precios del WebSocket reemplazan a Gamma
+                # para momentum/mean_reversion/volume_breakout.
+                clob_synced = self._sync_clob_prices_to_pipeline()
+                if clob_synced > 0:
+                    logger.debug(
+                        "AutExec: %d mercados sincronizados con CLOB micro-prices",
+                        clob_synced,
+                    )
+
                 # ── TAKER: señales del pipeline adaptativo ──────────────
                 # Usar solo snapshots del Top Direccional
                 signals = []
@@ -1410,24 +1459,8 @@ class ScoutOrchestrator:
                             )
                             # El MM slot queda liberado; el direccional puede operar
 
-                    kelly = self.portfolio_manager.position_size(
-                        strategy_name="momentum_follow",
-                        edge=abs(sig.confidence * 0.06),
-                        price=entry,
-                        equity=equity,
-                    )
-                    size = min(kelly.size_final, self.paper_trading.wallet.usdc_free * 0.10)
-
-                    if size < 50:
-                        logger.debug(
-                            "[DISCARD] SIZE_TOO_SMALL | Strategy=%s Token=%s | "
-                            "size=$%.2f < $50 min",
-                            sig.strategy, token_id[:16] if token_id else cid[:16], size,
-                        )
-                        continue
-
-                    # ── M4: Slippage & Economic Validation ────────────────────
-                    # Antes de ejecutar: Expected_Spread_Cost vs Target_PnL
+                    # ── M4 REFACTOR: Slippage descuenta el edge, no bloquea ──────
+                    adjusted_confidence = sig.confidence
                     if token_id and self.book_analyzer:
                         book_snap = self.book_analyzer.get_book(token_id)
                         if book_snap and book_snap.bid_count > 0 and book_snap.ask_count > 0:
@@ -1438,21 +1471,41 @@ class ScoutOrchestrator:
                             total_sz = bb_sz + ba_sz
                             if total_sz > 0 and real_ba > real_bb:
                                 real_micro_price = (real_bb * ba_sz + real_ba * bb_sz) / total_sz
-                                expected_spread_cost = (real_ba - real_bb) / real_micro_price if real_micro_price > 0 else 1.0
-                                # Target_PnL estimado: señal conf * size * 0.05
-                                target_pnl = sig.confidence * size * 0.05
-                                if target_pnl <= expected_spread_cost * size:
+                                expected_spread_cost = (real_ba - real_bb) / real_micro_price if real_micro_price > 0 else 0.0
+                                adjusted_confidence = sig.confidence * (1.0 - expected_spread_cost)
+                                if adjusted_confidence <= 0.01:
                                     logger.debug(
                                         "[SKIP_DIR] Token=%s | Reason=Spread_Too_Wide "
-                                        "(Spread: %.1f%% > Target: %.1f%%) | "
-                                        "expected_spread_cost=$%.2f > target_pnl=$%.2f",
+                                        "(spread=%.1f%% adjusted_conf=%.4f)",
                                         token_id[:16],
                                         expected_spread_cost * 100,
-                                        (target_pnl / size * 100) if size > 0 else 0,
-                                        expected_spread_cost * size,
-                                        target_pnl,
+                                        adjusted_confidence,
                                     )
                                     continue
+                                logger.debug(
+                                    "[SPREAD_DISCOUNT] Token=%s | spread=%.1f%% | "
+                                    "conf %.3f→%.3f",
+                                    token_id[:16],
+                                    expected_spread_cost * 100,
+                                    sig.confidence, adjusted_confidence,
+                                )
+
+                    kelly = self.portfolio_manager.position_size(
+                        strategy_name="momentum_follow",
+                        edge=abs(adjusted_confidence * 0.06),
+                        price=entry,
+                        equity=equity,
+                    )
+                    size = min(kelly.size_final, self.paper_trading.wallet.usdc_free * 0.10)
+
+                    if size < 50:
+                        logger.debug(
+                            "[DISCARD] SIZE_TOO_SMALL | Strategy=%s Token=%s | "
+                            "size=$%.2f < $50 min (adj_conf=%.4f)",
+                            sig.strategy, token_id[:16] if token_id else cid[:16], size,
+                            adjusted_confidence,
+                        )
+                        continue
 
                     market_name = f"[MOM] {sig.question[:55]}"
 
@@ -1514,6 +1567,46 @@ class ScoutOrchestrator:
 
     # ── WebSocket Callbacks ─────────────────────────────────────────
 
+    def _sync_clob_prices_to_pipeline(self) -> int:
+        """Copia los micro-precios CLOB al pipeline del adaptive engine.
+
+        Reemplaza los precios Gamma en cada MarketHistory con la serie
+        temporal de micro-precios CLOB (mucha más resolución).
+
+        Returns
+        -------
+        int
+            Número de mercados sincronizados.
+        """
+        synced = 0
+        pipeline = self.adaptive_engine.pipeline
+        for token_id, micro_prices in self._clob_micro_prices.items():
+            if len(micro_prices) < 4:
+                continue
+            cid = self._token_to_cid.get(token_id)
+            if not cid:
+                continue
+            history = pipeline._history.get(cid)
+            if not history:
+                # Crear MarketHistory si no existe
+                # Buscar la question en los snapshots del radar
+                question = ""
+                for snap in self._last_radar_snapshots:
+                    tokens = snap.get("clobTokenIds", [])
+                    if isinstance(tokens, list) and tokens and tokens[0] == token_id:
+                        question = snap.get("question", "")
+                        break
+                from src.signal_pipeline import MarketHistory
+                history = MarketHistory(
+                    condition_id=cid,
+                    question=question,
+                )
+                pipeline._history[cid] = history
+            # Reemplazar precios con la serie CLOB
+            history.prices = list(micro_prices)
+            synced += 1
+        return synced
+
     def _on_ws_book(self, asset_id: str, data: dict) -> None:
         """Callback: WS book event -> BookAnalyzer + Cross Engine fill simulation.
 
@@ -1553,6 +1646,23 @@ class ScoutOrchestrator:
                                 )
                         except RuntimeError:
                             pass  # sin event loop activo (e.g., tests)
+
+                # ── CLOB Micro-Price para estrategias direccionales ─────
+                # Cada book event produce un micro-price que alimenta
+                # momentum/mean_reversion/volume_breakout en tiempo real.
+                book_snap = self.book_analyzer.get_book(asset_id)
+                if book_snap and book_snap.bid_count > 0 and book_snap.ask_count > 0:
+                    bb = float(book_snap.bids[0, 0])
+                    ba = float(book_snap.asks[0, 0])
+                    bb_sz = float(book_snap.bids[0, 1])
+                    ba_sz = float(book_snap.asks[0, 1])
+                    total_sz = bb_sz + ba_sz
+                    if total_sz > 0 and ba > bb:
+                        micro = (bb * ba_sz + ba * bb_sz) / total_sz
+                    else:
+                        micro = (bb + ba) / 2.0 if ba > 0 or bb > 0 else 0.5
+                    if micro > 0.01 and micro < 0.99:
+                        self._clob_micro_prices[asset_id].append(micro)
 
         except Exception as e:
             logger.error("WS book callback error: %s", e, exc_info=True)
