@@ -110,8 +110,8 @@ def test_update_performance_advances_probation(pm):
     assert state.status == StrategyStatus.ACTIVE
 
 
-def test_update_performance_freezes_after_losses(pm):
-    """3 épocas consecutivas con Sortino ≤ 0 → FROZEN."""
+def test_update_performance_goes_to_recovery_after_losses(pm):
+    """v2.0: 3 épocas consecutivas con Sortino ≤ 0 → RECOVERY (no FROZEN)."""
     losing_trades = [{"pnl": -10, "amount_invested": 100}]
 
     # Primero, sacar de probation
@@ -119,16 +119,16 @@ def test_update_performance_freezes_after_losses(pm):
     for _ in range(4):
         pm.update_strategy_performance("momentum", winning)
 
-    # Luego, 3 épocas perdedoras
+    # Luego, 3 épocas perdedoras → RECOVERY
     for _ in range(3):
         pm.update_strategy_performance("momentum", losing_trades)
 
     state = pm.get_strategy_state("momentum")
-    assert state.status == StrategyStatus.FROZEN
+    assert state.status == StrategyStatus.RECOVERY
 
 
-def test_update_performance_recovers_from_frozen(pm):
-    """Una época positiva saca de FROZEN."""
+def test_update_performance_recovery_to_frozen(pm):
+    """v2.0: RECOVERY con 10 trades perdedores → FROZEN."""
     winning = [{"pnl": 10, "amount_invested": 100}]
     losing = [{"pnl": -10, "amount_invested": 100}]
 
@@ -136,12 +136,55 @@ def test_update_performance_recovers_from_frozen(pm):
     for _ in range(4):
         pm.update_strategy_performance("momentum", winning)
 
-    # Congelar
+    # 3 épocas perdedoras → RECOVERY
     for _ in range(3):
         pm.update_strategy_performance("momentum", losing)
+    assert pm.get_strategy_state("momentum").status == StrategyStatus.RECOVERY
+
+    # Simular 10 trades perdedores en RECOVERY → FROZEN
+    for _ in range(10):
+        pm.record_trade("momentum", pnl=-5.0, equity_before=10000.0)
     assert pm.get_strategy_state("momentum").status == StrategyStatus.FROZEN
 
-    # Recuperar
+
+def test_update_performance_recovers_from_recovery(pm):
+    """v2.0: RECOVERY con PnL positivo → vuelve a ACTIVE."""
+    winning = [{"pnl": 10, "amount_invested": 100}]
+    losing = [{"pnl": -10, "amount_invested": 100}]
+
+    # Sacar de probation
+    for _ in range(4):
+        pm.update_strategy_performance("momentum", winning)
+
+    # 3 épocas perdedoras → RECOVERY
+    for _ in range(3):
+        pm.update_strategy_performance("momentum", losing)
+    assert pm.get_strategy_state("momentum").status == StrategyStatus.RECOVERY
+
+    # Simular 10 trades ganadores en RECOVERY → ACTIVE
+    for _ in range(10):
+        pm.record_trade("momentum", pnl=5.0, equity_before=10000.0)
+    assert pm.get_strategy_state("momentum").status == StrategyStatus.ACTIVE
+
+
+def test_update_performance_recovers_from_frozen(pm):
+    """Una época positiva saca de FROZEN → ACTIVE."""
+    winning = [{"pnl": 10, "amount_invested": 100}]
+    losing = [{"pnl": -10, "amount_invested": 100}]
+
+    # Sacar de probation
+    for _ in range(4):
+        pm.update_strategy_performance("momentum", winning)
+
+    # Llevar a RECOVERY
+    for _ in range(3):
+        pm.update_strategy_performance("momentum", losing)
+    # Llevar a FROZEN vía 10 trades perdedores
+    for _ in range(10):
+        pm.record_trade("momentum", pnl=-5.0, equity_before=10000.0)
+    assert pm.get_strategy_state("momentum").status == StrategyStatus.FROZEN
+
+    # Recuperar con época positiva
     pm.update_strategy_performance("momentum", winning)
     assert pm.get_strategy_state("momentum").status == StrategyStatus.ACTIVE
 
@@ -189,6 +232,25 @@ def test_allocate_active_strategies_get_more(pm):
     assert mom_alloc.fraction >= con_alloc.fraction or con_alloc.status == "frozen"
 
 
+def test_allocate_recovery_gets_reduced_allocation(pm):
+    """v2.0: Estrategias en RECOVERY reciben asignación reducida (4%)."""
+    winning = [{"pnl": 10, "amount_invested": 100}]
+    losing = [{"pnl": -10, "amount_invested": 100}]
+
+    for _ in range(4):
+        pm.update_strategy_performance("momentum", winning)
+    for _ in range(3):
+        pm.update_strategy_performance("momentum", losing)
+
+    state = pm.get_strategy_state("momentum")
+    assert state.status == StrategyStatus.RECOVERY
+
+    allocations = pm.allocate(equity=10000)
+    mom = next(a for a in allocations if a.strategy == "momentum")
+    assert mom.status == "recovery"
+    assert mom.fraction > 0.0  # RECOVERY gets reduced allocation, not zero
+
+
 def test_allocate_frozen_gets_zero(pm):
     """Estrategias FROZEN reciben 0% de capital."""
     winning = [{"pnl": 10, "amount_invested": 100}]
@@ -198,6 +260,11 @@ def test_allocate_frozen_gets_zero(pm):
         pm.update_strategy_performance("momentum", winning)
     for _ in range(3):
         pm.update_strategy_performance("momentum", losing)
+    # Push through RECOVERY → FROZEN
+    for _ in range(10):
+        pm.record_trade("momentum", pnl=-5.0, equity_before=10000.0)
+
+    assert pm.get_strategy_state("momentum").status == StrategyStatus.FROZEN
 
     allocations = pm.allocate(equity=10000)
     mom = next(a for a in allocations if a.strategy == "momentum")

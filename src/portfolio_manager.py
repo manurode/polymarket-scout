@@ -47,6 +47,8 @@ MAX_POSITION_SIZE = 5000.0   # $5000 máximo
 DEFAULT_EPOCH_HOURS = 6      # reasignación cada 6h
 PROBATION_EPOCHS = 4         # épocas de prueba para nuevas estrategias
 PROBATION_ALLOCATION = 0.16  # 16% del capital durante prueba (base de exploración)
+RECOVERY_ALLOCATION = 0.04   # v2.0: 4% durante recovery (grace period reducido)
+RECOVERY_TRADES_REQUIRED = 10  # v2.0: trades necesarios en RECOVERY para evaluar salida
 BETA_PRIOR_A = 1.0           # prior no informativo
 BETA_PRIOR_B = 1.0
 
@@ -60,7 +62,8 @@ class StrategyStatus(Enum):
     PROBATION = "probation"  # nueva, acumulando historial
     ACTIVE = "active"        # compitiendo
     ELITE = "elite"          # rendimiento consistente
-    FROZEN = "frozen"        # 3 épocas consecutivas Sortino < 0
+    RECOVERY = "recovery"    # grace period: operando con tamaño reducido antes de FROZEN
+    FROZEN = "frozen"        # 3 épocas consecutivas Sortino < 0 tras RECOVERY fallido
     RETIRED = "retired"      # 10 épocas sin recuperar
 
 
@@ -77,6 +80,9 @@ class StrategyState:
     sortino_history: list[float] = field(default_factory=list)
     allocation: float = 0.0
     created_at: float = field(default_factory=time.time)
+    # --- v2.0: RECOVERY grace period tracking ---
+    recovery_trades_count: int = 0
+    recovery_pnl_cumulative: float = 0.0
     # --- Campos para paper trading ---
     total_trades: int = 0
     winning_trades: int = 0
@@ -202,7 +208,13 @@ class PortfolioManager:
         return sortino
 
     def _update_strategy_status(self, state: StrategyState) -> None:
-        """Actualiza el estado de una estrategia según sus reglas de ciclo de vida."""
+        """Actualiza el estado de una estrategia según sus reglas de ciclo de vida.
+
+        v2.0: RECOVERY grace period antes de FROZEN.
+        - ACTIVE/ELITE con 3 pérdidas consecutivas → RECOVERY (no FROZEN)
+        - RECOVERY: tras 10 trades, si PnL ≤ 0 → FROZEN; si PnL > 0 → ACTIVE
+        - FROZEN: 10 épocas sin recuperar → RETIRED
+        """
         if state.status == StrategyStatus.PROBATION:
             state.probation_epochs += 1
             if state.probation_epochs >= PROBATION_EPOCHS:
@@ -211,10 +223,30 @@ class PortfolioManager:
 
         if state.status in (StrategyStatus.ACTIVE, StrategyStatus.ELITE):
             if state.consecutive_losses >= 3:
-                state.status = StrategyStatus.FROZEN
+                # v2.0: Ir a RECOVERY en lugar de FROZEN
+                state.status = StrategyStatus.RECOVERY
+                state.recovery_trades_count = 0
+                state.recovery_pnl_cumulative = 0.0
                 state.frozen_epochs = 0
             elif state.sortino_history and state.sortino_history[-1] > 2.0:
                 state.status = StrategyStatus.ELITE
+            return
+
+        if state.status == StrategyStatus.RECOVERY:
+            # Evaluar salida de RECOVERY tras N trades
+            if state.recovery_trades_count >= RECOVERY_TRADES_REQUIRED:
+                if state.recovery_pnl_cumulative > 0:
+                    # PnL positivo → volver a ACTIVE
+                    state.status = StrategyStatus.ACTIVE
+                    state.consecutive_losses = 0
+                    state.recovery_trades_count = 0
+                    state.recovery_pnl_cumulative = 0.0
+                else:
+                    # PnL ≤ 0 tras recovery → FROZEN
+                    state.status = StrategyStatus.FROZEN
+                    state.frozen_epochs = 0
+                    state.recovery_trades_count = 0
+                    state.recovery_pnl_cumulative = 0.0
             return
 
         if state.status == StrategyStatus.FROZEN:
@@ -252,6 +284,8 @@ class PortfolioManager:
                 thetas[name] = 0.0
             elif state.status == StrategyStatus.PROBATION:
                 thetas[name] = PROBATION_ALLOCATION
+            elif state.status == StrategyStatus.RECOVERY:
+                thetas[name] = RECOVERY_ALLOCATION  # v2.0: reduced allocation during grace period
             elif state.status == StrategyStatus.FROZEN:
                 thetas[name] = 0.0  # sin capital
             else:
@@ -528,7 +562,9 @@ class PortfolioManager:
         return dict(self._strategies)
 
     def get_active_strategies(self) -> list[str]:
-        """Retorna estrategias activas (no RETIRED ni FROZEN)."""
+        """Retorna estrategias activas (no RETIRED ni FROZEN).
+
+        v2.0: RECOVERY se considera activa (recibe asignación reducida)."""
         return [
             name for name, s in self._strategies.items()
             if s.status not in (StrategyStatus.RETIRED, StrategyStatus.FROZEN)
@@ -593,6 +629,9 @@ class PortfolioManager:
             state.successes = 0
             state.failures = 0
             state.sortino_history.clear()
+            # v2.0: limpiar recovery tracking
+            state.recovery_trades_count = 0
+            state.recovery_pnl_cumulative = 0.0
             # Resetear también métricas de paper trading acumuladas
             state.total_trades = 0
             state.winning_trades = 0
@@ -623,6 +662,8 @@ class PortfolioManager:
     def record_trade(self, strategy_name: str, pnl: float, equity_before: float) -> None:
         """Registra un trade cerrado para una estrategia (paper trading).
 
+        v2.0: En estado RECOVERY, acumula PnL y cuenta trades para evaluar salida.
+
         Parameters
         ----------
         strategy_name : str
@@ -641,6 +682,13 @@ class PortfolioManager:
             state.winning_trades += 1
 
         state.cumulative_pnl += pnl
+
+        # v2.0: RECOVERY tracking
+        if state.status == StrategyStatus.RECOVERY:
+            state.recovery_trades_count += 1
+            state.recovery_pnl_cumulative += pnl
+            # Evaluar salida inmediatamente si se alcanza el threshold
+            self._update_strategy_status(state)
 
         # Actualizar peak equity y drawdown
         current_equity = equity_before + pnl
