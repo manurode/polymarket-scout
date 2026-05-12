@@ -5,7 +5,8 @@ Implementa el Market Making Líquido (§2.1 del ARCHITECTURE_V2.md):
 - Coloca órdenes límite en ambos lados del libro.
 - Quote width dinámico ajustado por volatilidad, inventario y time-decay.
 - Protección anti-selección adversa (OBI extremo, whale, flash crash, reconciling).
-- Fair price: midpoint del CLOB L2, fallback a precio Gamma.
+- v2.0: Inventory Skew Pricing, Anti-Toxic Flow Guard, OBI-Linked Spread.
+- Fair price: micro-price CLOB L2 ponderado por tamaño, fallback a precio Gamma.
 
 Uso:
     mm = MarketMaker(book_analyzer, time_decay_manager)
@@ -15,6 +16,7 @@ Uso:
 """
 
 import logging
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -33,6 +35,21 @@ FLASH_CRASH_THRESHOLD = 0.05      # 5% en < 30s
 FLASH_CRASH_WINDOW = 30           # segundos
 REENTRY_DELAY = 30                # segundos para reincorporarse tras pausa
 
+# ── v2.0: Inventory Skew Pricing ──────────────────────────────────
+TARGET_INVENTORY = 0.0             # inventario objetivo (neutral)
+MAX_INVENTORY_LIMIT = 10000.0      # USD máximos de inventario para skew completo
+SKEW_RISK_FACTOR = 0.5             # factor de riesgo del skew (0-1)
+
+# ── v2.0: Anti-Toxic Flow Guard ───────────────────────────────────
+TOXIC_FLOW_VOLUME_RATIO = 3.0      # 300% sobre la media → pausa
+TOXIC_FLOW_SHORT_WINDOW = 60       # ventana corta: 1 minuto
+TOXIC_FLOW_LONG_WINDOW = 1200      # ventana larga: 20 minutos
+TOXIC_FLOW_PAUSE_DURATION = 60     # segundos de pausa
+TOXIC_FLOW_MIN_VOLUME = 500.0      # USD mínimo para considerar flujo tóxico
+
+# ── v2.0: OBI-Linked Spread ───────────────────────────────────────
+OBI_SPREAD_WIDEN_THRESHOLD = 0.8   # |OBI| > 0.8 → ensanchar spread
+OBI_SPREAD_WIDEN_FACTOR = 1.5      # multiplicador del spread (50% más ancho)
 
 # ── Tipos ──────────────────────────────────────────────────────────
 
@@ -53,6 +70,11 @@ class Quote:
     volatility_scalar: float = 1.0
     inventory_scalar: float = 1.0
     time_decay_scalar: float = 1.0
+    obi_scalar: float = 1.0
+    # v2.0: Inventory skew
+    inventory_skew: float = 0.0
+    net_inventory: float = 0.0
+    mode: str = "Normal"
     paused: bool = False
     pause_reason: str = ""
 
@@ -67,12 +89,23 @@ class MarketMakerState:
     pause_reason: str = ""
     inventory_yes: float = 0.0   # inventario en YES (positivo = long YES)
     inventory_no: float = 0.0    # inventario en NO
+    # v2.0: Volume tracking for toxic flow detection
+    _volume_history: deque = field(default_factory=lambda: deque(maxlen=1500))
+    # v2.0: Recovery mode tracking
+    recovery_mode: bool = False
+
+    @property
+    def net_inventory(self) -> float:
+        """Inventario neto: positivo = long YES, negativo = short YES."""
+        return self.inventory_yes - self.inventory_no
 
 
 # ── MarketMaker ────────────────────────────────────────────────────
 
 class MarketMaker:
     """Market Maker líquido con protección anti-selección adversa.
+
+    v2.0: Inventory Skew Pricing, Anti-Toxic Flow Guard, OBI-Linked Spread.
 
     Parameters
     ----------
@@ -87,6 +120,8 @@ class MarketMaker:
     max_obi : float
         Umbral de |OBI| que dispara cancelación de órdenes (default 0.95).
         Solo se pausa si el libro está absolutamente sesgado hacia un lado.
+    max_inventory : float
+        Límite de inventario para skew completo.
     """
 
     def __init__(
@@ -96,12 +131,14 @@ class MarketMaker:
         spoof_detector: Optional[SpoofDetector] = None,
         base_multiplier: float = DEFAULT_BASE_MULTIPLIER,
         max_obi: float = MAX_OBI_FOR_QUOTING,
+        max_inventory: float = MAX_INVENTORY_LIMIT,
     ):
         self._books = book_analyzer
         self._time_decay = time_decay or TimeDecayManager()
         self._spoof = spoof_detector
         self.base_multiplier = base_multiplier
         self.max_obi = max_obi
+        self.max_inventory = max_inventory
 
         # Estado por mercado
         self._states: dict[str, MarketMakerState] = {}
@@ -122,8 +159,11 @@ class MarketMaker:
         created_at: float = 0.0,
         end_date: float = 0.0,
         now: Optional[float] = None,
+        recovery_mode: bool = False,
     ) -> Optional[Quote]:
         """Calcula una cotización (bid + ask) para un mercado.
+
+        v2.0: Aplica Inventory Skew Pricing y OBI-Linked Spread.
 
         Parameters
         ----------
@@ -151,6 +191,8 @@ class MarketMaker:
             Timestamp de expiración (para time-decay).
         now : float | None
             Timestamp actual.
+        recovery_mode : bool
+            Si la estrategia está en RECOVERY (reduce tamaños).
 
         Returns
         -------
@@ -173,8 +215,17 @@ class MarketMaker:
         if spread <= 0:
             spread = 0.02  # default 2%
 
+        # ── 2.5 OBI intensity factor (v2.0) ──────────────────
+        obi = self._books.get_obi(token_id, min_total_size=MIN_TOTAL_SIZE_FOR_OBI)
+        obi_scalar = 1.0
+        if abs(obi) > OBI_SPREAD_WIDEN_THRESHOLD:
+            # Spread se ensancha proporcionalmente al exceso sobre el umbral
+            excess = (abs(obi) - OBI_SPREAD_WIDEN_THRESHOLD) / (1.0 - OBI_SPREAD_WIDEN_THRESHOLD)
+            obi_scalar = 1.0 + excess * (OBI_SPREAD_WIDEN_FACTOR - 1.0)
+            obi_scalar = min(2.0, obi_scalar)
+
         # ── 3. Quote Width Multiplier ─────────────────────────
-        qw_mult = self._calculate_quote_width_multiplier(
+        qw_mult, vol_scalar, inv_scalar, td_scalar = self._calculate_quote_scalars(
             token_id=token_id,
             inventory_yes=inventory_yes,
             inventory_no=inventory_no,
@@ -184,21 +235,36 @@ class MarketMaker:
             end_date=end_date,
             now=now,
         )
+        qw_mult *= obi_scalar  # OBI spread widening applied here
+
+        # ── 3.5 Inventory Skew (v2.0) ─────────────────────────
+        net_inv = inventory_yes - inventory_no
+        skew = self._calculate_inventory_skew(net_inv)
+        # skew is in price units (dollar amount to shift both bid and ask)
+        # When long tokens (net_inv > 0): skew > 0 → bid/ask shift DOWN
+        # When short tokens (net_inv < 0): skew < 0 → bid/ask shift UP
 
         # ── 4. Bid/Ask Prices ─────────────────────────────────
-        half_spread = (spread / 2.0) * qw_mult
-        bid_price = max(0.01, fair_price - half_spread)
-        ask_price = min(0.99, fair_price + half_spread)
+        half_spread = (spread / 2.0) * qw_mult * obi_scalar
+        bid_price = max(0.01, fair_price - half_spread - skew)
+        ask_price = min(0.99, fair_price + half_spread - skew)
 
         # ── 5. Position Size ──────────────────────────────────
         if position_size_kelly <= 0:
             position_size_kelly = 100.0  # default
         half_size = position_size_kelly / 2.0
 
+        # ── Recovery mode: reduce size by 80% ──────────────────
+        if recovery_mode:
+            half_size *= 0.2  # 80% reduction → 20% of normal
+
         # ── 6. Check pause ────────────────────────────────────
         state = self._get_state(token_id, condition_id)
         paused = now < state.pause_until
         pause_reason = state.pause_reason if paused else ""
+
+        # Determine mode label
+        mode = "Recovery" if recovery_mode else "Normal"
 
         return Quote(
             token_id=token_id,
@@ -211,13 +277,51 @@ class MarketMaker:
             bid_size=half_size,
             ask_size=half_size,
             timestamp=now,
+            volatility_scalar=round(vol_scalar, 3),
+            inventory_scalar=round(inv_scalar, 3),
+            time_decay_scalar=round(td_scalar, 3),
+            obi_scalar=round(obi_scalar, 3),
+            inventory_skew=round(skew, 6),
+            net_inventory=round(net_inv, 2),
+            mode=mode,
             paused=paused,
             pause_reason=pause_reason,
         )
 
+    # ── Inventory Skew (v2.0) ──────────────────────────────────────
+
+    def _calculate_inventory_skew(self, net_inventory: float) -> float:
+        """Calcula el skew de inventario para ajustar bid/ask.
+
+        Cuando el bot está cargado de tokens (net_inventory > 0), el skew
+        es positivo y desplaza ambos precios hacia ABAJO, incentivando la
+        venta y desincentivando la compra.
+
+        Formula:
+            skew = (net_inventory / max_inventory_limit) * risk_factor
+
+        Parameters
+        ----------
+        net_inventory : float
+            Inventario neto: positivo = long YES, negativo = short.
+
+        Returns
+        -------
+        float
+            Valor del skew en unidades de precio.
+        """
+        if self.max_inventory <= 0:
+            return 0.0
+
+        ratio = net_inventory / self.max_inventory
+        # Clamp to [-1, 1] to prevent extreme skew
+        ratio = max(-1.0, min(1.0, ratio))
+        skew = ratio * SKEW_RISK_FACTOR
+        return skew
+
     # ── Quote Width Multiplier ────────────────────────────────────
 
-    def _calculate_quote_width_multiplier(
+    def _calculate_quote_scalars(
         self,
         token_id: str,
         inventory_yes: float,
@@ -227,8 +331,13 @@ class MarketMaker:
         created_at: float,
         end_date: float,
         now: float,
-    ) -> float:
-        """Calcula el multiplicador dinámico del quote width.
+    ) -> tuple[float, float, float, float]:
+        """Calcula el multiplicador dinámico del quote width y sus componentes.
+
+        Returns
+        -------
+        tuple[float, float, float, float]
+            (quote_width_multiplier, volatility_scalar, inventory_scalar, time_decay_scalar)
 
         quote_width_multiplier = base_multiplier
                                × volatility_scalar
@@ -259,7 +368,15 @@ class MarketMaker:
         else:
             td_scalar = 1.0
 
-        return self.base_multiplier * vol_scalar * inv_scalar * td_scalar
+        qw_mult = self.base_multiplier * vol_scalar * inv_scalar * td_scalar
+        return qw_mult, vol_scalar, inv_scalar, td_scalar
+
+    # ── Legacy alias (backward compatibility) ──────────────────
+
+    def _calculate_quote_width_multiplier(self, **kwargs) -> float:
+        """Legacy wrapper — returns just the multiplier."""
+        result, _, _, _ = self._calculate_quote_scalars(**kwargs)
+        return result
 
     # ── Adverse Selection Protection ──────────────────────────────
 
@@ -311,7 +428,102 @@ class MarketMaker:
             self._pause(token_id, condition_id, REENTRY_DELAY, "flash_crash", now)
             return False, "flash crash/spike detected"
 
+        # 6. Toxic flow check (v2.0)
+        is_toxic, toxic_reason = self.check_toxic_flow(token_id, now)
+        if is_toxic:
+            self._pause(token_id, condition_id, TOXIC_FLOW_PAUSE_DURATION, toxic_reason, now)
+            return False, toxic_reason
+
         return True, "ok"
+
+    # ── Anti-Toxic Flow Guard (v2.0) ─────────────────────────────
+
+    def record_volume(
+        self,
+        token_id: str,
+        volume: float,
+        timestamp: Optional[float] = None,
+    ) -> None:
+        """Registra volumen de trading para un mercado (ventana deslizante).
+
+        Llamar desde el orchestrator cada vez que se procesa un trade.
+
+        Parameters
+        ----------
+        token_id : str
+            Token del mercado.
+        volume : float
+            Volumen del trade en USD.
+        timestamp : float | None
+            Timestamp del trade.
+        """
+        import time as _time
+        if timestamp is None:
+            timestamp = _time.time()
+        state = self._get_state(token_id)
+        state._volume_history.append((timestamp, volume))
+
+    def check_toxic_flow(
+        self,
+        token_id: str,
+        now: Optional[float] = None,
+    ) -> tuple[bool, str]:
+        """Detecta flujo tóxico por explosión de volumen.
+
+        Si el volumen en 1 minuto supera en 300% la media de los últimos
+        20 minutos, se considera flujo tóxico.
+
+        Parameters
+        ----------
+        token_id : str
+            Token del mercado.
+        now : float | None
+            Timestamp actual.
+
+        Returns
+        -------
+        tuple[bool, str]
+            (es_tóxico, razón)
+        """
+        import time as _time
+        if now is None:
+            now = _time.time()
+
+        state = self._states.get(token_id)
+        if state is None or not state._volume_history:
+            return False, ""
+
+        short_cutoff = now - TOXIC_FLOW_SHORT_WINDOW
+        long_cutoff = now - TOXIC_FLOW_LONG_WINDOW
+
+        # Volumen en la ventana corta (1 min)
+        short_vol = sum(
+            v for ts, v in state._volume_history if ts >= short_cutoff
+        )
+
+        # Volumen en la ventana larga (20 min)
+        long_vol = sum(
+            v for ts, v in state._volume_history if ts >= long_cutoff
+        )
+
+        # Si no hay suficiente historial largo, no evaluar
+        if long_vol < TOXIC_FLOW_MIN_VOLUME:
+            return False, ""
+
+        # Media por minuto en la ventana larga (20 min)
+        long_minutes = TOXIC_FLOW_LONG_WINDOW / 60.0
+        avg_per_minute = long_vol / long_minutes
+
+        if avg_per_minute <= 0:
+            return False, ""
+
+        # Ratio del volumen corto vs media por minuto
+        ratio = short_vol / avg_per_minute
+
+        if ratio > TOXIC_FLOW_VOLUME_RATIO:
+            return True, f"toxic_flow: 1m_vol=${short_vol:.0f} vs avg=${avg_per_minute:.0f}/min (ratio={ratio:.1f}x)"
+
+        return False, ""
 
     def detect_flash_crash(
         self,

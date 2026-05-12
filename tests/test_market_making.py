@@ -255,9 +255,18 @@ def test_quote_has_all_metadata(mm):
         inventory_yes=100,
         inventory_no=50,
     )
-    assert quote.volatility_scalar == 1.0  # inicializado como 1.0 por defecto en Quote
-    assert quote.inventory_scalar == 1.0
+    # v2.0: scalars reflect computed values (not defaults)
+    # volatility: 1.0 + (0.03/0.02 - 1.0)*0.5 = 1.0 + 0.25 = 1.25 (clamped to 2.0)
+    assert quote.volatility_scalar >= 1.0
+    # inventory: 1.0 + |(100-50)/150| * 0.5 = 1.0 + 0.166... = ~1.167
+    assert quote.inventory_scalar >= 1.0
     assert quote.time_decay_scalar == 1.0
+    # v2.0: new fields
+    assert hasattr(quote, 'obi_scalar')
+    assert hasattr(quote, 'inventory_skew')
+    assert hasattr(quote, 'net_inventory')
+    assert hasattr(quote, 'mode')
+    assert quote.mode == "Normal"
 
 
 # ── MarketMakerState ───────────────────────────────────────────────
