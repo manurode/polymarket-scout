@@ -52,6 +52,13 @@ THIN_BOOK_ORDER_THRESHOLD = 20   # Umbral de órdenes para considerar libro fino
 THIN_BOOK_SIZE_THRESHOLD = 50.0  # Tamaño mínimo (USD) para aplicar penalización
 POL_COMMISSION = 0.02    # 0.02 POL por trade cerrado (gas simulado)
 
+# ── Reglas de Ejecución Institucional (Anti-Espejismos) ─────────────────────
+GHOST_LIQUIDITY_MIN_SIZE = 25.0   # Rule 2: ignorar niveles < $25 para MTM
+PRICE_FLOOR = 0.02                 # Rule 5: precio mínimo permitido
+PRICE_CEILING = 0.98               # Rule 5: precio máximo permitido
+TP_LIMIT_ORDER_TTL = 300           # Rule 4: TTL de órdenes límite de TP (5 min)
+MAX_BOOK_SWEEP_LEVELS = 20         # Rule 1: niveles máximos a barrer del L2
+
 
 # ── Tipos ─────────────────────────────────────────────────────────────────────────────
 
@@ -117,6 +124,25 @@ class VirtualWallet:
         }
 
 
+@dataclass
+class TPLimitOrder:
+    """Orden límite de Take Profit (Maker-style, Rule 4).
+
+    Se coloca cuando el precio alcanza el target de TP.
+    Solo se ejecuta si el mercado la cruza con volumen real.
+    """
+    id: int
+    position_id: int       # ID de la posición asociada
+    token_id: str
+    market: str
+    strategy: str
+    side: str              # "YES" | "NO"
+    target_price: float    # Precio al que queremos cerrar (nivel límite)
+    size: float            # Tamaño a cerrar
+    entry: float           # Precio de entrada original
+    created_at: float = field(default_factory=time.time)
+
+
 # ── PaperTradingEngine ───────────────────────────────────────────────────────────
 
 class PaperTradingEngine:
@@ -147,6 +173,13 @@ class PaperTradingEngine:
         # El Cross Engine evalúa estas quotes cuando el CLOB real las cruza.
         self._pending_quotes: dict[str, VirtualLimitOrder] = {}
         self._order_counter = 0
+
+        # ── TP Limit Orders (Maker-style, Rule 4) ──────────────────────────
+        # _tp_limit_orders: dict position_id → TPLimitOrder.
+        # Órdenes límite colocadas cuando el precio alcanza el target de TP.
+        # Solo se ejecutan si el mercado las cruza con volumen real.
+        self._tp_limit_orders: dict[int, TPLimitOrder] = {}
+        self._tp_order_counter = 0
 
     # ── Cross Engine: Virtual Limit Orders ─────────────────────────────────────────
 
@@ -373,6 +406,611 @@ class PaperTradingEngine:
 
         return filled_positions
 
+    # ── Reglas de Ejecución Institucional ─────────────────────────────────────
+
+    @staticmethod
+    def _check_price_sanity(price: float) -> bool:
+        """Rule 5: Hard Cap de Resolución.
+
+        Rechaza ejecuciones con precios extremos que solo ocurren
+        a milisegundos de la resolución oficial del mercado.
+        En dinero real, nadie regala céntimos gratis.
+
+        Returns True si el precio es VÁLIDO (dentro de [0.02, 0.98]).
+        """
+        return PRICE_FLOOR <= price <= PRICE_CEILING
+
+    @staticmethod
+    def _sweep_book_vwap(
+        levels: "np.ndarray",
+        count: int,
+        required_size: float,
+        side: str,
+    ) -> tuple[float, float, float]:
+        """Rule 1: Depth-Aware Fill — barre el libro calculando VWAP.
+
+        NO asume liquidez infinita en el BBO. Itera por los niveles del
+        L2 hasta sumar el size completo de la orden.
+
+        Parameters
+        ----------
+        levels : np.ndarray
+            Array de shape (N, 2) con niveles [[price, size], ...].
+            bids deben estar ordenados DESC (mejor primero).
+            asks deben estar ordenados ASC (mejor primero).
+        count : int
+            Número de niveles activos en el array.
+        required_size : float
+            Tamaño total a ejecutar en USD.
+        side : str
+            "BUY" (consumir asks) o "SELL" (consumir bids).
+
+        Returns
+        -------
+        tuple[float, float, float]
+            (vwap_price, filled_size, remaining_size)
+            - vwap_price: precio medio ponderado por volumen de los niveles consumidos
+            - filled_size: cuánto se pudo ejecutar
+            - remaining_size: cuánto quedó sin ejecutar (> 0 = partial fill)
+        """
+        if count == 0 or required_size <= 0:
+            return 0.0, 0.0, required_size
+
+        total_cost = 0.0
+        total_size = 0.0
+        remaining = required_size
+
+        for i in range(min(count, MAX_BOOK_SWEEP_LEVELS)):
+            level_price = float(levels[i, 0])
+            level_size = float(levels[i, 1])
+
+            if level_price <= 0 or level_size <= 0:
+                continue
+
+            # Rule 5: sanity check en cada nivel
+            if not PaperTradingEngine._check_price_sanity(level_price):
+                continue
+
+            take = min(remaining, level_size)
+            total_cost += take * level_price
+            total_size += take
+            remaining -= take
+
+            if remaining <= 0.001:  # tolerancia de redondeo
+                break
+
+        vwap = total_cost / total_size if total_size > 0 else 0.0
+        return round(vwap, 6), round(total_size, 2), round(remaining, 2)
+
+    @staticmethod
+    def _filter_ghost_liquidity(
+        levels: "np.ndarray",
+        count: int,
+        min_size: float = GHOST_LIQUIDITY_MIN_SIZE,
+    ) -> int:
+        """Rule 2: Ghost Liquidity Filter — ignora niveles con size < $25.
+
+        Si un market maker retira sus órdenes y queda una orden residual
+        de $1 a precio 0.99, ese nivel NO debe usarse para MTM ni TP.
+
+        Retorna el índice del primer nivel que cumple el filtro,
+        o -1 si ningún nivel lo cumple.
+        """
+        for i in range(count):
+            if float(levels[i, 1]) >= min_size:
+                return i
+        return -1
+
+    async def cross_and_fill_depth_aware(
+        self,
+        token_id: str,
+        book_snap: "BookSnapshot",
+    ) -> list["VirtualPosition"]:
+        """Rule 1: Depth-Aware Cross Engine — barre el L2 con VWAP.
+
+        Versión institucional de cross_and_fill(). En lugar de asumir que
+        el top-of-book (BBO) puede absorber toda la orden, itera por los
+        niveles de profundidad del orderbook hasta sumar el size completo.
+
+        Si el libro no tiene liquidez suficiente → Partial Fill.
+        El precio de ejecución es el VWAP de todos los niveles consumidos.
+
+        Parameters
+        ----------
+        token_id : str
+            ID del token cuyo book acaba de actualizarse.
+        book_snap : BookSnapshot
+            Snapshot completo del L2 desde BookAnalyzer.
+
+        Returns
+        -------
+        list[VirtualPosition]
+            Posiciones abiertas por fills ejecutados.
+        """
+        filled_positions: list[VirtualPosition] = []
+
+        if book_snap is None or book_snap.bid_count == 0 or book_snap.ask_count == 0:
+            return filled_positions
+
+        real_best_bid = float(book_snap.bids[0, 0])
+        real_best_ask = float(book_snap.asks[0, 0])
+
+        # Rule 5: sanity check en best bid/ask
+        if not self._check_price_sanity(real_best_bid) or not self._check_price_sanity(real_best_ask):
+            logger.warning(
+                "CrossEngine PRICE SANITY FAIL %s: bb=%.4f ba=%.4f — fuera de [%.2f, %.2f]",
+                token_id[:16], real_best_bid, real_best_ask, PRICE_FLOOR, PRICE_CEILING,
+            )
+            return filled_positions
+
+        if real_best_bid <= 0 or real_best_ask <= 0:
+            return filled_positions
+
+        # ── Rechazo por spread ilíquido (> 5%) ─────────────────────────────
+        MAX_FILL_SPREAD = 0.05
+        real_spread = real_best_ask - real_best_bid
+        if real_spread > MAX_FILL_SPREAD:
+            logger.warning(
+                "CrossEngine SPREAD BLOCK %s: spread=%.4f (%.1f%%) > %.0f%% — fill rechazado",
+                token_id[:16], real_spread, real_spread * 100, MAX_FILL_SPREAD * 100,
+            )
+            return filled_positions
+
+        # ── Recuperar la ÚNICA quote pendiente para este token ────────────
+        now = time.time()
+        order = self._pending_quotes.get(token_id)
+        if order is None:
+            return filled_positions
+
+        # TTL check
+        if (now - order.created_at) > ORDER_TTL_SECONDS:
+            self._pending_quotes.pop(token_id, None)
+            logger.debug("CrossEngine TTL expired %s: quote #%d eliminada", token_id[:16], order.id)
+            return filled_positions
+
+        # ── INVENTORY LOCK: verificar slots ──
+        open_positions = [p for p in self._positions if p.closed_at is None]
+        token_positions = [p for p in open_positions if p.token_id == token_id]
+
+        is_mm_fill = order.strategy == "market_making"
+        mm_positions = [p for p in token_positions if p.strategy == "market_making"]
+        dir_positions = [p for p in token_positions if p.strategy != "market_making"]
+
+        if is_mm_fill and len(mm_positions) >= 1:
+            removed = self._pending_quotes.pop(token_id, None)
+            if removed:
+                logger.warning(
+                    "CrossEngine INV BLOCK [MM Slot] %s: slot MM ocupado — quote #%d rechazada",
+                    token_id[:16], removed.id,
+                )
+            return filled_positions
+
+        if not is_mm_fill and len(dir_positions) >= 1:
+            removed = self._pending_quotes.pop(token_id, None)
+            if removed:
+                logger.warning(
+                    "CrossEngine INV BLOCK [Dir Slot] %s: slot Direccional ocupado — quote #%d rechazada",
+                    token_id[:16], removed.id,
+                )
+            return filled_positions
+
+        # ── Depth-Aware Fill: barrer el libro con VWAP ───────────────
+        side: str | None = None
+        required_size: float = 0.0
+        book_side = None
+        book_side_count: int = 0
+
+        # Fill BID: necesitamos consumir ASKs (comprar YES)
+        if real_best_ask <= order.bid_price and order.bid_size >= 50:
+            if order.ask_price <= real_best_bid:
+                logger.warning(
+                    "CrossEngine SANITY FAIL %s: virtual_ask=%.4f <= real_bb=%.4f — fill BID rechazado",
+                    token_id[:16], order.ask_price, real_best_bid,
+                )
+            else:
+                side = "YES"
+                required_size = order.bid_size
+                book_side = book_snap.asks  # consumir asks para comprar YES
+                book_side_count = book_snap.ask_count
+
+        # Fill ASK: necesitamos consumir BIDs (vender NO)
+        elif real_best_bid >= order.ask_price and order.ask_size >= 50:
+            if order.bid_price >= real_best_ask:
+                logger.warning(
+                    "CrossEngine SANITY FAIL %s: virtual_bid=%.4f >= real_ba=%.4f — fill ASK rechazado",
+                    token_id[:16], order.bid_price, real_best_ask,
+                )
+            else:
+                side = "NO"
+                required_size = order.ask_size
+                book_side = book_snap.bids  # consumir bids para vender NO
+                book_side_count = book_snap.bid_count
+
+        if side is None or book_side is None:
+            return filled_positions
+
+        # ── Barrer el libro (VWAP Sweep) ──────────────────────────
+        vwap_price, filled_size, remaining = self._sweep_book_vwap(
+            book_side, book_side_count, required_size, side,
+        )
+
+        if filled_size <= 0 or vwap_price <= 0:
+            logger.warning(
+                "CrossEngine NO LIQUIDITY %s: side=%s required=$%.0f filled=$%.0f — partial fill",
+                token_id[:16], side, required_size, filled_size,
+            )
+            return filled_positions
+
+        # Rule 5: sanity check en el precio VWAP resultante
+        if not self._check_price_sanity(vwap_price):
+            logger.warning(
+                "CrossEngine PRICE SANITY FAIL %s: vwap=%.4f fuera de [%.2f, %.2f] — fill rechazado",
+                token_id[:16], vwap_price, PRICE_FLOOR, PRICE_CEILING,
+            )
+            return filled_positions
+
+        # ── Ejecutar fill ─────────────────────────────────────────
+        self._pending_quotes.pop(order.token_id, None)
+
+        size = min(filled_size, self.wallet.usdc_free)
+        if size < 50:
+            logger.debug("CrossEngine: fill omitido (capital libre=$%.2f)", self.wallet.usdc_free)
+            return filled_positions
+
+        pos = await self.open_position(
+            strategy=order.strategy,
+            market=order.market,
+            side=side,
+            size=size,
+            entry=vwap_price,
+            token_id=order.token_id,
+            tau_pct=random.uniform(10, 55),
+            toxicity=random.uniform(0.03, 0.20),
+        )
+
+        if pos:
+            if remaining > 1.0:
+                logger.warning(
+                    "PARTIAL FILL %s: side=%s vwap=%.4f filled=$%.0f remaining=$%.0f — posición abierta parcialmente",
+                    token_id[:16], side, vwap_price, filled_size, remaining,
+                )
+            filled_positions.append(pos)
+            trading_log.cross_fill(
+                token_id=token_id,
+                side=side,
+                price=vwap_price,
+                size=size,
+                strategy=order.strategy,
+            )
+            logger.info(
+                "PAPER TRADE EXECUTED [Depth-Aware] | Side: %s | VWAP: %.4f | Filled: $%.0f | "
+                "Remaining: $%.0f | Market: %s | token: %s | Levels swept: %d",
+                side, vwap_price, filled_size, remaining,
+                order.market[:55], token_id[:16],
+                min(book_side_count, MAX_BOOK_SWEEP_LEVELS),
+            )
+
+        return filled_positions
+
+    # ── Rule 4: Realistic Take Profit (Maker Limit Orders) ────────────────
+
+    def register_tp_limit_order(
+        self,
+        position_id: int,
+        token_id: str,
+        market: str,
+        strategy: str,
+        side: str,
+        target_price: float,
+        size: float,
+        entry: float,
+    ) -> "TPLimitOrder | None":
+        """Rule 4: Registra una orden límite de Take Profit (Maker-style).
+
+        En lugar de ejecutar un Market Sweep que arruina la rentabilidad,
+        coloca una orden Limit que solo se considera filled cuando el
+        precio cruzado en el CLOB la atraviesa con volumen real.
+
+        Returns None si ya existe una orden de TP para esta posición.
+        """
+        if position_id in self._tp_limit_orders:
+            return None  # ya existe
+
+        self._tp_order_counter += 1
+        tp_order = TPLimitOrder(
+            id=self._tp_order_counter,
+            position_id=position_id,
+            token_id=token_id,
+            market=market,
+            strategy=strategy,
+            side=side,
+            target_price=target_price,
+            size=size,
+            entry=entry,
+        )
+        self._tp_limit_orders[position_id] = tp_order
+        logger.info(
+            "TP LIMIT ORDER #%d | pos=%d side=%s target=%.4f size=$%.0f | %s",
+            tp_order.id, position_id, side, target_price, size, market[:50],
+        )
+        return tp_order
+
+    async def check_tp_cross(
+        self,
+        book_snap: "BookSnapshot",
+        token_id: str,
+    ) -> list[dict]:
+        """Rule 4: Verifica si alguna orden TP límite ha sido cruzada por el mercado.
+
+        Para YES: si el best_bid >= target_price → cerramos vendiendo al best_bid.
+        Para NO:  si el best_ask <= target_price → cerramos comprando al best_ask.
+
+        Solo ejecuta si el nivel que cruza supera el Ghost Liquidity Filter ($25).
+
+        Returns list[dict] de trades cerrados.
+        """
+        closed_trades: list[dict] = []
+
+        if book_snap is None or book_snap.bid_count == 0 or book_snap.ask_count == 0:
+            return closed_trades
+
+        # Filtrar ghost liquidity en best bid/ask
+        bb_idx = self._filter_ghost_liquidity(book_snap.bids, book_snap.bid_count)
+        ba_idx = self._filter_ghost_liquidity(book_snap.asks, book_snap.ask_count)
+
+        valid_bb = float(book_snap.bids[bb_idx, 0]) if bb_idx >= 0 else 0.0
+        valid_ba = float(book_snap.asks[ba_idx, 0]) if ba_idx >= 0 else 0.0
+
+        now = time.time()
+        to_remove: list[int] = []
+
+        for pos_id, tp_order in list(self._tp_limit_orders.items()):
+            if tp_order.token_id != token_id:
+                continue
+
+            # TTL check
+            if (now - tp_order.created_at) > TP_LIMIT_ORDER_TTL:
+                to_remove.append(pos_id)
+                logger.debug("TP LIMIT TTL expired: pos=%d target=%.4f", pos_id, tp_order.target_price)
+                continue
+
+            crossed = False
+            close_price = 0.0
+
+            if tp_order.side == "YES":
+                if valid_bb > 0 and valid_bb >= tp_order.target_price:
+                    crossed = True
+                    close_price = valid_bb
+            else:  # NO
+                if valid_ba > 0 and valid_ba <= tp_order.target_price:
+                    crossed = True
+                    close_price = valid_ba
+
+            if crossed:
+                if not self._check_price_sanity(close_price):
+                    logger.warning(
+                        "TP CROSS SANITY FAIL pos=%d: price=%.4f — rechazado",
+                        pos_id, close_price,
+                    )
+                    to_remove.append(pos_id)
+                    continue
+
+                trade = await self.close_position(
+                    position_id=pos_id,
+                    close_price=close_price,
+                    reason="tp_limit",
+                    apply_slippage=False,  # Maker: sin slippage
+                )
+                if trade:
+                    closed_trades.append(trade)
+                    logger.info(
+                        "TP LIMIT FILLED #%d | pos=%d side=%s target=%.4f filled@%.4f | %s",
+                        tp_order.id, pos_id, tp_order.side,
+                        tp_order.target_price, close_price,
+                        tp_order.market[:50],
+                    )
+                to_remove.append(pos_id)
+
+        for pos_id in to_remove:
+            self._tp_limit_orders.pop(pos_id, None)
+
+        return closed_trades
+
+    # ── Rule 2+3: MTM Institucional con Ghost Filter y Lógica NO Asimétrica ──
+
+    async def mark_to_market_v2(
+        self,
+        book_analyzer: "BookAnalyzer",
+    ) -> dict[str, int]:
+        """Mark-to-Market institucional usando datos L2 reales del CLOB.
+
+        Rule 2 (Ghost Liquidity Filter):
+            Ignora cualquier nivel de price cuyo size sea < $25.
+            Si un market maker retira sus órdenes y queda una orden
+            residual de $1 a precio 0.99, NO se usa ese 0.99 para MTM.
+
+        Rule 3 (MTM NO Asimétrico):
+            exit_value_NO = 1 - VWAP_of_real_ba(required_size).
+            Si el lado del Ask está vacío o no tiene liquidez suficiente,
+            el PnL no se puede calcular (None) y la posición se mantiene.
+
+        Parameters
+        ----------
+        book_analyzer : BookAnalyzer
+            Referencia al analizador de order books con datos CLOB L2.
+
+        Returns
+        -------
+        dict[str, int]
+            Estadísticas: {positions_updated, positions_skipped_no_book,
+                           positions_skipped_ghost, positions_no_ask_empty}
+        """
+        stats = {
+            "positions_updated": 0,
+            "positions_skipped_no_book": 0,
+            "positions_skipped_ghost": 0,
+            "positions_no_ask_empty": 0,
+        }
+
+        async with self._lock:
+            for pos in self._positions:
+                if pos.closed_at is not None:
+                    continue
+                if not pos.token_id:
+                    stats["positions_skipped_no_book"] += 1
+                    continue
+
+                book_snap = book_analyzer.get_book(pos.token_id)
+                if book_snap is None or (book_snap.bid_count == 0 and book_snap.ask_count == 0):
+                    stats["positions_skipped_no_book"] += 1
+                    continue
+
+                if pos.side == "YES":
+                    # ── YES: mark = best valid bid (lo que recibimos al vender) ──
+                    bid_idx = self._filter_ghost_liquidity(
+                        book_snap.bids, book_snap.bid_count,
+                    )
+                    if bid_idx < 0:
+                        stats["positions_skipped_ghost"] += 1
+                        logger.debug(
+                            "MTM GHOST SKIP #%d [YES] %s: no bid >= $%.0f — mark congelado",
+                            pos.id, pos.token_id[:16], GHOST_LIQUIDITY_MIN_SIZE,
+                        )
+                        continue
+
+                    valid_bid = float(book_snap.bids[bid_idx, 0])
+                    valid_bid_size = float(book_snap.bids[bid_idx, 1])
+
+                    if not self._check_price_sanity(valid_bid):
+                        stats["positions_skipped_ghost"] += 1
+                        continue
+
+                    prev_mark = pos.mark
+                    pos.mark = valid_bid
+                    pos.pnl = round((pos.mark - pos.entry) * pos.size, 2)
+                    pos.pnl_pct = round((pos.pnl / pos.size) * 100, 2) if pos.size > 0 else 0.0
+                    stats["positions_updated"] += 1
+
+                    logger.debug(
+                        "MTM #%d [YES] %s: mark=%.4f (was %.4f) bid_size=$%.0f ghost_filter=OK",
+                        pos.id, pos.token_id[:16], pos.mark, prev_mark, valid_bid_size,
+                    )
+
+                else:  # NO — Rule 3: Lógica Asimétrica
+                    # ── NO: exit_value_NO = 1 - VWAP_of_real_ba(required_size) ──
+                    ask_idx = self._filter_ghost_liquidity(
+                        book_snap.asks, book_snap.ask_count,
+                    )
+                    if ask_idx < 0:
+                        stats["positions_no_ask_empty"] += 1
+                        logger.warning(
+                            "MTM NO ASK EMPTY #%d [NO] %s: ask side vacío o < $%.0f — "
+                            "PnL NO calculable, posición mantenida",
+                            pos.id, pos.token_id[:16], GHOST_LIQUIDITY_MIN_SIZE,
+                        )
+                        continue
+
+                    # Barrer el ask para el tamaño de la posición (VWAP)
+                    required_size = pos.size
+                    vwap_ask, filled, remaining = self._sweep_book_vwap(
+                        book_snap.asks, book_snap.ask_count, required_size, "BUY",
+                    )
+
+                    if filled <= 0 or vwap_ask <= 0:
+                        stats["positions_no_ask_empty"] += 1
+                        logger.warning(
+                            "MTM NO NO LIQUIDITY #%d [NO] %s: required=$%.0f filled=$%.0f — "
+                            "PnL NO calculable, posición mantenida",
+                            pos.id, pos.token_id[:16], required_size, filled,
+                        )
+                        continue
+
+                    # exit_value_NO = 1 - VWAP(asks)
+                    exit_value_no = round(1.0 - vwap_ask, 6)
+
+                    if not self._check_price_sanity(exit_value_no) and not self._check_price_sanity(vwap_ask):
+                        stats["positions_skipped_ghost"] += 1
+                        continue
+
+                    prev_mark = pos.mark
+                    pos.mark = exit_value_no
+                    pos.pnl = round((pos.mark - pos.entry) * pos.size, 2)
+                    pos.pnl_pct = round((pos.pnl / pos.size) * 100, 2) if pos.size > 0 else 0.0
+                    stats["positions_updated"] += 1
+
+                    logger.debug(
+                        "MTM #%d [NO] %s: vwap_ask=%.4f → exit_value_no=%.4f (was %.4f) "
+                        "filled=$%.0f remaining=$%.0f",
+                        pos.id, pos.token_id[:16], vwap_ask, pos.mark, prev_mark,
+                        filled, remaining,
+                    )
+
+                pos.liquidation_zone = pos.tau_pct > 85
+
+        return stats
+
+    # ── Auto-Close con TP Maker (Rule 4) ───────────────────────────────────
+
+    async def evaluate_auto_close_v2(
+        self,
+        book_analyzer: "BookAnalyzer" = None,
+    ) -> list[dict]:
+        """Evalúa criterios de cierre automático con reglas institucionales.
+
+        Rule 4 (Realistic Take Profit):
+            Cuando el precio alcanza el objetivo de TP, NO se simula una
+            orden de mercado. Se coloca una orden Limit (Maker) que solo
+            se ejecutará cuando el mercado la cruce con volumen real
+            (verificado en check_tp_cross).
+
+        SL, tau, y expired siguen usando cierre a mercado (son urgentes).
+        """
+        closed = []
+        positions = list(self._positions)
+        for pos in positions:
+            if pos.closed_at is not None:
+                continue
+
+            reason = None
+            if pos.pnl_pct >= TP_PCT * 100:
+                # ── Rule 4: TP → Maker Limit Order, NO Market Sweep ──
+                if pos.token_id and book_analyzer:
+                    book_snap = book_analyzer.get_book(pos.token_id)
+                    if book_snap and book_snap.bid_count > 0 and book_snap.ask_count > 0:
+                        target = pos.mark
+                        self.register_tp_limit_order(
+                            position_id=pos.id,
+                            token_id=pos.token_id,
+                            market=pos.market,
+                            strategy=pos.strategy,
+                            side=pos.side,
+                            target_price=target,
+                            size=pos.size,
+                            entry=pos.entry,
+                        )
+                        logger.info(
+                            "TP MAKER #%d [%s] side=%s target=%.4f size=$%.0f → orden límite registrada",
+                            pos.id, pos.strategy, pos.side, target, pos.size,
+                        )
+                    else:
+                        reason = "tp"
+                else:
+                    reason = "tp"
+            elif pos.pnl_pct <= -SL_PCT * 100:
+                reason = "sl"
+            elif pos.tau_pct >= TAU_LIQUIDATION * 100:
+                reason = "tau"
+            elif (time.time() - pos.opened_at) > MAX_POSITION_AGE_H * 3600:
+                reason = "expired"
+
+            if reason:
+                trade = await self.close_position(pos.id, reason=reason)
+                if trade:
+                    self._tp_limit_orders.pop(pos.id, None)
+                    closed.append(trade)
+
+        return closed
+
     def get_open_orders(self) -> list[dict]:
         """Retorna las órdenes límite virtuales activas (para el dashboard)."""
         now = time.time()
@@ -390,6 +1028,26 @@ class PaperTradingEngine:
             }
             for o in self._pending_quotes.values()
             if (now - o.created_at) <= ORDER_TTL_SECONDS
+        ]
+
+    def get_tp_limit_orders(self) -> list[dict]:
+        """Retorna las órdenes límite de Take Profit activas (para el dashboard)."""
+        now = time.time()
+        return [
+            {
+                "id": o.id,
+                "position_id": o.position_id,
+                "token_id": o.token_id,
+                "market": o.market,
+                "strategy": o.strategy,
+                "side": o.side,
+                "target_price": round(o.target_price, 4),
+                "size": round(o.size, 2),
+                "entry": round(o.entry, 4),
+                "age_s": round(now - o.created_at, 1),
+            }
+            for o in self._tp_limit_orders.values()
+            if (now - o.created_at) <= TP_LIMIT_ORDER_TTL
         ]
 
     # ── Execution ───────────────────────────────────────────────────────────────────
@@ -840,23 +1498,27 @@ class PaperTradingEngine:
             "trades_cleared": len(self._trade_history),
             "equity_snapshots_cleared": len(self._equity_log),
             "pending_quotes_cleared": len(self._pending_quotes),
+            "tp_limit_orders_cleared": len(self._tp_limit_orders),
         }
         self._positions.clear()
         self._trade_history.clear()
         self._equity_log.clear()
         self._pending_quotes.clear()
+        self._tp_limit_orders.clear()
         self._position_counter = 0
         self._order_counter = 0
+        self._tp_order_counter = 0
         # Resetear billetera a valores iniciales
         self.wallet.usdc_free = DEFAULT_INITIAL_USDC
         self.wallet.usdc_collateral = 0.0
         self.wallet.pol_balance = DEFAULT_INITIAL_POL
         logger.warning(
             "🔴 PAPER TRADING NUCLEAR RESET: %d posiciones, %d trades, "
-            "%d equity snapshots, %d pending quotes eliminados. "
+            "%d equity snapshots, %d pending quotes, %d TP limit orders eliminados. "
             "Billetera resetada a $%.0f USDC + %.0f POL.",
             result["positions_cleared"], result["trades_cleared"],
             result["equity_snapshots_cleared"], result["pending_quotes_cleared"],
+            result["tp_limit_orders_cleared"],
             DEFAULT_INITIAL_USDC, DEFAULT_INITIAL_POL,
         )
         return result

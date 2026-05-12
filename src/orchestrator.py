@@ -569,25 +569,34 @@ class ScoutOrchestrator:
     # ── Paper Trading Loops ─────────────────────────────────────────────────────────────────────────────
 
     async def _paper_mtm_loop(self) -> None:
-        """Mark-to-market: actualiza precios y P&L de posiciones abiertas."""
-        logger.info("PaperTrading MTM daemon iniciado")
+        """Mark-to-market institucional: usa CLOB L2 con Ghost Filter y lógica NO asimétrica."""
+        logger.info("PaperTrading MTM daemon iniciado (v2: Depth-Aware + Ghost Filter)")
         while self._running:
             try:
-                # Construir price_source haciendo fuzzy match con los precios del radar
-                price_source: dict[str, float] = {}
-                if self._market_prices:
-                    for pos in self.paper_trading._positions:
-                        if pos.closed_at is not None:
-                            continue
-                        # Buscar el mercado en los precios del radar (fuzzy match)
-                        pos_key = pos.market.lower().strip("?")
-                        for radar_name, radar_price in self._market_prices.items():
-                            # Fuzzy match: si comparten keywords significativas
-                            if _fuzzy_market_match(pos_key, radar_name):
-                                price_source[pos.market] = radar_price
-                                break
-
-                await self.paper_trading.mark_to_market(price_source)
+                # ── Rule 2+3: MTM institucional con BookAnalyzer (CLOB L2) ──
+                if self.book_analyzer and len(self.book_analyzer) > 0:
+                    stats = await self.paper_trading.mark_to_market_v2(self.book_analyzer)
+                    if stats["positions_skipped_ghost"] > 0 or stats["positions_no_ask_empty"] > 0:
+                        logger.warning(
+                            "MTM v2 stats: updated=%d no_book=%d ghost=%d no_ask=%d",
+                            stats["positions_updated"],
+                            stats["positions_skipped_no_book"],
+                            stats["positions_skipped_ghost"],
+                            stats["positions_no_ask_empty"],
+                        )
+                else:
+                    # Fallback: usar precios Gamma del radar si no hay CLOB L2
+                    price_source: dict[str, float] = {}
+                    if self._market_prices:
+                        for pos in self.paper_trading._positions:
+                            if pos.closed_at is not None:
+                                continue
+                            pos_key = pos.market.lower().strip("?")
+                            for radar_name, radar_price in self._market_prices.items():
+                                if _fuzzy_market_match(pos_key, radar_name):
+                                    price_source[pos.market] = radar_price
+                                    break
+                    await self.paper_trading.mark_to_market(price_source)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -595,11 +604,15 @@ class ScoutOrchestrator:
             await asyncio.sleep(PAPER_MTM_INTERVAL)
 
     async def _paper_auto_close_loop(self) -> None:
-        """Evalúa TP/SL/tau y cierra posiciones automáticamente."""
-        logger.info("PaperTrading auto-close daemon iniciado")
+        """Evalúa TP/SL/tau y cierra posiciones automáticamente (v2: TP Maker)."""
+        logger.info("PaperTrading auto-close daemon iniciado (v2: TP Maker Limit Orders)")
         while self._running:
             try:
-                closed = await self.paper_trading.evaluate_auto_close()
+                # ── Rule 4: TP usa Maker Limit Orders; SL/tau/expired usan Market Close ──
+                if self.book_analyzer and len(self.book_analyzer) > 0:
+                    closed = await self.paper_trading.evaluate_auto_close_v2(self.book_analyzer)
+                else:
+                    closed = await self.paper_trading.evaluate_auto_close()
                 if closed:
                     logger.info("PaperTrading: %d posiciones cerradas automáticamente", len(closed))
             except asyncio.CancelledError:
@@ -1646,22 +1659,33 @@ class ScoutOrchestrator:
                     self.book_analyzer.apply_delta(asset_id, data)
 
                 # ── Cross Engine: cruzar precio real contra órdenes límite virtuales ──
-                # Solo si hay órdenes virtuales pendientes para algún token.
+                # Rule 1: Depth-Aware Fill con VWAP Sweep del L2 completo
                 if self.paper_trading._pending_quotes:
                     book_snap = self.book_analyzer.get_book(asset_id)
                     if book_snap and book_snap.bid_count > 0 and book_snap.ask_count > 0:
-                        real_best_bid = float(book_snap.bids[0, 0])
-                        real_best_ask = float(book_snap.asks[0, 0])
                         try:
                             loop = asyncio.get_event_loop()
                             if loop.is_running():
                                 asyncio.ensure_future(
-                                    self.paper_trading.cross_and_fill(
-                                        asset_id, real_best_bid, real_best_ask,
+                                    self.paper_trading.cross_and_fill_depth_aware(
+                                        asset_id, book_snap,
                                     )
                                 )
                         except RuntimeError:
                             pass  # sin event loop activo (e.g., tests)
+
+                # ── Rule 4: Verificar TP Limit Orders (Maker-style) ──
+                if self.paper_trading._tp_limit_orders:
+                    book_snap = self.book_analyzer.get_book(asset_id)
+                    if book_snap and book_snap.bid_count > 0 and book_snap.ask_count > 0:
+                        try:
+                            loop = asyncio.get_event_loop()
+                            if loop.is_running():
+                                asyncio.ensure_future(
+                                    self.paper_trading.check_tp_cross(book_snap, asset_id)
+                                )
+                        except RuntimeError:
+                            pass
 
                 # ── CLOB Micro-Price para estrategias direccionales ─────
                 # Cada book event produce un micro-price que alimenta
