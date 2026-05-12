@@ -308,6 +308,7 @@ class AdaptiveStrategyEngine:
         # Calcular ATR (Average True Range) simplificado
         tr_list = [abs(prices[i] - prices[i-1]) for i in range(1, len(prices))]
         atr = sum(tr_list) / len(tr_list) if tr_list else 0.001
+        atr = max(atr, 0.001)  # evitar division by zero con precios estables (CLOB)
         
         # Calcular DI+ y DI-
         di_plus = (sum(dm_plus) / len(dm_plus)) / atr * 100 if dm_plus else 0
@@ -319,6 +320,7 @@ class AdaptiveStrategyEngine:
         # Simplificación: usar volatilidad direccional
         total_move = abs(prices[-1] - prices[0])
         volatility = sum(tr_list) / len(tr_list) if tr_list else 0.001
+        volatility = max(volatility, 0.001)  # misma protección
         
         # Trending si el movimiento neto es significativo vs la volatilidad
         trending_score = total_move / volatility if volatility > 0 else 0
