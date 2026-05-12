@@ -43,6 +43,7 @@ from src.signal_pipeline import SignalPipeline
 from src.price_history import PriceHistory
 from src.adaptive_strategy_engine import AdaptiveStrategyEngine
 from src.trading_logger import trading_log
+from src.correlation_graph import CorrelationGraph
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +132,15 @@ class ScoutOrchestrator:
             state_file="data/adaptive_state.json"
         )
 
+        # ── Correlation Graph ──────────────────────────────────────────────
+        self.correlation_graph = CorrelationGraph()
+
+        # Inyectar contexto externo para correlation_arb y whale_follow
+        self.adaptive_engine.set_external_context(
+            correlation_graph=self.correlation_graph,
+            whale_tracker=self.whale_tracker,
+        )
+
         # ── Price History ───────────────────────────────────────────────────
         self.price_history = PriceHistory()
 
@@ -156,6 +166,7 @@ class ScoutOrchestrator:
         self._mm_last_quote_time: float = 0.0
         self._mm_errors: int = 0
         self._mm_active_tokens: set = set()  # token_ids actualmente suscritos
+        self._mm_bandit_blocked: bool = False  # trackear cambios de estado MM en el Bandit
 
     # ── Lifecycle ─────────────────────────────────────────────────
 
@@ -311,6 +322,13 @@ class ScoutOrchestrator:
 
                 # ── Guardar historial persistente de precios ──
                 self.price_history.save_snapshots(snapshots)
+
+                # ── Reconstruir grafo de correlación con datos frescos ──
+                if snapshots:
+                    try:
+                        self.correlation_graph.build(snapshots)
+                    except Exception as e:
+                        logger.debug("Correlation graph build error: %s", e)
 
                 # ── Log radar en consola ──
                 logger.info(
@@ -610,6 +628,9 @@ class ScoutOrchestrator:
             "momentum": "momentum_follow",
             "mean_reversion": "contrarian",
             "volume_breakout": "volume_breakout",
+            "consensus_breakout": "consensus_breakout",
+            "correlation_arb": "correlation_arb",
+            "whale_follow": "whale_follow",
         }
 
         while self._running:
@@ -907,6 +928,25 @@ class ScoutOrchestrator:
                 quotes_this_cycle = 0
                 import time as _time
                 now = _time.time()
+
+                # ── FIX: Respetar estado del Bandit ──────────────────────────
+                # Si el Bandit ha congelado o retirado market_making,
+                # no generamos quotes. La suscripción WS sigue activa
+                # para que el L2 book esté caliente si se reactiva.
+                mm_state = self.portfolio_manager.get_strategy_state("market_making")
+                mm_blocked = mm_state is not None and mm_state.status.value in ("frozen", "retired")
+                if mm_blocked != self._mm_bandit_blocked:
+                    self._mm_bandit_blocked = mm_blocked
+                    if mm_blocked:
+                        logger.warning(
+                            "MM BLOCKED by Bandit: market_making status=%s — quotes detenidas hasta recuperación",
+                            mm_state.status.value,
+                        )
+                    else:
+                        logger.info("MM REACTIVATED by Bandit: market_making status=%s", mm_state.status.value)
+                if mm_blocked:
+                    await asyncio.sleep(MM_QUOTE_INTERVAL)
+                    continue
 
                 for token_id in list(self._mm_active_tokens):
                     if not self._running:
