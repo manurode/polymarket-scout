@@ -141,11 +141,26 @@ class AdaptiveStrategyEngine:
         self.adaptive_thresholds: dict[str, AdaptiveThresholds] = {}
         self.market_regimes: dict[str, str] = {}  # condition_id -> regime
         
+        # Contexto externo (inyectado por el orchestrator)
+        self._correlation_graph: Optional[object] = None
+        self._whale_tracker: Optional[object] = None
+        
         # Cargar estado previo
         self._load_state()
         
         # Inicializar umbrales adaptativos
         self._init_thresholds()
+
+    def set_external_context(
+        self,
+        correlation_graph: Optional[object] = None,
+        whale_tracker: Optional[object] = None,
+    ) -> None:
+        """Inyecta componentes externos necesarios para correlation_arb y whale_follow."""
+        if correlation_graph is not None:
+            self._correlation_graph = correlation_graph
+        if whale_tracker is not None:
+            self._whale_tracker = whale_tracker
 
     def _init_thresholds(self) -> None:
         """Inicializa umbrales para cada estrategia."""
@@ -167,6 +182,18 @@ class AdaptiveStrategyEngine:
                     volume_spike_ratio=_PT_VOLUME_SPIKE_RATIO,
                     min_confidence=_PT_MIN_CONFIDENCE,
                 ),
+                "consensus_breakout": AdaptiveThresholds(
+                    "consensus_breakout",
+                    min_confidence=_PT_MIN_CONFIDENCE,
+                ),
+                "correlation_arb": AdaptiveThresholds(
+                    "correlation_arb",
+                    min_confidence=_PT_MIN_CONFIDENCE,
+                ),
+                "whale_follow": AdaptiveThresholds(
+                    "whale_follow",
+                    min_confidence=_PT_MIN_CONFIDENCE,
+                ),
             }
             logger.info(
                 "AdaptiveEngine: modo HIPERACTIVO activado — "
@@ -179,11 +206,24 @@ class AdaptiveStrategyEngine:
                 "momentum": AdaptiveThresholds("momentum", momentum_threshold=0.02),
                 "mean_reversion": AdaptiveThresholds("mean_reversion", mean_rev_deviation=0.05),
                 "volume_breakout": AdaptiveThresholds("volume_breakout", volume_spike_ratio=2.5),
+                "consensus_breakout": AdaptiveThresholds("consensus_breakout"),
+                "correlation_arb": AdaptiveThresholds("correlation_arb"),
+                "whale_follow": AdaptiveThresholds("whale_follow"),
             }
         
         for name, thresh in defaults.items():
-            if name not in self.adaptive_thresholds:
+            if PAPER_TRADING_HYPERACTIVE:
+                # Modo hiperactivo: sobreescribir SIEMPRE los umbrales desde
+                # el JSON persistente. Así el estado guardado es el canónico
+                # y _adapt_parameters() puede modificarlo en runtime.
                 self.adaptive_thresholds[name] = thresh
+            elif name not in self.adaptive_thresholds:
+                self.adaptive_thresholds[name] = thresh
+
+        # Guardar inmediatamente para que adaptive_state.json refleje
+        # los umbrales hiperactivos desde el primer ciclo.
+        if PAPER_TRADING_HYPERACTIVE:
+            self._save_state()
 
     def _load_state(self) -> None:
         """Carga estado previo de disco."""
@@ -728,7 +768,90 @@ class AdaptiveStrategyEngine:
                             confidence=round(conf, 2),
                             reason=f"Volumen {vol_spike:.1f}x (umbral: {threshold:.1f}x)",
                         ))
-        
+
+        # 4. Consensus Breakout — ensemble de las 3 estrategias base
+        # Si 2+ estrategias generan señal en la MISMA dirección para este mercado,
+        # emitimos una señal de consenso con confianza potenciada.
+        t = thresh.get("consensus_breakout")
+        if t and t.enabled and len(signals) >= 2:
+            sides = [s.side for s in signals if s.strategy in ("momentum", "mean_reversion", "volume_breakout")]
+            if len(sides) >= 2 and len(set(sides)) == 1:
+                # Todas coinciden en dirección → consenso
+                best_conf = max(s.confidence for s in signals if s.strategy in ("momentum", "mean_reversion", "volume_breakout"))
+                consensus_conf = min(best_conf * 1.3, 0.95)  # boost del 30%, cap 0.95
+                if consensus_conf > t.min_confidence:
+                    active_strats = [s.strategy for s in signals if s.strategy in ("momentum", "mean_reversion", "volume_breakout")]
+                    signals.append(Signal(
+                        market=history.question[:60],
+                        question=history.question,
+                        condition_id=cid,
+                        strategy="consensus_breakout",
+                        side=sides[0],
+                        entry_price=history.current_price or 0,
+                        confidence=round(consensus_conf, 2),
+                        reason=f"Consenso {len(sides)}/3 estrategias ({', '.join(active_strats)}) → {sides[0]}",
+                    ))
+
+        # 5. Correlation Arbitrage — busca discrepancias entre mercados relacionados
+        # Necesita acceso al CorrelationGraph, que se inyecta vía set_external_context().
+        t = thresh.get("correlation_arb")
+        if t and t.enabled and self._correlation_graph is not None:
+            try:
+                arb_opps = self._correlation_graph.find_arbitrage_opportunities()
+                for opp in arb_opps:
+                    if not opp.meets_hurdle:
+                        continue
+                    # Buscar si alguno de los mercados del arb coincide con este cid
+                    if cid in opp.markets:
+                        conf = min(opp.gross_profit_pct / 10.0, 0.85)
+                        if conf > t.min_confidence:
+                            signals.append(Signal(
+                                market=history.question[:60],
+                                question=history.question,
+                                condition_id=cid,
+                                strategy="correlation_arb",
+                                side="YES" if opp.gross_profit_pct > 0 else "NO",
+                                entry_price=history.current_price or 0,
+                                confidence=round(conf, 2),
+                                reason=f"Arb {opp.type} profit={opp.gross_profit_pct:.1%} annual={opp.annualized_return:.1%}",
+                            ))
+            except Exception as e:
+                logger.debug("Correlation arb signal error: %s", e)
+
+        # 6. Whale Follow — sigue el flujo de ballenas on-chain
+        # Necesita acceso al WhaleTracker, inyectado vía set_external_context().
+        t = thresh.get("whale_follow")
+        if t and t.enabled and self._whale_tracker is not None:
+            try:
+                flow = self._whale_tracker.get_whale_flow(cid)
+                if flow and flow.timestamp > 0:
+                    # Señal solo si hay ballenas activas y consenso claro
+                    if flow.active_whales >= 2 and flow.whale_consensus > 0.6:
+                        side = "YES" if flow.bullish_whales > flow.bearish_whales else "NO"
+                        # Confianza: combinación de zscore + consenso + num whales
+                        zscore_norm = min(abs(flow.whale_zscore) / 3.0, 1.0)
+                        conf = min(
+                            zscore_norm * 0.4 + flow.whale_consensus * 0.4 + min(flow.active_whales / 10.0, 1.0) * 0.2,
+                            0.85,
+                        )
+                        if conf > t.min_confidence:
+                            signals.append(Signal(
+                                market=history.question[:60],
+                                question=history.question,
+                                condition_id=cid,
+                                strategy="whale_follow",
+                                side=side,
+                                entry_price=history.current_price or 0,
+                                confidence=round(conf, 2),
+                                reason=(
+                                    f"Whales: {flow.active_whales} activas "
+                                    f"({flow.bullish_whales}B/{flow.bearish_whales}S) "
+                                    f"consenso={flow.whale_consensus:.0%} z={flow.whale_zscore:.1f}"
+                                ),
+                            ))
+            except Exception as e:
+                logger.debug("Whale follow signal error: %s", e)
+
         return signals
 
     def get_status_report(self) -> dict:
