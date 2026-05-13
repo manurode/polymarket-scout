@@ -604,15 +604,24 @@ class ScoutOrchestrator:
             await asyncio.sleep(PAPER_MTM_INTERVAL)
 
     async def _paper_auto_close_loop(self) -> None:
-        """Evalúa TP/SL/tau y cierra posiciones automáticamente (v2: TP Maker)."""
-        logger.info("PaperTrading auto-close daemon iniciado (v2: TP Maker Limit Orders)")
+        """Evalúa TP/SL/tau + active exits y cierra posiciones automáticamente (v2: TP Maker)."""
+        logger.info("PaperTrading auto-close daemon iniciado (v2: TP Maker + Active Exits)")
         while self._running:
             try:
                 # ── Rule 4: TP usa Maker Limit Orders; SL/tau/expired usan Market Close ──
+                # ── Active Exits: time_decay + trailing_stop integrados en evaluate ──
                 if self.book_analyzer and len(self.book_analyzer) > 0:
                     closed = await self.paper_trading.evaluate_auto_close_v2(self.book_analyzer)
                 else:
                     closed = await self.paper_trading.evaluate_auto_close()
+
+                # ── Momentum Reversal Exit: cerrar si el momentum se invirtió ──
+                mom_map = self._build_momentum_map()
+                if mom_map:
+                    reversal_closed = await self.paper_trading.evaluate_momentum_reversal(mom_map)
+                    if reversal_closed:
+                        closed.extend(reversal_closed)
+
                 if closed:
                     logger.info("PaperTrading: %d posiciones cerradas automáticamente", len(closed))
             except asyncio.CancelledError:
@@ -620,6 +629,37 @@ class ScoutOrchestrator:
             except Exception as e:
                 logger.error("Error en paper auto-close: %s", e)
             await asyncio.sleep(PAPER_AUTO_CLOSE_INTERVAL)
+
+    def _build_momentum_map(self) -> dict[str, float]:
+        """Construye un mapping token_id → momentum_value desde el SignalPipeline.
+
+        Usa los últimos snapshots del radar para mapear condition_id → token_id,
+        y extrae el momentum actual del MarketHistory de cada mercado.
+        """
+        momentum_map: dict[str, float] = {}
+        snapshots = getattr(self, '_last_radar_snapshots', [])
+        if not snapshots:
+            return momentum_map
+
+        pipeline = self.adaptive_engine.pipeline
+
+        # Construir condition_id → token_id desde los snapshots
+        cid_to_token: dict[str, str] = {}
+        for snap in snapshots:
+            cid = snap.get("condition_id", "")
+            tokens = snap.get("clobTokenIds", [])
+            if cid and isinstance(tokens, list) and tokens:
+                cid_to_token[cid] = tokens[0]  # YES token
+
+        # Extraer momentum de cada MarketHistory
+        for cid, history in pipeline._history.items():
+            mom = history.momentum
+            if mom is not None:
+                token_id = cid_to_token.get(cid)
+                if token_id:
+                    momentum_map[token_id] = mom
+
+        return momentum_map
 
     async def _equity_logger_loop(self) -> None:
         """Equity Logger Daemon: guarda una foto del equity total cada EQUITY_LOG_INTERVAL segundos.

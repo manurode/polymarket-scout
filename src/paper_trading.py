@@ -45,6 +45,22 @@ SL_PCT = 0.10          # Stop Loss: -10% sobre precio de entrada
 TAU_LIQUIDATION = 0.95  # Liquidación forzosa si tau > 95%
 MAX_POSITION_AGE_H = 72  # Cierre forzoso tras 72h
 
+# ── Active Exit Logic (Mainnet Prep) ─────────────────────────────────────────
+# Time-Decay Stale Trade Guard
+DIRECTIONAL_TTL_HOURS = 4.0       # TTL para estrategias direccionales
+DIRECTIONAL_TP_TARGET = TP_PCT    # Objetivo de TP para direccionales (15%)
+STALE_TRADE_PNL_THRESHOLD = 0.50  # Si PnL < 50% del objetivo TP → stale trade
+
+# Trailing Stop (asegurar ganancias reales)
+TRAILING_ACTIVATION_PCT = 3.0     # Activar trailing cuando unrealized PnL >= +3%
+TRAILING_DISTANCE_PCT = 1.5       # Distancia del trailing stop (1.5%)
+
+# Momentum Reversal Exit
+MOMENTUM_DIRECTIONAL_STRATEGIES = frozenset({
+    "momentum_follow", "momentum",
+})
+MOMENTUM_REVERSAL_THRESHOLD = 0.005  # 0.5% — cruce de línea cero
+
 # Realismo del simulador
 SLIPPAGE_PCT = 0.01      # 1% de slippage en mercados normales
 SLIPPAGE_THIN_BOOK = 0.03  # 3% de slippage en libros finos (order_count < 20, size > $50)
@@ -95,6 +111,9 @@ class VirtualPosition:
     opened_at: float = field(default_factory=time.time)
     closed_at: float | None = None
     close_reason: str | None = None  # "tp", "sl", "tau", "manual", "expired"
+    # ── Active Exit Logic: Trailing Stop ───────────────────────────────
+    trailing_activated: bool = False   # Se activa cuando PnL >= +3%
+    trailing_peak_pnl_pct: float = 0.0  # Pico máximo de PnL% alcanzado
 
 
 @dataclass
@@ -947,6 +966,24 @@ class PaperTradingEngine:
 
                 pos.liquidation_zone = pos.tau_pct > 85
 
+                # ── Active Exit: Trailing Stop peak tracking ────────────
+                if pos.pnl_pct >= TRAILING_ACTIVATION_PCT:
+                    if not pos.trailing_activated:
+                        pos.trailing_activated = True
+                        pos.trailing_peak_pnl_pct = pos.pnl_pct
+                        logger.info(
+                            "TRAILING ACTIVATED #%d [%s] side=%s pnl=%.1f%% peak=%.1f%%",
+                            pos.id, pos.market[:40], pos.side,
+                            pos.pnl_pct, pos.trailing_peak_pnl_pct,
+                        )
+                    elif pos.pnl_pct > pos.trailing_peak_pnl_pct:
+                        prev_peak = pos.trailing_peak_pnl_pct
+                        pos.trailing_peak_pnl_pct = pos.pnl_pct
+                        logger.debug(
+                            "TRAILING UPDATE #%d [%s] peak %.1f%% → %.1f%%",
+                            pos.id, pos.market[:40], prev_peak, pos.trailing_peak_pnl_pct,
+                        )
+
         return stats
 
     # ── Auto-Close con TP Maker (Rule 4) ───────────────────────────────────
@@ -954,6 +991,7 @@ class PaperTradingEngine:
     async def evaluate_auto_close_v2(
         self,
         book_analyzer: "BookAnalyzer" = None,
+        signal_pipeline=None,  # SignalPipeline para Momentum Reversal Exit
     ) -> list[dict]:
         """Evalúa criterios de cierre automático con reglas institucionales.
 
@@ -963,15 +1001,38 @@ class PaperTradingEngine:
             se ejecutará cuando el mercado la cruce con volumen real
             (verificado en check_tp_cross).
 
+        Active Exit Logic (Mainnet Prep):
+            - Time-Decay: fuerza cierre de direccionales stale (>4h, PnL < 50% TP)
+            - Trailing Stop: asegura ganancias cuando PnL >= 3% y retrocede 1.5%
+
         SL, tau, y expired siguen usando cierre a mercado (son urgentes).
         """
         closed = []
+        now = time.time()
         positions = list(self._positions)
         for pos in positions:
             if pos.closed_at is not None:
                 continue
 
             reason = None
+
+            # ── Active Exit 1: Time-Decay Stale Trade Guard ───────────
+            if self._is_directional_stale(pos, now):
+                reason = "time_decay"
+
+            # ── Active Exit 2: Trailing Stop ──────────────────────────
+            elif pos.trailing_activated:
+                drawdown = pos.trailing_peak_pnl_pct - pos.pnl_pct
+                if drawdown >= TRAILING_DISTANCE_PCT:
+                    reason = "trailing_stop"
+                    logger.info(
+                        "TRAILING STOP #%d [%s] side=%s pnl=%.1f%% peak=%.1f%% "
+                        "drawdown=%.1f%% → force close",
+                        pos.id, pos.market[:40], pos.side,
+                        pos.pnl_pct, pos.trailing_peak_pnl_pct, drawdown,
+                    )
+
+            # ── Standard: TP → Maker Limit Order ──────────────────────
             if pos.pnl_pct >= TP_PCT * 100:
                 # ── Rule 4: TP → Maker Limit Order, NO Market Sweep ──
                 if pos.token_id and book_analyzer:
@@ -1000,7 +1061,7 @@ class PaperTradingEngine:
                 reason = "sl"
             elif pos.tau_pct >= TAU_LIQUIDATION * 100:
                 reason = "tau"
-            elif (time.time() - pos.opened_at) > MAX_POSITION_AGE_H * 3600:
+            elif (now - pos.opened_at) > MAX_POSITION_AGE_H * 3600:
                 reason = "expired"
 
             if reason:
@@ -1010,6 +1071,19 @@ class PaperTradingEngine:
                     closed.append(trade)
 
         return closed
+
+    @staticmethod
+    def _is_directional_stale(pos: "VirtualPosition", now: float) -> bool:
+        """Time-Decay Stale Trade Guard: ¿posición direccional caducada?"""
+        if pos.strategy not in MOMENTUM_DIRECTIONAL_STRATEGIES:
+            return False
+        age_hours = (now - pos.opened_at) / 3600.0
+        if age_hours <= DIRECTIONAL_TTL_HOURS:
+            return False
+        # Stale si PnL no ha alcanzado el 50% del objetivo TP
+        tp_target_pct = DIRECTIONAL_TP_TARGET * 100  # 15%
+        half_target = tp_target_pct * STALE_TRADE_PNL_THRESHOLD  # 7.5%
+        return pos.pnl_pct < half_target
 
     def get_open_orders(self) -> list[dict]:
         """Retorna las órdenes límite virtuales activas (para el dashboard)."""
@@ -1368,8 +1442,25 @@ class PaperTradingEngine:
                 # Liquidation zone si tau > 85%
                 pos.liquidation_zone = pos.tau_pct > 85
 
-    async def evaluate_auto_close(self) -> list[dict]:
+                # ── Active Exit: Trailing Stop peak tracking ────────────
+                if pos.pnl_pct >= TRAILING_ACTIVATION_PCT:
+                    if not pos.trailing_activated:
+                        pos.trailing_activated = True
+                        pos.trailing_peak_pnl_pct = pos.pnl_pct
+                        logger.info(
+                            "TRAILING ACTIVATED #%d [%s] side=%s pnl=%.1f%% peak=%.1f%%",
+                            pos.id, pos.market[:40], pos.side,
+                            pos.pnl_pct, pos.trailing_peak_pnl_pct,
+                        )
+                    elif pos.pnl_pct > pos.trailing_peak_pnl_pct:
+                        pos.trailing_peak_pnl_pct = pos.pnl_pct
+
+    async def evaluate_auto_close(self, signal_pipeline=None) -> list[dict]:
         """Evalúa criterios de cierre automático y cierra posiciones que los cumplan.
+
+        Active Exit Logic incluida:
+        - Time-Decay Stale Trade Guard (direccionales > 4h con PnL < 50% TP)
+        - Trailing Stop (PnL >= 3% + drawdown 1.5%)
 
         Returns
         -------
@@ -1377,6 +1468,7 @@ class PaperTradingEngine:
             Trades cerrados.
         """
         closed = []
+        now = time.time()
         # Copiar lista para evitar modificar durante iteración
         positions = list(self._positions)
         for pos in positions:
@@ -1384,17 +1476,96 @@ class PaperTradingEngine:
                 continue
 
             reason = None
+
+            # ── Active Exit 1: Time-Decay Stale Trade Guard ───────────
+            if self._is_directional_stale(pos, now):
+                reason = "time_decay"
+
+            # ── Active Exit 2: Trailing Stop ──────────────────────────
+            elif pos.trailing_activated:
+                drawdown = pos.trailing_peak_pnl_pct - pos.pnl_pct
+                if drawdown >= TRAILING_DISTANCE_PCT:
+                    reason = "trailing_stop"
+                    logger.info(
+                        "TRAILING STOP #%d [%s] side=%s pnl=%.1f%% peak=%.1f%% "
+                        "drawdown=%.1f%% → force close",
+                        pos.id, pos.market[:40], pos.side,
+                        pos.pnl_pct, pos.trailing_peak_pnl_pct, drawdown,
+                    )
+
             if pos.pnl_pct >= TP_PCT * 100:
                 reason = "tp"
             elif pos.pnl_pct <= -SL_PCT * 100:
                 reason = "sl"
             elif pos.tau_pct >= TAU_LIQUIDATION * 100:
                 reason = "tau"
-            elif (time.time() - pos.opened_at) > MAX_POSITION_AGE_H * 3600:
+            elif (now - pos.opened_at) > MAX_POSITION_AGE_H * 3600:
                 reason = "expired"
 
             if reason:
                 trade = await self.close_position(pos.id, reason=reason)
+                if trade:
+                    closed.append(trade)
+
+        return closed
+
+    async def evaluate_momentum_reversal(
+        self,
+        momentum_by_token: dict[str, float],
+    ) -> list[dict]:
+        """Momentum Reversal Exit: cierra posiciones direccionales si el momentum
+        cruza la línea cero en dirección opuesta.
+
+        NO espera a que salte el Stop Loss. En cada ciclo de evaluación,
+        si el indicador de momentum se invirtió fuertemente en contra de la
+        posición, la cierra inmediatamente.
+
+        Parameters
+        ----------
+        momentum_by_token : dict[str, float]
+            Mapping {token_id: momentum_value} desde el SignalPipeline.
+            momentum > 0 = presión al alza (YES subiendo).
+            momentum < 0 = presión a la baja (YES bajando, NO subiendo).
+
+        Returns
+        -------
+        list[dict]
+            Trades cerrados por inversión de momentum.
+        """
+        closed = []
+        now = time.time()
+        for pos in list(self._positions):
+            if pos.closed_at is not None:
+                continue
+            if pos.strategy not in MOMENTUM_DIRECTIONAL_STRATEGIES:
+                continue
+            if not pos.token_id:
+                continue
+
+            mom = momentum_by_token.get(pos.token_id)
+            if mom is None:
+                continue
+
+            force_close = False
+            reversal_desc = ""
+
+            if pos.side == "YES":
+                # Long YES: momentum negativo fuerte = señal de salida
+                if mom <= -MOMENTUM_REVERSAL_THRESHOLD:
+                    force_close = True
+                    reversal_desc = f"mom={mom:.4f} ≤ -{MOMENTUM_REVERSAL_THRESHOLD}"
+            else:  # NO
+                # Long NO: momentum positivo fuerte = YES subiendo, NO bajando
+                if mom >= MOMENTUM_REVERSAL_THRESHOLD:
+                    force_close = True
+                    reversal_desc = f"mom={mom:.4f} ≥ +{MOMENTUM_REVERSAL_THRESHOLD}"
+
+            if force_close:
+                logger.info(
+                    "MOMENTUM REVERSAL #%d [%s] side=%s %s → force close",
+                    pos.id, pos.market[:40], pos.side, reversal_desc,
+                )
+                trade = await self.close_position(pos.id, reason="momentum_reversal")
                 if trade:
                     closed.append(trade)
 
@@ -1422,6 +1593,10 @@ class PaperTradingEngine:
                 "toxicity": p.toxicity,
                 "liquidation_zone": p.liquidation_zone,
                 "opened_at": p.opened_at,
+                # Active Exit Logic
+                "trailing_activated": p.trailing_activated,
+                "trailing_peak_pnl_pct": p.trailing_peak_pnl_pct,
+                "close_reason": p.close_reason,
             })
         return result
 
