@@ -53,6 +53,48 @@ def get_wallet_credentials() -> dict[str, str]:
     }
 
 
+def get_telegram_credentials() -> dict[str, str]:
+    """Return Telegram API credentials from environment (.env).
+
+    These are used by the NLP Oracle's TelegramNewsStreamer
+    to listen to news channels via the MTProto client API.
+
+    NEVER hardcode these in config.yaml — that file is versioned in git.
+    """
+    return {
+        "api_id": os.getenv("TELEGRAM_API_ID", ""),
+        "api_hash": os.getenv("TELEGRAM_API_HASH", ""),
+    }
+
+
+def has_telegram_credentials() -> bool:
+    """Check if Telegram API credentials are configured."""
+    creds = get_telegram_credentials()
+    return bool(creds["api_id"] and creds["api_hash"])
+
+
+def get_nlp_oracle_config() -> dict[str, Any]:
+    """Return NLP Oracle config merged from YAML + environment.
+
+    Reads structure from config.yaml (channels, model, thresholds, etc.)
+    and injects Telegram API credentials from the .env file so they are
+    never versioned in git.
+    """
+    yaml_nlp = _yaml_config.get("nlp_oracle", {}).copy()
+    creds = get_telegram_credentials()
+
+    # Inject Telegram credentials from env (only if set)
+    if creds["api_id"]:
+        try:
+            yaml_nlp["telegram_api_id"] = int(creds["api_id"])
+        except (ValueError, TypeError):
+            pass  # keep whatever is in YAML (likely 0)
+    if creds["api_hash"]:
+        yaml_nlp["telegram_api_hash"] = creds["api_hash"]
+
+    return yaml_nlp
+
+
 def get_yaml_config() -> dict[str, Any]:
     """Return the full YAML configuration dict."""
     return _yaml_config

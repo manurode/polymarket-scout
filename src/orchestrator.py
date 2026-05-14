@@ -45,6 +45,7 @@ from src.adaptive_strategy_engine import AdaptiveStrategyEngine
 from src.trading_logger import trading_log
 from src.correlation_graph import CorrelationGraph
 from src.nlp_oracle import NLPOracle
+from src.config import get_nlp_oracle_config
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +146,9 @@ class ScoutOrchestrator:
         # ── NLP Oracle — Real-Time Sentiment Validator ─────────────────
         # Validador de confluencia para momentum_follow: requiere que
         # los spikes de volumen L2 estén respaldados por noticias reales.
-        nlp_config = config.get("nlp_oracle", {})
+        # Credenciales de Telegram (api_id/api_hash) se leen del .env,
+        # NUNCA de config.yaml (que está versionado en git).
+        nlp_config = get_nlp_oracle_config()
         self.nlp_oracle = NLPOracle(nlp_config)
         self.adaptive_engine.set_nlp_oracle(self.nlp_oracle)
 
