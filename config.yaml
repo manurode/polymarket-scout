@@ -117,8 +117,8 @@ redis:
 # para validar que los spikes de volumen L2 tienen respaldo noticioso.
 
 nlp_oracle:
-  enabled: false                   # Master switch. Activar tras configurar .env
-  # ⚠️  telegram_api_id y telegram_api_hash se leen del .env
+  enabled: true                   # Master switch. Activar tras configurar .env
+  # [!] telegram_api_id y telegram_api_hash se leen del .env
   #     (TELEGRAM_API_ID / TELEGRAM_API_HASH). NUNCA en este archivo.
   channels:                        # Canales de Telegram a monitorizar (sin @)
     - "tree_news"
