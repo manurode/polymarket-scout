@@ -45,6 +45,7 @@ from src.adaptive_strategy_engine import AdaptiveStrategyEngine
 from src.trading_logger import trading_log
 from src.correlation_graph import CorrelationGraph
 from src.nlp_oracle import NLPOracle
+from src.nlp_oracle_logger import nlp_log
 from src.config import get_nlp_oracle_config
 
 logger = logging.getLogger(__name__)
@@ -204,6 +205,7 @@ class ScoutOrchestrator:
         """Arranca todos los daemons del sistema."""
         logger.info("Scout Lab v2.0 — Arrancando...")
         trading_log.system_start()
+        nlp_log.system_start()
 
         # ── 1. Message Bus ────────────────────────────────────
         if self._bus is None:
@@ -293,6 +295,7 @@ class ScoutOrchestrator:
         """Detiene todos los daemons."""
         logger.info("Scout Lab v2.0 — Deteniendo...")
         trading_log.system_stop("user requested")
+        nlp_log.system_stop("user requested")
         self._running = False
 
         # ── NLP Oracle: detener streamer de Telegram ──
@@ -855,6 +858,7 @@ class ScoutOrchestrator:
                         nlp_approved, nlp_score, nlp_headline = await self.nlp_oracle.validate_market_premise(
                             market_question=sig.question,
                             side=sig.side,
+                            token_id=token_id,
                         )
                         if not nlp_approved:
                             logger.info(
@@ -1591,6 +1595,7 @@ class ScoutOrchestrator:
                         nlp_approved, nlp_score, nlp_headline = await self.nlp_oracle.validate_market_premise(
                             market_question=sig.question,
                             side=sig.side,
+                            token_id=token_id,
                         )
                         if not nlp_approved:
                             logger.info(

@@ -31,6 +31,8 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
+from src.nlp_oracle_logger import nlp_log
+
 logger = logging.getLogger(__name__)
 
 
@@ -161,6 +163,8 @@ class TelegramNewsStreamer:
         self.session_name = session_name
         self._client = None
         self._running = False
+        self._msg_count: int = 0
+        self._resolved_channels: int = 0
 
     async def start(self) -> None:
         """Connect to Telegram and start listening for messages."""
@@ -170,9 +174,11 @@ class TelegramNewsStreamer:
             logger.error(
                 "Telethon no instalado. Instálalo con: pip install telethon"
             )
+            nlp_log.streamer_error("Telethon no instalado")
             return
 
         self._running = True
+        nlp_log.streamer_connecting(self.channels)
         logger.info(
             "TelegramNewsStreamer: conectando a Telegram (canales: %s)...",
             ", ".join(self.channels),
@@ -191,6 +197,7 @@ class TelegramNewsStreamer:
 
             # Skip very short messages (likely just emojis/reactions)
             if len(text.strip()) < 15:
+                nlp_log.headline_dropped("too_short", text)
                 return
 
             channel_name = getattr(
@@ -202,9 +209,12 @@ class TelegramNewsStreamer:
                 source=str(channel_name),
             )
             await self.buffer.add(headline)
+            self._msg_count += 1
 
-            logger.info(
-                "[NLP_ORACLE] Ingested | Source=%s | Text=%.80s...",
+            nlp_log.headline_ingested(str(channel_name), text.strip())
+            logger.debug(
+                "[NLP_ORACLE] Ingested #%d | Source=%s | Text=%.80s...",
+                self._msg_count,
                 channel_name,
                 text.strip().replace("\n", " "),
             )
@@ -215,11 +225,41 @@ class TelegramNewsStreamer:
                 "TelegramNewsStreamer: conectado y escuchando %d canales",
                 len(self.channels),
             )
+
+            # ── Resolve channels and report status ──────────────────────
+            resolved = 0
+            for ch in self.channels:
+                try:
+                    entity = await self._client.get_entity(ch)
+                    etype = getattr(entity, "__class__", type(entity)).__name__
+                    nlp_log.streamer_channel_resolved(ch, True, etype)
+                    logger.info(
+                        "TelegramNewsStreamer: canal '%s' resuelto → %s",
+                        ch, etype,
+                    )
+                    resolved += 1
+                except Exception as e:
+                    nlp_log.streamer_channel_resolved(ch, False)
+                    logger.warning(
+                        "TelegramNewsStreamer: canal '%s' NO resuelto: %s",
+                        ch, e,
+                    )
+
+            self._resolved_channels = resolved
+            nlp_log.streamer_connected(self.channels, resolved)
+
             # Run until stopped
             await self._client.run_until_disconnected()
         except Exception as e:
-            logger.error("TelegramNewsStreamer: error de conexión: %s", e)
+            error_msg = str(e)
+            logger.error("TelegramNewsStreamer: error de conexión: %s", error_msg)
+            nlp_log.streamer_error(error_msg)
+
+            # Detect auth-specific errors
+            if "API_ID" in error_msg.upper() or "AUTH" in error_msg.upper():
+                nlp_log.streamer_auth_needed()
         finally:
+            nlp_log.streamer_disconnected()
             logger.info("TelegramNewsStreamer: desconectado")
 
     async def stop(self) -> None:
@@ -278,6 +318,7 @@ class ZeroShotValidator:
         if self._loaded:
             return
 
+        nlp_log.model_loading(self.model_name)
         logger.info("ZeroShotValidator: cargando modelo %s ...", self.model_name)
         try:
             import torch
@@ -294,18 +335,22 @@ class ZeroShotValidator:
                 ),
             )
             self._loaded = True
+            device_str = "CPU" if self.device < 0 else f"cuda:{self.device}"
+            nlp_log.model_loaded(self.model_name, device_str)
             logger.info(
                 "ZeroShotValidator: modelo %s cargado (device=%s)",
                 self.model_name,
-                "CPU" if self.device < 0 else f"cuda:{self.device}",
+                device_str,
             )
         except ImportError as e:
+            nlp_log.model_error(self.model_name, str(e))
             logger.error(
                 "ZeroShotValidator: transformers/torch no instalados. "
                 "Instala con: pip install transformers torch"
             )
             raise
         except Exception as e:
+            nlp_log.model_error(self.model_name, str(e))
             logger.error("ZeroShotValidator: error cargando modelo: %s", e)
             raise
 
@@ -476,9 +521,10 @@ class NLPOracle:
 
         if not self._api_id or not self._api_hash:
             logger.warning(
-                "NLPOracle: API_ID/API_HASH no configurados — "
-                "streamer de Telegram no iniciado. Configúralos en config.yaml"
+                "NLPOracle: API_ID/API_HASH no configurados en .env — "
+                "streamer de Telegram no iniciado."
             )
+            nlp_log.streamer_error("API_ID/API_HASH no configurados en .env")
             return
 
         if not self._channels:
@@ -486,6 +532,15 @@ class NLPOracle:
                 "NLPOracle: sin canales configurados — streamer no iniciado"
             )
             return
+
+        # Log config on first start
+        nlp_log.oracle_config(
+            enabled=self._enabled,
+            model=self._model_name,
+            threshold=self._confidence_threshold,
+            channels=self._channels,
+            buffer_ttl=self.buffer.ttl_seconds,
+        )
 
         self._streamer = TelegramNewsStreamer(
             api_id=self._api_id,
@@ -525,6 +580,7 @@ class NLPOracle:
         self,
         market_question: str,
         side: str = "YES",
+        token_id: str = "",
     ) -> tuple[bool, float, str]:
         """Validate whether recent news supports a market direction.
 
@@ -543,6 +599,8 @@ class NLPOracle:
             The Polymarket market question (e.g., "Will BTC hit $200K in 2026?").
         side : str
             Momentum direction: "YES" (price rising) or "NO" (price falling).
+        token_id : str
+            Token ID for logging context.
 
         Returns
         -------
@@ -559,6 +617,7 @@ class NLPOracle:
         # Get recent headlines
         headlines = await self.buffer.get_recent()
         if not headlines:
+            nlp_log.premise_skipped_no_buffer(token_id, market_question)
             logger.debug(
                 "[NLP_ORACLE] No headlines in buffer — signal REJECTED by default"
             )
@@ -568,8 +627,8 @@ class NLPOracle:
         try:
             validator = await self._ensure_validator()
         except Exception as e:
+            nlp_log.premise_error(token_id, market_question, str(e))
             logger.error("[NLP_ORACLE] Error cargando clasificador: %s", e)
-            # Degrade gracefully: if classifier fails to load, reject
             return (False, 0.0, "")
 
         best_score = 0.0
@@ -589,7 +648,7 @@ class NLPOracle:
 
                 if score > best_score:
                     best_score = score
-                    best_headline = headline.text[:80]
+                    best_headline = headline.text
 
             except Exception as e:
                 logger.debug(
@@ -600,16 +659,29 @@ class NLPOracle:
 
         approved = best_score >= self._confidence_threshold
 
-        # ── Logging ──────────────────────────────────────────────────────
-        token_snippet = market_question[:30] if market_question else "?"
+        # ── Dedicated logger ──────────────────────────────────────────
+        nlp_log.premise_validated(
+            token_id=token_id,
+            question=market_question,
+            side=side,
+            score=best_score,
+            threshold=self._confidence_threshold,
+            approved=approved,
+            top_headline=best_headline,
+            buffer_count=len(headlines),
+        )
+
+        # ── Console logger (compact) ───────────────────────────────────
+        token_snippet = token_id[:16] if token_id else "?"
         action = "APPROVED" if approved else "REJECTED"
-        log_headline = best_headline[:80] if best_headline else "(no match)"
+        log_headline = best_headline[:80] if best_headline else "(sin noticias)"
 
         logger.info(
-            "[NLP_ORACLE] Premise=\"%s\" | Top News: \"%s\" | "
+            "[NLP_ORACLE] Token=%s | Premise=\"%s\" | Top News: \"%s\" | "
             "NLP_Score=%.3f (threshold=%.2f) | Action=%s | "
             "Buffer=%d headlines | side=%s target=%s",
             token_snippet,
+            market_question[:40],
             log_headline,
             best_score,
             self._confidence_threshold,
@@ -626,12 +698,16 @@ class NLPOracle:
         buffer_count = await self.buffer.count()
         oldest = await self.buffer.oldest_age()
 
+        streamer = self._streamer
         return {
             "enabled": self._enabled,
             "model": self._model_name,
             "model_loaded": self._validator is not None and self._validator._loaded,
-            "streamer_active": self._streamer is not None and self._streamer._running,
-            "channels": self._channels,
+            "streamer_active": streamer is not None and streamer._running,
+            "streamer_connected": streamer is not None and streamer._client is not None,
+            "streamer_resolved_channels": streamer._resolved_channels if streamer else 0,
+            "streamer_msg_count": streamer._msg_count if streamer else 0,
+            "channels_configured": self._channels,
             "buffer_count": buffer_count,
             "buffer_oldest_age_s": round(oldest, 1) if oldest else None,
             "buffer_ttl_s": self.buffer.ttl_seconds,
