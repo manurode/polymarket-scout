@@ -13,3 +13,7 @@ redis>=5.0
 sse-starlette>=1.8
 starlette>=0.27
 python-dotenv>=1.0
+# ── NLP Oracle: Zero-Shot Sentiment Validator ──
+telethon>=1.36                              # Telegram MTProto client API
+transformers>=4.40                          # HuggingFace transformers (Zero-Shot NLI)
+torch>=2.0                                  # PyTorch (backend para transformers)

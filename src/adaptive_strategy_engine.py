@@ -139,6 +139,9 @@ class AdaptiveStrategyEngine:
         # Estado de aprendizaje
         self.strategy_perf: dict[str, StrategyPerformance] = {}
         self.adaptive_thresholds: dict[str, AdaptiveThresholds] = {}
+        
+        # NLP Oracle (inyectado externamente vía set_nlp_oracle)
+        self._nlp_oracle: Optional[object] = None
         self.market_regimes: dict[str, str] = {}  # condition_id -> regime
         
         # Contexto externo (inyectado por el orchestrator)
@@ -162,23 +165,31 @@ class AdaptiveStrategyEngine:
         if whale_tracker is not None:
             self._whale_tracker = whale_tracker
 
+    def set_nlp_oracle(self, nlp_oracle: Optional[object]) -> None:
+        """Inyecta el NLP Oracle para validación de momentum_follow.
+
+        Cuando está presente y habilitado, las señales de momentum
+        requieren validación de noticias (confluencia de 2 llaves:
+        L2 volume spike + NLP confidence > threshold).
+        """
+        self._nlp_oracle = nlp_oracle
+
     def _init_thresholds(self) -> None:
         """Inicializa umbrales para cada estrategia."""
         if PAPER_TRADING_HYPERACTIVE:
             # FIX 3: umbrales ultra-bajos para activar todas las estrategias en Paper Trading
-            # v2.1: momentum_follow RETIRED — sin NLP externo, solo sangra por time-decay
             defaults = {
                 "momentum": AdaptiveThresholds(
                     "momentum",
                     momentum_threshold=_PT_MOMENTUM_THRESHOLD,
                     min_confidence=_PT_MIN_CONFIDENCE,
-                    enabled=False,  # RETIRED: momentum sin NLP externo no es rentable en Polymarket
+                    enabled=True,  # REACTIVADO: ahora con NLP Oracle como 2ª llave de confluencia
                 ),
                 "momentum_follow": AdaptiveThresholds(
                     "momentum_follow",
                     momentum_threshold=_PT_MOMENTUM_THRESHOLD,
                     min_confidence=_PT_MIN_CONFIDENCE,
-                    enabled=False,  # RETIRED: libera ancho de banda para Market Maker
+                    enabled=True,  # REACTIVADO: NLP Oracle valida que el volumen tiene respaldo noticioso
                 ),
                 "mean_reversion": AdaptiveThresholds(
                     "mean_reversion",

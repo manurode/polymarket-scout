@@ -1,0 +1,640 @@
+"""
+NLP Oracle — Real-Time Sentiment Validator for Polymarket Scout.
+
+Zero-cost external context validator using local Zero-Shot Classification
+and Telegram news ingestion. Provides a second key (confluencia) for the
+momentum_follow strategy to filter out noise-driven volume spikes.
+
+Architecture (3 modules):
+  1. NewsBuffer — In-memory deque with TTL-based eviction (15 min default)
+  2. TelegramNewsStreamer — Telethon-based async listener for configurable channels
+  3. ZeroShotValidator — HuggingFace NLI pipeline (bart-large-mnli or configurable)
+
+Integration:
+  NLPOracle.validate_market_premise(market_question, news_texts) → confidence_score
+
+Usage:
+  oracle = NLPOracle(config["nlp_oracle"])
+  await oracle.start_streamer()  # starts Telegram listener in background
+  approved, score, headline = await oracle.validate_market_premise(
+      "Will BTC hit $200K in 2026?", 
+      side="YES"  # momentum direction
+  )
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NewsBuffer — In-memory rolling buffer with TTL eviction
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class NewsHeadline:
+    """A single news headline with ingestion timestamp."""
+    text: str
+    timestamp: float = field(default_factory=time.time)
+    source: str = ""  # channel username or name
+
+    @property
+    def age_seconds(self) -> float:
+        return time.time() - self.timestamp
+
+    def is_expired(self, ttl: float) -> bool:
+        return self.age_seconds > ttl
+
+
+class NewsBuffer:
+    """Thread-safe rolling buffer of news headlines with TTL eviction.
+
+    Stores headlines in a double-ended queue. Expired entries are
+    purged on each read operation (lazy eviction).
+
+    Parameters
+    ----------
+    max_size : int
+        Maximum number of headlines to retain (beyond TTL).
+    ttl_seconds : float
+        Time-to-live in seconds. Headlines older than this are discarded.
+    """
+
+    def __init__(self, max_size: int = 200, ttl_seconds: float = 900.0):
+        self.max_size = max_size
+        self.ttl_seconds = ttl_seconds
+        self._buffer: deque[NewsHeadline] = deque(maxlen=max_size)
+        self._lock = asyncio.Lock()
+        self._total_ingested: int = 0
+
+    async def add(self, headline: NewsHeadline) -> None:
+        """Add a headline to the buffer (thread-safe)."""
+        async with self._lock:
+            self._buffer.append(headline)
+            self._total_ingested += 1
+
+    async def get_recent(self) -> list[NewsHeadline]:
+        """Return all non-expired headlines (purges expired on read).
+
+        Returns
+        -------
+        list[NewsHeadline]
+            Headlines sorted by recency (newest first).
+        """
+        async with self._lock:
+            self._purge_expired()
+            return list(reversed(self._buffer))
+
+    async def get_texts(self) -> list[str]:
+        """Return text-only list of recent headlines (for classifier input)."""
+        recent = await self.get_recent()
+        return [h.text for h in recent]
+
+    async def count(self) -> int:
+        """Return count of non-expired headlines."""
+        async with self._lock:
+            self._purge_expired()
+            return len(self._buffer)
+
+    async def oldest_age(self) -> float | None:
+        """Age in seconds of the oldest non-expired headline."""
+        async with self._lock:
+            self._purge_expired()
+            if not self._buffer:
+                return None
+            return self._buffer[0].age_seconds
+
+    def _purge_expired(self) -> None:
+        """Remove all expired headlines from the front of the deque."""
+        while self._buffer and self._buffer[0].is_expired(self.ttl_seconds):
+            self._buffer.popleft()
+
+    @property
+    def total_ingested(self) -> int:
+        return self._total_ingested
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TelegramNewsStreamer — Telethon-based channel listener
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TelegramNewsStreamer:
+    """Async Telegram listener that monitors channels for news headlines.
+
+    Uses Telethon (MTProto client API) to connect to Telegram and listen
+    for new messages in pre-configured channels. Each message is treated
+    as a potential news headline and pushed to the shared NewsBuffer.
+
+    Parameters
+    ----------
+    api_id : int
+        Telegram API ID from https://my.telegram.org/apps
+    api_hash : str
+        Telegram API hash from https://my.telegram.org/apps
+    channels : list[str]
+        List of channel usernames to monitor (e.g., ["tree_news", "polymarket_news"]).
+    buffer : NewsBuffer
+        Shared buffer to push headlines into.
+    session_name : str
+        Telethon session file name (for persistent auth).
+    """
+
+    def __init__(
+        self,
+        api_id: int,
+        api_hash: str,
+        channels: list[str],
+        buffer: NewsBuffer,
+        session_name: str = "nlp_oracle_session",
+    ):
+        self.api_id = api_id
+        self.api_hash = api_hash
+        self.channels = channels
+        self.buffer = buffer
+        self.session_name = session_name
+        self._client = None
+        self._running = False
+
+    async def start(self) -> None:
+        """Connect to Telegram and start listening for messages."""
+        try:
+            from telethon import TelegramClient, events
+        except ImportError:
+            logger.error(
+                "Telethon no instalado. Instálalo con: pip install telethon"
+            )
+            return
+
+        self._running = True
+        logger.info(
+            "TelegramNewsStreamer: conectando a Telegram (canales: %s)...",
+            ", ".join(self.channels),
+        )
+
+        self._client = TelegramClient(self.session_name, self.api_id, self.api_hash)
+
+        @self._client.on(events.NewMessage(chats=self.channels))
+        async def handler(event: events.NewMessage.Event) -> None:
+            """Push new messages into the shared NewsBuffer."""
+            if not self._running:
+                return
+            text = event.message.text or ""
+            if not text.strip():
+                return
+
+            # Skip very short messages (likely just emojis/reactions)
+            if len(text.strip()) < 15:
+                return
+
+            channel_name = getattr(
+                getattr(event, "chat", None), "username", ""
+            ) or getattr(getattr(event, "chat", None), "title", "")
+
+            headline = NewsHeadline(
+                text=text.strip(),
+                source=str(channel_name),
+            )
+            await self.buffer.add(headline)
+
+            logger.info(
+                "[NLP_ORACLE] Ingested | Source=%s | Text=%.80s...",
+                channel_name,
+                text.strip().replace("\n", " "),
+            )
+
+        try:
+            await self._client.start()
+            logger.info(
+                "TelegramNewsStreamer: conectado y escuchando %d canales",
+                len(self.channels),
+            )
+            # Run until stopped
+            await self._client.run_until_disconnected()
+        except Exception as e:
+            logger.error("TelegramNewsStreamer: error de conexión: %s", e)
+        finally:
+            logger.info("TelegramNewsStreamer: desconectado")
+
+    async def stop(self) -> None:
+        """Disconnect the Telegram client."""
+        self._running = False
+        if self._client is not None:
+            try:
+                await self._client.disconnect()
+            except Exception:
+                pass
+            self._client = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ZeroShotValidator — HuggingFace NLI pipeline
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ZeroShotValidator:
+    """Zero-shot NLI classifier for market premise validation.
+
+    Uses a HuggingFace transformers pipeline with an NLI model (e.g.,
+    facebook/bart-large-mnli) to determine whether news headlines entail
+    or contradict a market question.
+
+    The classifier is loaded lazily on first use to avoid slowing down
+    application startup.
+
+    Parameters
+    ----------
+    model_name : str
+        HuggingFace model name for zero-shot classification / NLI.
+        Recommended: "facebook/bart-large-mnli" (accurate, ~1.6GB)
+        Faster alternative: "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli" (~700MB)
+        Lightweight: "typeform/distilbert-base-uncased-mnli" (~268MB)
+    device : int
+        Device for inference: -1 for CPU, 0 for GPU.
+    """
+
+    # NLI label mapping (model-specific; bart-large-mnli uses these)
+    NLI_LABELS = ["entailment", "neutral", "contradiction"]
+    # Some models use different casing
+    NLI_LABELS_ALT = ["ENTAILMENT", "NEUTRAL", "CONTRADICTION"]
+
+    def __init__(
+        self,
+        model_name: str = "facebook/bart-large-mnli",
+        device: int = -1,
+    ):
+        self.model_name = model_name
+        self.device = device
+        self._pipeline = None
+        self._loaded = False
+
+    async def load(self) -> None:
+        """Load the HuggingFace pipeline (async-compatible, but internally sync)."""
+        if self._loaded:
+            return
+
+        logger.info("ZeroShotValidator: cargando modelo %s ...", self.model_name)
+        try:
+            import torch
+            from transformers import pipeline
+
+            # Run the blocking load in a thread to avoid blocking the event loop
+            loop = asyncio.get_running_loop()
+            self._pipeline = await loop.run_in_executor(
+                None,
+                lambda: pipeline(
+                    "zero-shot-classification",
+                    model=self.model_name,
+                    device=self.device,
+                ),
+            )
+            self._loaded = True
+            logger.info(
+                "ZeroShotValidator: modelo %s cargado (device=%s)",
+                self.model_name,
+                "CPU" if self.device < 0 else f"cuda:{self.device}",
+            )
+        except ImportError as e:
+            logger.error(
+                "ZeroShotValidator: transformers/torch no instalados. "
+                "Instala con: pip install transformers torch"
+            )
+            raise
+        except Exception as e:
+            logger.error("ZeroShotValidator: error cargando modelo: %s", e)
+            raise
+
+    def classify(self, premise: str, hypothesis: str) -> dict[str, float]:
+        """Run NLI inference: does the premise entail/contradict the hypothesis?
+
+        Parameters
+        ----------
+        premise : str
+            The news headline (ground truth context).
+        hypothesis : str
+            The market question / premise to validate.
+
+        Returns
+        -------
+        dict[str, float]
+            Scores for each NLI label, e.g.:
+            {"entailment": 0.82, "neutral": 0.15, "contradiction": 0.03}
+        """
+        if not self._loaded or self._pipeline is None:
+            raise RuntimeError(
+                "ZeroShotValidator: modelo no cargado. Llama a await load() primero."
+            )
+
+        # For NLI models, we pass premise + hypothesis as a single string
+        # formatted for the model's tokenizer
+        result = self._pipeline(
+            premise,
+            candidate_labels=[hypothesis],
+            hypothesis_template="This text is about {}.",
+        )
+
+        # The pipeline returns label→score. But for NLI we need to use a
+        # different approach. Let's use the NLI pipeline directly.
+        # Actually, the zero-shot-classification pipeline with bart-large-mnli
+        # returns scores for how well each candidate label matches the sequence.
+        # For proper NLI, we should use the "text-classification" pipeline
+        # or call tokenizer + model directly.
+
+        # However, the user explicitly asked for pipeline("zero-shot-classification",
+        # model="facebook/bart-large-mnli"), so let's use that approach.
+        # We pass the news as the sequence and the market question as a label.
+        labels = result.get("labels", [])
+        scores = result.get("scores", [])
+
+        # Build a dict mapping label → score
+        score_dict: dict[str, float] = {}
+        for label, score in zip(labels, scores):
+            score_dict[label] = float(score)
+
+        return score_dict
+
+    def classify_nli(self, premise: str, hypothesis: str) -> dict[str, float]:
+        """Run proper NLI: premise entails/contradicts/neutral hypothesis.
+
+        This method uses the raw NLI capability of MNLI-trained models
+        by constructing the input as "premise [SEP] hypothesis" and
+        classifying into entailment/neutral/contradiction.
+
+        Requires a model fine-tuned on MNLI (bart-large-mnli qualifies).
+
+        Returns
+        -------
+        dict[str, float]
+            {"entailment": 0.82, "neutral": 0.15, "contradiction": 0.03}
+        """
+        if not self._loaded or self._pipeline is None:
+            raise RuntimeError("ZeroShotValidator: modelo no cargado.")
+
+        # Use the model directly (not the pipeline wrapper) for NLI
+        # The zero-shot-classification pipeline wraps the model differently.
+        # We need to access the underlying model and tokenizer.
+        model = self._pipeline.model
+        tokenizer = self._pipeline.tokenizer
+
+        import torch
+
+        # Format: [CLS] premise [SEP] hypothesis [SEP]
+        inputs = tokenizer(
+            premise,
+            hypothesis,
+            truncation=True,
+            max_length=512,
+            return_tensors="pt",
+        )
+
+        # Move to correct device if needed
+        if self.device >= 0:
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = model(**inputs)
+
+        # Get logits for entailment/neutral/contradiction
+        logits = outputs.logits[0]  # shape: (3,)
+
+        # The label order is typically: contradiction, neutral, entailment
+        # for bart-large-mnli (id2label: {0: 'contradiction', 1: 'neutral', 2: 'entailment'})
+        probs = torch.softmax(logits, dim=-1)
+
+        # Map to label names using model's id2label
+        id2label = model.config.id2label
+        result: dict[str, float] = {}
+        for i in range(len(probs)):
+            label = id2label.get(i, f"label_{i}").lower()
+            result[label] = float(probs[i])
+
+        return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NLPOracle — Main orchestrator
+# ─────────────────────────────────────────────────────────────────────────────
+
+class NLPOracle:
+    """Natural Language Processing Oracle for market premise validation.
+
+    Wires together the NewsBuffer, TelegramNewsStreamer, and ZeroShotValidator
+    into a unified interface for the momentum_follow confluencia check.
+
+    Parameters
+    ----------
+    config : dict
+        Sub-dictionary from config.yaml under 'nlp_oracle'.
+        Keys:
+          - enabled (bool): Master switch.
+          - telegram_api_id (int): Telegram API ID.
+          - telegram_api_hash (str): Telegram API hash.
+          - channels (list[str]): Channel usernames to monitor.
+          - model (str): HuggingFace NLI model name.
+          - nlp_confidence_threshold (float): Minimum score to approve (default 0.65).
+          - buffer_ttl_seconds (int): Headline TTL in seconds (default 900).
+          - buffer_max_size (int): Max headlines in buffer (default 200).
+    """
+
+    def __init__(self, config: dict | None = None):
+        config = config or {}
+        self._enabled = config.get("enabled", False)
+        self._confidence_threshold = config.get("nlp_confidence_threshold", 0.65)
+        self._model_name = config.get("model", "facebook/bart-large-mnli")
+
+        # Initialize sub-modules
+        self.buffer = NewsBuffer(
+            max_size=config.get("buffer_max_size", 200),
+            ttl_seconds=config.get("buffer_ttl_seconds", 900),
+        )
+        self._validator: Optional[ZeroShotValidator] = None
+        self._streamer: Optional[TelegramNewsStreamer] = None
+        self._streamer_task: Optional[asyncio.Task] = None
+
+        # Telegram credentials (may be empty → streamer won't start)
+        self._api_id: int = config.get("telegram_api_id", 0)
+        self._api_hash: str = config.get("telegram_api_hash", "")
+        self._channels: list[str] = config.get("channels", [])
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    async def start_streamer(self) -> None:
+        """Start the Telegram news streamer in a background task.
+
+        Safe to call even if NLP oracle is disabled or credentials are missing.
+        """
+        if not self._enabled:
+            logger.info("NLPOracle: desactivado — streamer no iniciado")
+            return
+
+        if not self._api_id or not self._api_hash:
+            logger.warning(
+                "NLPOracle: API_ID/API_HASH no configurados — "
+                "streamer de Telegram no iniciado. Configúralos en config.yaml"
+            )
+            return
+
+        if not self._channels:
+            logger.warning(
+                "NLPOracle: sin canales configurados — streamer no iniciado"
+            )
+            return
+
+        self._streamer = TelegramNewsStreamer(
+            api_id=self._api_id,
+            api_hash=self._api_hash,
+            channels=self._channels,
+            buffer=self.buffer,
+        )
+
+        self._streamer_task = asyncio.create_task(self._streamer.start())
+        logger.info(
+            "NLPOracle: streamer de Telegram iniciado (%d canales)",
+            len(self._channels),
+        )
+
+    async def stop_streamer(self) -> None:
+        """Stop the Telegram streamer gracefully."""
+        if self._streamer:
+            await self._streamer.stop()
+            self._streamer = None
+
+        if self._streamer_task and not self._streamer_task.done():
+            self._streamer_task.cancel()
+            try:
+                await self._streamer_task
+            except asyncio.CancelledError:
+                pass
+            self._streamer_task = None
+
+    async def _ensure_validator(self) -> ZeroShotValidator:
+        """Lazy-load the zero-shot validator on first use."""
+        if self._validator is None:
+            self._validator = ZeroShotValidator(model_name=self._model_name)
+            await self._validator.load()
+        return self._validator
+
+    async def validate_market_premise(
+        self,
+        market_question: str,
+        side: str = "YES",
+    ) -> tuple[bool, float, str]:
+        """Validate whether recent news supports a market direction.
+
+        Core method of the NLP Oracle. Takes a market question and the
+        momentum direction (YES = price rising, NO = price falling) and
+        checks whether recent Telegram news headlines entail or contradict
+        the market premise.
+
+        Logic:
+        - YES momentum → we need ENTAILMENT (news confirms event is happening)
+        - NO momentum → we need CONTRADICTION (news contradicts event happening)
+
+        Parameters
+        ----------
+        market_question : str
+            The Polymarket market question (e.g., "Will BTC hit $200K in 2026?").
+        side : str
+            Momentum direction: "YES" (price rising) or "NO" (price falling).
+
+        Returns
+        -------
+        tuple[bool, float, str]
+            (approved, confidence_score, top_headline_snippet)
+            - approved: True if NLP signal is strong enough to validate momentum.
+            - confidence_score: Best entailment/contradiction score found.
+            - top_headline_snippet: The headline that produced the best score.
+        """
+        if not self._enabled:
+            # NLP oracle disabled → pass-through (always approve)
+            return (True, 1.0, "")
+
+        # Get recent headlines
+        headlines = await self.buffer.get_recent()
+        if not headlines:
+            logger.debug(
+                "[NLP_ORACLE] No headlines in buffer — signal REJECTED by default"
+            )
+            return (False, 0.0, "")
+
+        # Lazy-load the classifier
+        try:
+            validator = await self._ensure_validator()
+        except Exception as e:
+            logger.error("[NLP_ORACLE] Error cargando clasificador: %s", e)
+            # Degrade gracefully: if classifier fails to load, reject
+            return (False, 0.0, "")
+
+        best_score = 0.0
+        best_headline = ""
+        target_label = "entailment" if side == "YES" else "contradiction"
+
+        for headline in headlines:
+            try:
+                # Run proper NLI: headline (premise) → market question (hypothesis)
+                scores = validator.classify_nli(
+                    premise=headline.text,
+                    hypothesis=market_question,
+                )
+
+                # Get the score for our target label
+                score = scores.get(target_label, 0.0)
+
+                if score > best_score:
+                    best_score = score
+                    best_headline = headline.text[:80]
+
+            except Exception as e:
+                logger.debug(
+                    "[NLP_ORACLE] Error clasificando headline: %s",
+                    e,
+                )
+                continue
+
+        approved = best_score >= self._confidence_threshold
+
+        # ── Logging ──────────────────────────────────────────────────────
+        token_snippet = market_question[:30] if market_question else "?"
+        action = "APPROVED" if approved else "REJECTED"
+        log_headline = best_headline[:80] if best_headline else "(no match)"
+
+        logger.info(
+            "[NLP_ORACLE] Premise=\"%s\" | Top News: \"%s\" | "
+            "NLP_Score=%.3f (threshold=%.2f) | Action=%s | "
+            "Buffer=%d headlines | side=%s target=%s",
+            token_snippet,
+            log_headline,
+            best_score,
+            self._confidence_threshold,
+            action,
+            len(headlines),
+            side,
+            target_label,
+        )
+
+        return (approved, best_score, best_headline)
+
+    async def get_status(self) -> dict:
+        """Return current oracle status for monitoring/dashboard."""
+        buffer_count = await self.buffer.count()
+        oldest = await self.buffer.oldest_age()
+
+        return {
+            "enabled": self._enabled,
+            "model": self._model_name,
+            "model_loaded": self._validator is not None and self._validator._loaded,
+            "streamer_active": self._streamer is not None and self._streamer._running,
+            "channels": self._channels,
+            "buffer_count": buffer_count,
+            "buffer_oldest_age_s": round(oldest, 1) if oldest else None,
+            "buffer_ttl_s": self.buffer.ttl_seconds,
+            "confidence_threshold": self._confidence_threshold,
+            "total_ingested": self.buffer.total_ingested,
+        }

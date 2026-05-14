@@ -44,6 +44,7 @@ from src.price_history import PriceHistory
 from src.adaptive_strategy_engine import AdaptiveStrategyEngine
 from src.trading_logger import trading_log
 from src.correlation_graph import CorrelationGraph
+from src.nlp_oracle import NLPOracle
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +141,13 @@ class ScoutOrchestrator:
             correlation_graph=self.correlation_graph,
             whale_tracker=self.whale_tracker,
         )
+
+        # ── NLP Oracle — Real-Time Sentiment Validator ─────────────────
+        # Validador de confluencia para momentum_follow: requiere que
+        # los spikes de volumen L2 estén respaldados por noticias reales.
+        nlp_config = config.get("nlp_oracle", {})
+        self.nlp_oracle = NLPOracle(nlp_config)
+        self.adaptive_engine.set_nlp_oracle(self.nlp_oracle)
 
         # ── MAINNET ALIGNMENT: whale_follow desactivada hasta RPC real ──
         # Sin datos on-chain (Alchemy/QuickNode), esta estrategia no puede
@@ -258,6 +266,11 @@ class ScoutOrchestrator:
 
         logger.info("Scout Lab v2.0 — Todos los daemons arrancados")
 
+        # ── NLP Oracle: iniciar streamer de Telegram en background ──
+        if self.nlp_oracle.enabled:
+            await self.nlp_oracle.start_streamer()
+            logger.info("NLP Oracle: streamer de noticias Telegram iniciado")
+
         # ── 10. 🧹 CLEAN SLATE: borrar historial contaminado + resetear Bandit ──
         # El bot ahora solo opera si el CLOB real cruza sus órdenes límite (Maker)
         # o si hay un movimiento matemático real (Taker). Sin simulaciones.
@@ -278,6 +291,9 @@ class ScoutOrchestrator:
         logger.info("Scout Lab v2.0 — Deteniendo...")
         trading_log.system_stop("user requested")
         self._running = False
+
+        # ── NLP Oracle: detener streamer de Telegram ──
+        await self.nlp_oracle.stop_streamer()
 
         for task in self._tasks:
             if not task.done():
@@ -830,6 +846,23 @@ class ScoutOrchestrator:
                             if isinstance(tokens, list) and tokens:
                                 token_id = tokens[0]
                             break
+
+                    # ── KEY 2: NLP Oracle — Confluencia de noticias ────────────
+                    if sig.strategy in ("momentum", "momentum_follow"):
+                        nlp_approved, nlp_score, nlp_headline = await self.nlp_oracle.validate_market_premise(
+                            market_question=sig.question,
+                            side=sig.side,
+                        )
+                        if not nlp_approved:
+                            logger.info(
+                                "[NLP_ORACLE] Token=%s | Premise=\"%s\" | Top News: \"%s\" | "
+                                "NLP_Score=%.3f | Action=REJECTED",
+                                token_id[:16] if token_id else cid[:16],
+                                sig.question[:40],
+                                nlp_headline[:50] if nlp_headline else "(sin noticias)",
+                                nlp_score,
+                            )
+                            continue
 
                     # ── EXECUTION_BLOCK: verificar inventory slots ──
                     if token_id:
@@ -1546,6 +1579,34 @@ class ScoutOrchestrator:
                             if isinstance(tokens, list) and tokens:
                                 token_id = tokens[0]
                             break
+
+                    # ── KEY 2: NLP Oracle — Confluencia de noticias ────────────
+                    # Momentum signals require real-time news validation.
+                    # Volume spike (Key 1) is already verified in the pipeline.
+                    # NLP confidence > threshold (Key 2) confirms the spike has news backing.
+                    if sig.strategy in ("momentum", "momentum_follow"):
+                        nlp_approved, nlp_score, nlp_headline = await self.nlp_oracle.validate_market_premise(
+                            market_question=sig.question,
+                            side=sig.side,
+                        )
+                        if not nlp_approved:
+                            logger.info(
+                                "[NLP_ORACLE] Token=%s | Premise=\"%s\" | Top News: \"%s\" | "
+                                "NLP_Score=%.3f | Action=REJECTED",
+                                token_id[:16] if token_id else cid[:16],
+                                sig.question[:40],
+                                nlp_headline[:50] if nlp_headline else "(sin noticias)",
+                                nlp_score,
+                            )
+                            continue
+                        logger.info(
+                            "[NLP_ORACLE] Token=%s | Premise=\"%s\" | Top News: \"%s\" | "
+                            "NLP_Score=%.3f | Action=APPROVED",
+                            token_id[:16] if token_id else cid[:16],
+                            sig.question[:40],
+                            nlp_headline[:50] if nlp_headline else "(sin noticias)",
+                            nlp_score,
+                        )
 
                     # ── EXECUTION_BLOCK: verificar inventory slots ──
                     if token_id:

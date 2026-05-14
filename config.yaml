@@ -110,3 +110,24 @@ degradation:
 
 redis:
   url: "redis://localhost:6379"
+
+# ── NLP Oracle — Real-Time Sentiment Validator ─────────────────────
+# Validador de contexto externo (coste cero, baja latencia) para la
+# estrategia momentum_follow. Usa ingestión Telegram + Zero-Shot NLI
+# para validar que los spikes de volumen L2 tienen respaldo noticioso.
+
+nlp_oracle:
+  enabled: false                   # Master switch. Activar cuando Telegram API esté configurado.
+  telegram_api_id: 0               # Obtener en https://my.telegram.org/apps
+  telegram_api_hash: ""            # Obtener en https://my.telegram.org/apps
+  channels:                        # Canales de Telegram a monitorizar (sin @)
+    - "tree_news"
+    - "unusual_whales"
+    # - "polymarket_news"
+  model: "facebook/bart-large-mnli"  # Modelo NLI Zero-Shot (~1.6GB)
+  # Alternativas más ligeras:
+  #   "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli"  (~700MB)
+  #   "typeform/distilbert-base-uncased-mnli"          (~268MB)
+  nlp_confidence_threshold: 0.65    # Score mínimo para aprobar señal (0-1)
+  buffer_ttl_seconds: 900           # TTL de titulares en buffer (15 min)
+  buffer_max_size: 200              # Máximo de titulares en memoria
