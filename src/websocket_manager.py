@@ -38,8 +38,9 @@ MARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 HEARTBEAT_INTERVAL = 30      # segundos entre pings
 RECONNECT_DELAY_BASE = 1.0   # delay inicial para exponential backoff
 RECONNECT_DELAY_MAX = 30.0   # delay máximo de reconexión
-GAP_TIMEOUT = 300            # segundos sin delta → forzar RECONCILING (5 min)
+GAP_TIMEOUT = 300            # segundos sin delta por mercado → forzar RECONCILING (5 min)
 RECONCILE_COOLDOWN = 60     # segundos entre intentos de reconciliación automática
+WATCHDOG_TIMEOUT = 60       # segundos sin NINGÚN delta global → forzar reconexión WS
 
 # Capacidad del buffer circular de deltas durante reconciliación
 DELTA_BUFFER_CAPACITY = 1000
@@ -119,6 +120,9 @@ class WebSocketManager:
 
         # Backoff
         self._reconnect_attempt = 0
+
+        # Watchdog: timestamp del último delta recibido en CUALQUIER mercado
+        self._last_any_delta_time: float = 0.0
 
         # Callbacks — se asignan externamente
         self.on_book_delta: Callable | None = None
@@ -413,6 +417,7 @@ class WebSocketManager:
 
         now = time.monotonic()
         tracker.last_delta_time = now
+        self._last_any_delta_time = now  # Watchdog: global tracker
 
         # Track book version: Polymarket envía snapshots completos (no seq_num),
         # usamos contador local como version identifier.
@@ -463,11 +468,32 @@ class WebSocketManager:
                     self._connected = False
 
     async def _health_check_loop(self) -> None:
-        """Monitoriza gaps y fuerza reconciliacion si es necesario."""
+        """Monitoriza gaps, fuerza reconciliacion, y ejecuta el Watchdog de reconexión."""
         while self._running:
             await asyncio.sleep(5)  # check cada 5s
 
             now = time.monotonic()
+
+            # ── WATCHDOG: 60s sin NINGÚN delta global → reconexión forzada ──
+            if self._connected and self._books:
+                if self._last_any_delta_time > 0:
+                    global_age = now - self._last_any_delta_time
+                    if global_age > WATCHDOG_TIMEOUT:
+                        logger.warning(
+                            "⏱️ WATCHDOG: %.0fs sin deltas globales (>%ds) — "
+                            "forzando reconexión del WebSocket...",
+                            global_age, WATCHDOG_TIMEOUT,
+                        )
+                        self._connected = False
+                        if self._ws and not self._ws.closed:
+                            try:
+                                await self._ws.close()
+                            except Exception:
+                                pass
+                        # _connect_ws se disparará en _read_loop al detectar ws cerrado/None
+                        self._last_any_delta_time = 0.0  # resetear para el próximo ciclo
+                        continue  # saltar el resto del chequeo este ciclo
+
             for token_id, tracker in list(self._books.items()):
                 if tracker.state == BookState.CLEAN:
                     # Sin deltas por mucho tiempo -> posible desconexion silenciosa

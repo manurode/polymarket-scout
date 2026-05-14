@@ -630,15 +630,27 @@ class ScoutOrchestrator:
         logger.info("PaperTrading auto-close daemon iniciado (v2: TP Maker + Active Exits + OBI Evac)")
         while self._running:
             try:
+                # ── WS health check: SL solo con datos frescos ──
+                ws_healthy = (
+                    self.ws_manager is not None
+                    and self.ws_manager.is_connected
+                )
+
                 # ── Rule 4: TP usa Maker Limit Orders; SL/tau/expired usan Market Close ──
                 # ── Active Exits: time_decay + trailing_stop integrados en evaluate ──
                 if self.book_analyzer and len(self.book_analyzer) > 0:
-                    closed = await self.paper_trading.evaluate_auto_close_v2(self.book_analyzer)
+                    closed = await self.paper_trading.evaluate_auto_close_v2(
+                        self.book_analyzer,
+                        ws_healthy=ws_healthy,
+                    )
                 else:
-                    closed = await self.paper_trading.evaluate_auto_close()
+                    closed = await self.paper_trading.evaluate_auto_close(
+                        ws_healthy=ws_healthy,
+                    )
 
                 # ── OBI Toxic Flow Evacuation (v2.1): detectar tsunamis de liquidez tóxica ──
-                if self.market_maker and self.book_analyzer and len(self.book_analyzer) > 0:
+                # MAINNET: solo evacuar con WS healthy (necesita OBI fresco del L2)
+                if ws_healthy and self.market_maker and self.book_analyzer and len(self.book_analyzer) > 0:
                     evac_closed = await self._evaluate_obi_evacuations()
                     if evac_closed:
                         closed.extend(evac_closed)

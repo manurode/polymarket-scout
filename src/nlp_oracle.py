@@ -212,11 +212,10 @@ class TelegramNewsStreamer:
             self._msg_count += 1
 
             nlp_log.headline_ingested(str(channel_name), text.strip())
-            logger.debug(
-                "[NLP_ORACLE] Ingested #%d | Source=%s | Text=%.80s...",
-                self._msg_count,
-                channel_name,
-                text.strip().replace("\n", " "),
+            logger.info(
+                "[NLP_RECEIVE] Ingestado: \"%s...\" de Canal=%s",
+                text.strip().replace("\n", " ")[:50],
+                channel_name or "???",
             )
 
         try:

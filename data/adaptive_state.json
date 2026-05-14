@@ -2,25 +2,25 @@
   "strategy_perf": {
     "market_making": {
       "name": "market_making",
-      "wins": 222,
+      "wins": 224,
       "losses": 154,
-      "total_pnl": 6965.810020784272,
-      "avg_win": 41.70070505095114,
+      "total_pnl": 6966.740520784271,
+      "avg_win": 41.33253134513908,
       "avg_loss": 14.881470782642102,
-      "win_rate": 0.5904255319148937,
-      "confidence": 0.7120720102855893,
-      "last_updated": 1778726006.4556637
+      "win_rate": 0.5925925925925926,
+      "confidence": 0.7123035019067742,
+      "last_updated": 1778760784.256271
     },
     "momentum_follow": {
       "name": "momentum_follow",
       "wins": 18,
-      "losses": 63,
-      "total_pnl": 1279.4322257386823,
+      "losses": 73,
+      "total_pnl": 1276.0908417592218,
       "avg_win": 127.45629712771441,
-      "avg_loss": 16.107636866034536,
-      "win_rate": 0.2222222222222222,
-      "confidence": 0.5031722889579809,
-      "last_updated": 1778751841.5873175
+      "avg_loss": 13.946883651227898,
+      "win_rate": 0.1978021978021978,
+      "confidence": 0.479876502827128,
+      "last_updated": 1778773541.3524845
     },
     "consensus_breakout": {
       "name": "consensus_breakout",
@@ -32,6 +32,17 @@
       "win_rate": 1.0,
       "confidence": 0.5927468750000001,
       "last_updated": 1778606320.2555091
+    },
+    "contrarian": {
+      "name": "contrarian",
+      "wins": 0,
+      "losses": 4,
+      "total_pnl": -2.9925423145777943,
+      "avg_win": 0.0,
+      "avg_loss": 0.7481355786444486,
+      "win_rate": 0.0,
+      "confidence": 0.46290125,
+      "last_updated": 1778762046.019397
     }
   },
   "thresholds": {
@@ -81,6 +92,14 @@
       "mean_rev_deviation": 0.05,
       "volume_spike_ratio": 2.5,
       "min_confidence": 0.05,
+      "enabled": false
+    },
+    "momentum_follow": {
+      "strategy": "momentum_follow",
+      "momentum_threshold": 0.004287177620000002,
+      "mean_rev_deviation": 0.05,
+      "volume_spike_ratio": 2.5,
+      "min_confidence": 0.10717944050000006,
       "enabled": false
     }
   }

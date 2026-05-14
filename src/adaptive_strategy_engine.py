@@ -431,7 +431,7 @@ class AdaptiveStrategyEngine:
         
         if regime == MarketRegime.TRENDING and signal.strategy == "mean_reversion":
             reason = "Mean reversion desactivado en mercado trending"
-            logger.info(
+            logger.debug(
                 "[DISCARD] REGIME_MISMATCH | Strategy=mean_reversion Token=%s | "
                 "Regime=TRENDING → mean_reversion bloqueado",
                 signal.condition_id[:16],
@@ -440,7 +440,7 @@ class AdaptiveStrategyEngine:
         
         if regime == MarketRegime.RANGING and signal.strategy == "momentum":
             reason = "Momentum desactivado en mercado ranging"
-            logger.info(
+            logger.debug(
                 "[DISCARD] REGIME_MISMATCH | Strategy=momentum Token=%s | "
                 "Regime=RANGING → momentum bloqueado",
                 signal.condition_id[:16],

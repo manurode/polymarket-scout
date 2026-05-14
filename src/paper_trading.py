@@ -993,6 +993,7 @@ class PaperTradingEngine:
         self,
         book_analyzer: "BookAnalyzer" = None,
         signal_pipeline=None,  # SignalPipeline para Momentum Reversal Exit
+        ws_healthy: bool = True,  # MAINNET: solo ejecutar SL con WS vivo
     ) -> list[dict]:
         """Evalúa criterios de cierre automático con reglas institucionales.
 
@@ -1007,6 +1008,10 @@ class PaperTradingEngine:
             - Trailing Stop: asegura ganancias cuando PnL >= 3% y retrocede 1.5%
 
         SL, tau, y expired siguen usando cierre a mercado (son urgentes).
+
+        ws_healthy: si False, el SL NO se ejecuta (datos stale pueden causar
+                    falsos positivos). Time-decay, trailing stop, tau y expired
+                    sí se ejecutan (no dependen de precios en tiempo real).
         """
         closed = []
         now = time.time()
@@ -1060,12 +1065,22 @@ class PaperTradingEngine:
                     reason = "tp"
 
             # ── Stop Loss: MM usa Micro-SL (-3%), resto usa SL estándar (-10%) ──
-            if not reason:
+            # MAINNET: solo ejecutar SL si el WS está HEALTHY.
+            # Con WS caído, los precios mark-to-market son stale y pueden
+            # causar falsos positivos por wicks o datos desactualizados.
+            if not reason and ws_healthy:
                 if pos.strategy == "market_making":
                     if pos.pnl_pct <= -MM_SL_PCT * 100:
                         reason = "sl_mm_micro"
                 elif pos.pnl_pct <= -SL_PCT * 100:
                     reason = "sl"
+            elif not reason and not ws_healthy and pos.pnl_pct <= -SL_PCT * 100:
+                sl_pct = MM_SL_PCT if pos.strategy == "market_making" else SL_PCT
+                logger.warning(
+                    "⏸️ SL BLOCKED [%s] #%d | pnl=%.1f%% (SL=%.0f%%) | WS_UNHEALTHY — "
+                    "SL diferido para evitar cierre por datos stale",
+                    pos.strategy, pos.id, pos.pnl_pct, sl_pct * 100,
+                )
 
             if not reason and pos.tau_pct >= TAU_LIQUIDATION * 100:
                 reason = "tau"
@@ -1463,12 +1478,14 @@ class PaperTradingEngine:
                     elif pos.pnl_pct > pos.trailing_peak_pnl_pct:
                         pos.trailing_peak_pnl_pct = pos.pnl_pct
 
-    async def evaluate_auto_close(self, signal_pipeline=None) -> list[dict]:
+    async def evaluate_auto_close(self, signal_pipeline=None, ws_healthy: bool = True) -> list[dict]:
         """Evalúa criterios de cierre automático y cierra posiciones que los cumplan.
 
         Active Exit Logic incluida:
         - Time-Decay Stale Trade Guard (direccionales > 4h con PnL < 50% TP)
         - Trailing Stop (PnL >= 3% + drawdown 1.5%)
+
+        ws_healthy: si False, el SL NO se ejecuta (datos stale).
 
         Returns
         -------
@@ -1504,12 +1521,20 @@ class PaperTradingEngine:
             if pos.pnl_pct >= TP_PCT * 100:
                 reason = "tp"
             # ── Stop Loss: MM usa Micro-SL (-3%), resto usa SL estándar (-10%) ──
-            if not reason:
+            # MAINNET: solo ejecutar SL si el WS está HEALTHY.
+            if not reason and ws_healthy:
                 if pos.strategy == "market_making":
                     if pos.pnl_pct <= -MM_SL_PCT * 100:
                         reason = "sl_mm_micro"
                 elif pos.pnl_pct <= -SL_PCT * 100:
                     reason = "sl"
+            elif not reason and not ws_healthy and pos.pnl_pct <= -SL_PCT * 100:
+                sl_pct = MM_SL_PCT if pos.strategy == "market_making" else SL_PCT
+                logger.warning(
+                    "⏸️ SL BLOCKED [%s] #%d | pnl=%.1f%% (SL=%.0f%%) | WS_UNHEALTHY — "
+                    "SL diferido para evitar cierre por datos stale",
+                    pos.strategy, pos.id, pos.pnl_pct, sl_pct * 100,
+                )
             if not reason and pos.tau_pct >= TAU_LIQUIDATION * 100:
                 reason = "tau"
             if not reason and (now - pos.opened_at) > MAX_POSITION_AGE_H * 3600:
