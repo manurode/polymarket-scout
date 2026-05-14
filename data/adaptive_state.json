@@ -1,0 +1,87 @@
+{
+  "strategy_perf": {
+    "market_making": {
+      "name": "market_making",
+      "wins": 222,
+      "losses": 154,
+      "total_pnl": 6965.810020784272,
+      "avg_win": 41.70070505095114,
+      "avg_loss": 14.881470782642102,
+      "win_rate": 0.5904255319148937,
+      "confidence": 0.7120720102855893,
+      "last_updated": 1778726006.4556637
+    },
+    "momentum_follow": {
+      "name": "momentum_follow",
+      "wins": 18,
+      "losses": 63,
+      "total_pnl": 1279.4322257386823,
+      "avg_win": 127.45629712771441,
+      "avg_loss": 16.107636866034536,
+      "win_rate": 0.2222222222222222,
+      "confidence": 0.5031722889579809,
+      "last_updated": 1778751841.5873175
+    },
+    "consensus_breakout": {
+      "name": "consensus_breakout",
+      "wins": 4,
+      "losses": 0,
+      "total_pnl": 622.8485421813574,
+      "avg_win": 155.71213554533935,
+      "avg_loss": 0.0,
+      "win_rate": 1.0,
+      "confidence": 0.5927468750000001,
+      "last_updated": 1778606320.2555091
+    }
+  },
+  "thresholds": {
+    "momentum": {
+      "strategy": "momentum",
+      "momentum_threshold": 0.002,
+      "mean_rev_deviation": 0.05,
+      "volume_spike_ratio": 2.5,
+      "min_confidence": 0.05,
+      "enabled": true
+    },
+    "mean_reversion": {
+      "strategy": "mean_reversion",
+      "momentum_threshold": 0.02,
+      "mean_rev_deviation": 0.01,
+      "volume_spike_ratio": 2.5,
+      "min_confidence": 0.05,
+      "enabled": true
+    },
+    "volume_breakout": {
+      "strategy": "volume_breakout",
+      "momentum_threshold": 0.02,
+      "mean_rev_deviation": 0.05,
+      "volume_spike_ratio": 1.1,
+      "min_confidence": 0.05,
+      "enabled": true
+    },
+    "consensus_breakout": {
+      "strategy": "consensus_breakout",
+      "momentum_threshold": 0.02,
+      "mean_rev_deviation": 0.05,
+      "volume_spike_ratio": 2.5,
+      "min_confidence": 0.05,
+      "enabled": true
+    },
+    "correlation_arb": {
+      "strategy": "correlation_arb",
+      "momentum_threshold": 0.02,
+      "mean_rev_deviation": 0.05,
+      "volume_spike_ratio": 2.5,
+      "min_confidence": 0.05,
+      "enabled": true
+    },
+    "whale_follow": {
+      "strategy": "whale_follow",
+      "momentum_threshold": 0.02,
+      "mean_rev_deviation": 0.05,
+      "volume_spike_ratio": 2.5,
+      "min_confidence": 0.05,
+      "enabled": false
+    }
+  }
+}

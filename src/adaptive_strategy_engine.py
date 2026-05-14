@@ -166,11 +166,19 @@ class AdaptiveStrategyEngine:
         """Inicializa umbrales para cada estrategia."""
         if PAPER_TRADING_HYPERACTIVE:
             # FIX 3: umbrales ultra-bajos para activar todas las estrategias en Paper Trading
+            # v2.1: momentum_follow RETIRED — sin NLP externo, solo sangra por time-decay
             defaults = {
                 "momentum": AdaptiveThresholds(
                     "momentum",
                     momentum_threshold=_PT_MOMENTUM_THRESHOLD,
                     min_confidence=_PT_MIN_CONFIDENCE,
+                    enabled=False,  # RETIRED: momentum sin NLP externo no es rentable en Polymarket
+                ),
+                "momentum_follow": AdaptiveThresholds(
+                    "momentum_follow",
+                    momentum_threshold=_PT_MOMENTUM_THRESHOLD,
+                    min_confidence=_PT_MIN_CONFIDENCE,
+                    enabled=False,  # RETIRED: libera ancho de banda para Market Maker
                 ),
                 "mean_reversion": AdaptiveThresholds(
                     "mean_reversion",
@@ -203,7 +211,8 @@ class AdaptiveStrategyEngine:
             )
         else:
             defaults = {
-                "momentum": AdaptiveThresholds("momentum", momentum_threshold=0.02),
+                "momentum": AdaptiveThresholds("momentum", momentum_threshold=0.02, enabled=False),
+                "momentum_follow": AdaptiveThresholds("momentum_follow", momentum_threshold=0.02, enabled=False),
                 "mean_reversion": AdaptiveThresholds("mean_reversion", mean_rev_deviation=0.05),
                 "volume_breakout": AdaptiveThresholds("volume_breakout", volume_spike_ratio=2.5),
                 "consensus_breakout": AdaptiveThresholds("consensus_breakout"),
@@ -357,7 +366,7 @@ class AdaptiveStrategyEngine:
         
         # Si win_rate < 30%, ajustar parámetros para ser más selectivo
         if perf.win_rate < 0.30:
-            if strategy == "momentum":
+            if strategy in ("momentum", "momentum_follow"):
                 thresh.momentum_threshold = min(0.05, thresh.momentum_threshold * 1.1)
             elif strategy == "mean_reversion":
                 thresh.mean_rev_deviation = min(0.10, thresh.mean_rev_deviation * 1.1)
@@ -368,7 +377,7 @@ class AdaptiveStrategyEngine:
         
         # Si win_rate > 60%, relajar parámetros para capturar más oportunidades
         elif perf.win_rate > 0.60:
-            if strategy == "momentum":
+            if strategy in ("momentum", "momentum_follow"):
                 thresh.momentum_threshold = max(0.01, thresh.momentum_threshold * 0.95)
             elif strategy == "mean_reversion":
                 thresh.mean_rev_deviation = max(0.03, thresh.mean_rev_deviation * 0.95)

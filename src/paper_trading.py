@@ -42,6 +42,7 @@ MIN_POL_OPERATIVO = 2.0
 # Criterios de cierre automático
 TP_PCT = 0.15          # Take Profit: +15% sobre precio de entrada
 SL_PCT = 0.10          # Stop Loss: -10% sobre precio de entrada
+MM_SL_PCT = 0.03       # Micro-Stop Loss para Market Making: -3% máximo
 TAU_LIQUIDATION = 0.95  # Liquidación forzosa si tau > 95%
 MAX_POSITION_AGE_H = 72  # Cierre forzoso tras 72h
 
@@ -1057,11 +1058,18 @@ class PaperTradingEngine:
                         reason = "tp"
                 else:
                     reason = "tp"
-            elif pos.pnl_pct <= -SL_PCT * 100:
-                reason = "sl"
-            elif pos.tau_pct >= TAU_LIQUIDATION * 100:
+
+            # ── Stop Loss: MM usa Micro-SL (-3%), resto usa SL estándar (-10%) ──
+            if not reason:
+                if pos.strategy == "market_making":
+                    if pos.pnl_pct <= -MM_SL_PCT * 100:
+                        reason = "sl_mm_micro"
+                elif pos.pnl_pct <= -SL_PCT * 100:
+                    reason = "sl"
+
+            if not reason and pos.tau_pct >= TAU_LIQUIDATION * 100:
                 reason = "tau"
-            elif (now - pos.opened_at) > MAX_POSITION_AGE_H * 3600:
+            if not reason and (now - pos.opened_at) > MAX_POSITION_AGE_H * 3600:
                 reason = "expired"
 
             if reason:
@@ -1495,11 +1503,16 @@ class PaperTradingEngine:
 
             if pos.pnl_pct >= TP_PCT * 100:
                 reason = "tp"
-            elif pos.pnl_pct <= -SL_PCT * 100:
-                reason = "sl"
-            elif pos.tau_pct >= TAU_LIQUIDATION * 100:
+            # ── Stop Loss: MM usa Micro-SL (-3%), resto usa SL estándar (-10%) ──
+            if not reason:
+                if pos.strategy == "market_making":
+                    if pos.pnl_pct <= -MM_SL_PCT * 100:
+                        reason = "sl_mm_micro"
+                elif pos.pnl_pct <= -SL_PCT * 100:
+                    reason = "sl"
+            if not reason and pos.tau_pct >= TAU_LIQUIDATION * 100:
                 reason = "tau"
-            elif (now - pos.opened_at) > MAX_POSITION_AGE_H * 3600:
+            if not reason and (now - pos.opened_at) > MAX_POSITION_AGE_H * 3600:
                 reason = "expired"
 
             if reason:

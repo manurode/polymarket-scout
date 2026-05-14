@@ -31,7 +31,7 @@ alerter:
 
 auto_trader:
   enabled: true
-  max_open_positions: 10
+  max_open_positions: 25
   position_size_pct: 0.05
   min_score: 30
   enabled_strategies:

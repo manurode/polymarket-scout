@@ -604,8 +604,8 @@ class ScoutOrchestrator:
             await asyncio.sleep(PAPER_MTM_INTERVAL)
 
     async def _paper_auto_close_loop(self) -> None:
-        """Evalúa TP/SL/tau + active exits y cierra posiciones automáticamente (v2: TP Maker)."""
-        logger.info("PaperTrading auto-close daemon iniciado (v2: TP Maker + Active Exits)")
+        """Evalúa TP/SL/tau + active exits + OBI evacuation y cierra posiciones automáticamente."""
+        logger.info("PaperTrading auto-close daemon iniciado (v2: TP Maker + Active Exits + OBI Evac)")
         while self._running:
             try:
                 # ── Rule 4: TP usa Maker Limit Orders; SL/tau/expired usan Market Close ──
@@ -614,6 +614,12 @@ class ScoutOrchestrator:
                     closed = await self.paper_trading.evaluate_auto_close_v2(self.book_analyzer)
                 else:
                     closed = await self.paper_trading.evaluate_auto_close()
+
+                # ── OBI Toxic Flow Evacuation (v2.1): detectar tsunamis de liquidez tóxica ──
+                if self.market_maker and self.book_analyzer and len(self.book_analyzer) > 0:
+                    evac_closed = await self._evaluate_obi_evacuations()
+                    if evac_closed:
+                        closed.extend(evac_closed)
 
                 # ── Momentum Reversal Exit: cerrar si el momentum se invirtió ──
                 mom_map = self._build_momentum_map()
@@ -660,6 +666,62 @@ class ScoutOrchestrator:
                     momentum_map[token_id] = mom
 
         return momentum_map
+
+    async def _evaluate_obi_evacuations(self) -> list[dict]:
+        """Evalúa OBI Toxic Flow Evacuation para todas las posiciones MM abiertas.
+
+        Si el Order Book Imbalance (OBI) se inclina > 0.85 en contra de una
+        posición de Market Making durante 3+ ciclos consecutivos, se ejecuta
+        un EMERGENCY_DUMP a precio de mercado. Esto evita esperar al Stop Loss
+        cuando el libro de órdenes ya indica que nos van a barrer.
+
+        Returns
+        -------
+        list[dict]
+            Trades cerrados por evacuación OBI.
+        """
+        closed: list[dict] = []
+        open_positions = [
+            p for p in self.paper_trading._positions
+            if p.closed_at is None and p.strategy == "market_making"
+        ]
+        if not open_positions:
+            return closed
+
+        import time as _time
+        now = _time.time()
+
+        for pos in open_positions:
+            if not pos.token_id:
+                continue
+
+            should_dump, reason = self.market_maker.evaluate_obi_evacuation(
+                token_id=pos.token_id,
+                side=pos.side,
+                now=now,
+            )
+
+            if should_dump:
+                logger.error(
+                    "🚨 OBI EVACUATION EXECUTING #%d [%s] side=%s — %s",
+                    pos.id, pos.market[:50], pos.side, reason,
+                )
+                trade = await self.paper_trading.close_position(
+                    pos.id,
+                    reason="obi_evacuation",
+                )
+                if trade:
+                    closed.append(trade)
+                    trading_log.position_closed(
+                        pos_id=pos.id,
+                        strategy=pos.strategy,
+                        market=pos.market,
+                        pnl=pos.pnl,
+                        pnl_pct=pos.pnl_pct,
+                        reason="obi_evacuation",
+                    )
+
+        return closed
 
     async def _equity_logger_loop(self) -> None:
         """Equity Logger Daemon: guarda una foto del equity total cada EQUITY_LOG_INTERVAL segundos.

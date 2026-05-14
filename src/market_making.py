@@ -51,6 +51,10 @@ TOXIC_FLOW_MIN_VOLUME = 500.0      # USD mínimo para considerar flujo tóxico
 OBI_SPREAD_WIDEN_THRESHOLD = 0.8   # |OBI| > 0.8 → ensanchar spread
 OBI_SPREAD_WIDEN_FACTOR = 1.5      # multiplicador del spread (50% más ancho)
 
+# ── v2.1: OBI Toxic Flow Evacuation ──────────────────────────────
+OBI_EVACUATION_THRESHOLD = 0.85    # |OBI| > 0.85 en contra de la posición → flujo tóxico
+OBI_EVACUATION_CYCLES = 3          # ciclos consecutivos necesarios para evacuar
+
 # ── Tipos ──────────────────────────────────────────────────────────
 
 @dataclass
@@ -93,6 +97,9 @@ class MarketMakerState:
     _volume_history: deque = field(default_factory=lambda: deque(maxlen=1500))
     # v2.0: Recovery mode tracking
     recovery_mode: bool = False
+    # v2.1: OBI Toxic Flow Evacuation tracking
+    _obi_consecutive_against: int = 0  # ciclos seguidos con OBI en contra de la posición
+    _last_obi_check: float = 0.0       # timestamp de la última evaluación OBI
 
     @property
     def net_inventory(self) -> float:
@@ -524,6 +531,99 @@ class MarketMaker:
             return True, f"toxic_flow: 1m_vol=${short_vol:.0f} vs avg=${avg_per_minute:.0f}/min (ratio={ratio:.1f}x)"
 
         return False, ""
+
+    # ── OBI Toxic Flow Evacuation (v2.1) ───────────────────────────
+
+    def evaluate_obi_evacuation(
+        self,
+        token_id: str,
+        side: str,
+        condition_id: str = "",
+        now: Optional[float] = None,
+    ) -> tuple[bool, str]:
+        """Evalúa si el Order Book Imbalance indica flujo tóxico contra la posición.
+
+        Lógica: si tenemos una posición abierta y el OBI del L2 se inclina
+        > OBI_EVACUATION_THRESHOLD en contra de nuestra posición durante
+        más de OBI_EVACUATION_CYCLES ciclos consecutivos, alguien tiene
+        información que nosotros no → evacuar inmediatamente a mercado.
+
+        Parameters
+        ----------
+        token_id : str
+            Token del mercado.
+        side : str
+            "YES" (long YES) o "NO" (long NO).
+        condition_id : str
+            Condition ID (opcional).
+        now : float | None
+            Timestamp actual.
+
+        Returns
+        -------
+        tuple[bool, str]
+            (debe_evacuar, razón)
+        """
+        import time as _time
+        if now is None:
+            now = _time.time()
+
+        # Obtener OBI actual del BookAnalyzer
+        obi = self._books.get_obi(token_id, min_total_size=MIN_TOTAL_SIZE_FOR_OBI)
+        if abs(obi) <= OBI_EVACUATION_THRESHOLD:
+            # OBI dentro de rango normal → resetear contador
+            self._reset_obi_counter(token_id, condition_id)
+            return False, ""
+
+        state = self._get_state(token_id, condition_id)
+
+        # Determinar si el OBI está en contra de la posición
+        obi_against = False
+        if side == "YES":
+            # Long YES: OBI negativo = presión vendedora = EN CONTRA
+            obi_against = obi < -OBI_EVACUATION_THRESHOLD
+        elif side == "NO":
+            # Long NO: OBI positivo = presión compradora de YES = NO baja = EN CONTRA
+            obi_against = obi > OBI_EVACUATION_THRESHOLD
+
+        if not obi_against:
+            # OBI extremo pero a FAVOR de la posición → resetear contador
+            self._reset_obi_counter(token_id, condition_id)
+            return False, ""
+
+        # OBI en contra → incrementar contador
+        state._obi_consecutive_against += 1
+        state._last_obi_check = now
+
+        logger.warning(
+            "OBI TOXIC WATCH ⚠️  %s side=%s obi=%.4f ciclos=%d/%d",
+            token_id[:16], side, obi,
+            state._obi_consecutive_against, OBI_EVACUATION_CYCLES,
+        )
+
+        if state._obi_consecutive_against >= OBI_EVACUATION_CYCLES:
+            reason = (
+                f"obi_evacuation: obi={obi:.3f} against {side} "
+                f"for {state._obi_consecutive_against} consecutive cycles"
+            )
+            logger.error(
+                "🚨 OBI EVACUATION TRIGGERED %s | side=%s obi=%.4f ciclos=%d — "
+                "EMERGENCY DUMP a mercado",
+                token_id[:16], side, obi, state._obi_consecutive_against,
+            )
+            # Resetear contador tras evacuar
+            self._reset_obi_counter(token_id, condition_id)
+            return True, reason
+
+        return False, ""
+
+    def _reset_obi_counter(self, token_id: str, condition_id: str = "") -> None:
+        """Resetea el contador de OBI consecutivo en contra."""
+        state = self._states.get(condition_id or token_id)
+        if state and state._obi_consecutive_against > 0:
+            state._obi_consecutive_against = 0
+
+    # ── Flash Crash Detection ───────────────────────────────────────
 
     def detect_flash_crash(
         self,
