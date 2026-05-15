@@ -189,7 +189,10 @@ class AdaptiveStrategyEngine:
                     "momentum_follow",
                     momentum_threshold=_PT_MOMENTUM_THRESHOLD,
                     min_confidence=_PT_MIN_CONFIDENCE,
-                    enabled=True,  # REACTIVADO: NLP Oracle valida que el volumen tiene respaldo noticioso
+                    enabled=False,  # 🚫 QUARANTINE 2026-05-15: death-by-thousand-cuts en mercados
+                                    # estocásticos (Elon Musk tweets, etc). Prohibido abrir trades
+                                    # hasta reescribir lógica de validación (post-NLP Oracle fix).
+                                    # Ver SYSTEM DIRECTIVE: CAPITAL REALLOCATION & MOMENTUM QUARANTINE.
                 ),
                 "mean_reversion": AdaptiveThresholds(
                     "mean_reversion",
@@ -244,6 +247,16 @@ class AdaptiveStrategyEngine:
         # los umbrales hiperactivos desde el primer ciclo.
         if PAPER_TRADING_HYPERACTIVE:
             self._save_state()
+
+        # ── QUARANTINE ENFORCEMENT: momentum_follow permanece DORMANT ──
+        # Incluso si el JSON persistente tiene enabled=True.
+        mf = self.adaptive_thresholds.get("momentum_follow")
+        if mf and mf.enabled:
+            mf.enabled = False
+            logger.warning(
+                "QUARANTINE: momentum_follow forzado a DISABLED "
+                "(SYSTEM DIRECTIVE: CAPITAL REALLOCATION)"
+            )
 
     def _load_state(self) -> None:
         """Carga estado previo de disco."""
@@ -401,6 +414,11 @@ class AdaptiveStrategyEngine:
         if perf.win_rate < 0.20 and (perf.wins + perf.losses) > 20:
             thresh.enabled = False
             logger.warning(f"AdaptiveEngine: {strategy} DESACTIVADA por bajo rendimiento")
+
+        # ── QUARANTINE GATE: momentum_follow permanece DORMANT hasta rewrite ──
+        # Ver SYSTEM DIRECTIVE: CAPITAL REALLOCATION & MOMENTUM QUARANTINE
+        if strategy == "momentum_follow" and thresh:
+            thresh.enabled = False
 
     def should_trade(self, history: MarketHistory, signal: Signal) -> tuple[bool, str]:
         """

@@ -258,7 +258,9 @@ class MarketMaker:
 
         # ── 5. Position Size ──────────────────────────────────
         if position_size_kelly <= 0:
-            position_size_kelly = 100.0  # default
+            position_size_kelly = 300.0  # v5.1 SCALE-UP: $150/side (was $50/side)
+                                         # MM ahora controla 80% del capital con Sortino 0.77
+                                         # Micro-stop 3% nos protege en caso de adverse selection
         half_size = position_size_kelly / 2.0
 
         # ── Recovery mode: reduce size by 80% ──────────────────

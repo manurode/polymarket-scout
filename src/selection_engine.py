@@ -81,6 +81,18 @@ MM_NICHE_CLOB_DEPTH         = 2_000.0  # USD — excepción MM: si el book CLOB
 MM_LOW_VOL_PENALTY          = 0.10     # ×0.10 — penalización soft para MM en
                                         #   mercados con vol24h < umbral
 
+# ── v5.1 STOCHASTIC MARKET BLACKLIST ──────────────────────────────────────────
+# Mercados cuyo precio depende de tweets/redes sociales en vez de flujos
+# macro/financieros/geopolíticos. El MM sólo opera donde la liquidez fluye
+# de forma racional, no en mercados de nicho hiper-volátiles.
+STOCHASTIC_BLACKLIST_RE = re.compile(
+    r'\b(?:tweets|SpaceX)\b|'                # whole-word: "tweets", "SpaceX"
+    r'(?<![\w-])post(?![\w-])',              # "post" como palabra aislada —
+                                              # excluye "post-election", "post-merger", etc.
+                                              # pero captura "will Musk post", "X post", etc.
+    re.IGNORECASE,
+)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Constantes — Perfil Direccional
@@ -348,6 +360,14 @@ class SelectionEngine:
         # G6 — Spread desconocido (sin margen de cortesía)
         if spread is None and not has_grace:
             return False, "unknown_spread"
+
+        # G7 — v5.1 STOCHASTIC MARKET BLACKLIST
+        # Ignorar mercados basados en tweets/redes sociales (ej. Elon Musk).
+        # El MM opera en flujos macro/financieros/geopolíticos, no en nichos
+        # hiper-volátiles donde el precio depende de un solo tweet.
+        question = snapshot.get("question", "") or ""
+        if STOCHASTIC_BLACKLIST_RE.search(question):
+            return False, "stochastic_blacklist"
 
         return True, "ok"
 

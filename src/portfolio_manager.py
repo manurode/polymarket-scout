@@ -52,6 +52,13 @@ RECOVERY_TRADES_REQUIRED = 10  # v2.0: trades necesarios en RECOVERY para evalua
 BETA_PRIOR_A = 1.0           # prior no informativo
 BETA_PRIOR_B = 1.0
 
+# ── v5.1 CAPITAL REALLOCATION DIRECTIVE ─────────────────────────
+# El Market Maker ha demostrado Sortino 0.77, WR 75%, CumPnL +$9.4.
+# El Bandit ya no asigna libremente: MM recibe mínimo 80% del capital.
+# Las estrategias de exploración compiten por el 20% restante.
+MM_MIN_ALLOCATION = 0.80     # 80% floor para market_making
+EXPLORATION_POOL = 0.20      # 20% restante para estrategias de exploración
+
 # Sortino
 MAR = 0.0                    # Minimum Acceptable Return
 
@@ -298,6 +305,34 @@ class PortfolioManager:
             PAPER_TRADING_HYPERACTIVE, _PT_WEIGHT_CUTOFF,
         )
         _weight_cutoff = _PT_WEIGHT_CUTOFF if PAPER_TRADING_HYPERACTIVE else 0.15
+
+        # ── CAPITAL REALLOCATION DIRECTIVE (v5.1): MM floor ────────
+        # El Market Maker recibe mínimo 80% del capital operativo.
+        # El Bandit solo asigna el 20% restante entre estrategias de exploración.
+        # Si market_making está FROZEN/RETIRED, se usa Thompson Sampling normal.
+        mm_state = self._strategies.get("market_making")
+        mm_eligible = (
+            mm_state is not None
+            and mm_state.status not in (StrategyStatus.RETIRED, StrategyStatus.FROZEN)
+        )
+
+        if mm_eligible and "market_making" in thetas and thetas["market_making"] > 0:
+            # ── Override: MM = 80% fijo ──────────────────────────
+            mm_fraction = MM_MIN_ALLOCATION
+            thetas["market_making"] = mm_fraction
+
+            # ── Exploración: normalizar el resto al 20% ──────────
+            other_thetas = {
+                name: t for name, t in thetas.items()
+                if name != "market_making" and t > 0
+            }
+            other_total = sum(other_thetas.values()) if other_thetas else 0.0
+            if other_total > 0:
+                for name in other_thetas:
+                    thetas[name] = (thetas[name] / other_total) * EXPLORATION_POOL
+            else:
+                # Sin otras estrategias activas → MM se lleva el 100%
+                thetas["market_making"] = 1.0
 
         # Normalizar y asignar
         total_theta = sum(thetas.values())
