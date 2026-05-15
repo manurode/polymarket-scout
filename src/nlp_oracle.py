@@ -1,17 +1,26 @@
 """
-NLP Oracle — Real-Time Sentiment Validator for Polymarket Scout.
+NLP Oracle — Real-Time Sentiment Validator for Polymarket Scout (v5.2).
 
-Zero-cost external context validator using local Zero-Shot Classification
+Zero-cost external context validator using Zero-Shot Classification
 and Telegram news ingestion. Provides a second key (confluencia) for the
 momentum_follow strategy to filter out noise-driven volume spikes.
+
+v5.2 Fix: Replaced NLI pipeline (entailment/neutral/contradiction) with
+explicit two-phase zero-shot relevance labels. The old pipeline treated
+irrelevant news (e.g., "Hantavirus outbreak") as low-confidence contradiction
+for unrelated markets (e.g., "Starmer"), causing false NO trades. The new
+approach forces the model to decide relevance first — "completely unrelated"
+headlines are rejected unconditionally.
 
 Architecture (3 modules):
   1. NewsBuffer — In-memory deque with TTL-based eviction (15 min default)
   2. TelegramNewsStreamer — Telethon-based async listener for configurable channels
-  3. ZeroShotValidator — HuggingFace NLI pipeline (bart-large-mnli or configurable)
+  3. ZeroShotValidator — HuggingFace zero-shot classification pipeline with
+     explicit relevance labels (bart-large-mnli or configurable)
 
 Integration:
-  NLPOracle.validate_market_premise(market_question, news_texts) → confidence_score
+  NLPOracle.validate_market_premise(market_question, side) →
+    (approved, confidence_score, top_headline)
 
 Usage:
   oracle = NLPOracle(config["nlp_oracle"])
@@ -280,6 +289,9 @@ class TelegramNewsStreamer:
             self._resolved_channels = resolved
             nlp_log.streamer_connected(self.channels, resolved)
 
+            # ── v5.1 DIAGNOSTIC: verificar si realmente podemos recibir msgs ──
+            await self._diagnose_channel_access()
+
             # Run until stopped
             await self._client.run_until_disconnected()
         except Exception as e:
@@ -303,6 +315,57 @@ class TelegramNewsStreamer:
             except Exception:
                 pass
             self._client = None
+
+    async def _diagnose_channel_access(self) -> None:
+        """v5.1: Verify the user can actually receive messages from channels.
+
+        Telethon resolves channel entities even if the user hasn't joined them,
+        but events.NewMessage only fires for dialogs the user is a member of.
+        This diagnostic checks each channel against the user's dialog list
+        and logs clear warnings for inaccessible channels.
+        """
+        if not self._client:
+            return
+
+        inaccessible: list[str] = []
+        try:
+            # Get all dialogs (chats the user has access to)
+            dialogs = await self._client.get_dialogs()
+            dialog_names: set[str] = set()
+            for d in dialogs:
+                name = getattr(d, 'name', '') or ''
+                username = getattr(getattr(d, 'entity', None), 'username', '') or ''
+                dialog_names.add(name.lower())
+                if username:
+                    dialog_names.add(username.lower())
+
+            for ch in self.channels:
+                ch_lower = ch.lower().lstrip('@')
+                if ch_lower not in dialog_names:
+                    inaccessible.append(ch)
+
+            if inaccessible:
+                nlp_log.streamer_error(
+                    f"CANALES SIN ACCESO: {', '.join(inaccessible)}. "
+                    f"Únete a estos canales en Telegram para que el NLP Oracle "
+                    f"pueda recibir noticias. Sin acceso, el buffer estará SIEMPRE vacío."
+                )
+                logger.error(
+                    "🔴 NLP ORACLE DIAGNOSTIC: %d/%d canales SIN ACCESO: %s\n"
+                    "   👉 Únete manualmente a estos canales en tu cuenta de Telegram.\n"
+                    "   👉 O actualiza la lista 'channels' en config.yaml con canales\n"
+                    "      a los que SÍ tengas acceso.",
+                    len(inaccessible), len(self.channels),
+                    ", ".join(inaccessible),
+                )
+            else:
+                logger.info(
+                    "✅ NLP ORACLE DIAGNOSTIC: %d/%d canales accesibles — "
+                    "el streamer debería recibir mensajes correctamente.",
+                    len(self.channels), len(self.channels),
+                )
+        except Exception as e:
+            logger.debug("NLP Oracle channel diagnostic error: %s", e)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -334,6 +397,22 @@ class ZeroShotValidator:
     NLI_LABELS = ["entailment", "neutral", "contradiction"]
     # Some models use different casing
     NLI_LABELS_ALT = ["ENTAILMENT", "NEUTRAL", "CONTRADICTION"]
+
+    # ── v5.2: Explicit relevance labels for zero-shot pre-filter ────────
+    # These labels force the model to explicitly decide whether a text is
+    # relevant to the premise BEFORE scoring confirmation/contradiction.
+    # Fixes the "Hantavirus → NO on Starmer" bug where the old NLI pipeline
+    # treated neutral/irrelevant text as low-confidence contradiction.
+    RELEVANCE_LABELS = [
+        "This text confirms the premise",
+        "This text contradicts the premise",
+        "This text is completely unrelated to the premise",
+    ]
+
+    # Shorthand keys for the labels above (used in decision logic)
+    LABEL_CONFIRMS = RELEVANCE_LABELS[0]    # "This text confirms the premise"
+    LABEL_CONTRADICTS = RELEVANCE_LABELS[1]  # "This text contradicts the premise"
+    LABEL_UNRELATED = RELEVANCE_LABELS[2]    # "This text is completely unrelated to the premise"
 
     def __init__(
         self,
@@ -496,6 +575,47 @@ class ZeroShotValidator:
 
         return result
 
+    def classify_relevance(self, text: str, premise: str) -> dict[str, float]:
+        """Zero-shot relevance pre-filter: is the text relevant to the premise?
+
+        Uses the zero-shot-classification pipeline with three explicit labels:
+          - "This text confirms the premise"
+          - "This text contradicts the premise"
+          - "This text is completely unrelated to the premise"
+
+        Unlike the NLI pipeline (which conflates irrelevance with low-confidence
+        contradiction), this forces the model to explicitly identify noise.
+
+        Parameters
+        ----------
+        text : str
+            The news headline to evaluate.
+        premise : str
+            The market question / trading premise.
+
+        Returns
+        -------
+        dict[str, float]
+            Scores for each of the three relevance labels.
+            Example:
+            {"This text confirms the premise": 0.05,
+             "This text contradicts the premise": 0.03,
+             "This text is completely unrelated to the premise": 0.92}
+        """
+        if not self._loaded or self._pipeline is None:
+            raise RuntimeError(
+                "ZeroShotValidator: modelo no cargado. Llama a await load() primero."
+            )
+
+        result = self._pipeline(
+            text,
+            candidate_labels=self.RELEVANCE_LABELS,
+        )
+
+        labels = result.get("labels", [])
+        scores = result.get("scores", [])
+        return {label: float(score) for label, score in zip(labels, scores)}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # NLPOracle — Main orchestrator
@@ -594,6 +714,7 @@ class NLPOracle:
 
     async def _periodic_buffer_status(self) -> None:
         """Periodically log buffer status for monitoring/debugging."""
+        _warned_empty = False
         while True:
             await asyncio.sleep(60)
             try:
@@ -601,6 +722,20 @@ class NLPOracle:
                 oldest = await self.buffer.oldest_age()
                 total = self.buffer.total_ingested
                 nlp_log.buffer_status(count, oldest, total)
+
+                # ── v5.1: warn if buffer is perpetually empty ──
+                if total == 0 and not _warned_empty:
+                    _warned_empty = True
+                    logger.warning(
+                        "⚠️  NLP Oracle: buffer de noticias VACÍO tras 60s. "
+                        "Posibles causas:\n"
+                        "   1) No estás unido a los canales configurados: %s\n"
+                        "   2) Los canales no han enviado mensajes recientemente\n"
+                        "   3) La sesión de Telethon no está autenticada correctamente\n"
+                        "   👉 Ejecuta el diagnóstico automático o revisa "
+                        "data/nlp_oracle.log para ver el resultado del diagnóstico.",
+                        ", ".join(self._channels),
+                    )
             except Exception:
                 pass
 
@@ -639,16 +774,22 @@ class NLPOracle:
         side: str = "YES",
         token_id: str = "",
     ) -> tuple[bool, float, str]:
-        """Validate whether recent news supports a market direction.
+        """Validate whether recent news supports a market direction (v5.2).
 
         Core method of the NLP Oracle. Takes a market question and the
         momentum direction (YES = price rising, NO = price falling) and
-        checks whether recent Telegram news headlines entail or contradict
-        the market premise.
+        checks whether recent Telegram news headlines confirm or contradict
+        the market premise using a two-phase zero-shot relevance filter.
 
-        Logic:
-        - YES momentum → we need ENTAILMENT (news confirms event is happening)
-        - NO momentum → we need CONTRADICTION (news contradicts event happening)
+        v5.2 Logic (Zero-Shot Relevance, not NLI):
+        - Phase 1: Is the news relevant? Uses 3 explicit labels:
+            "This text confirms the premise"
+            "This text contradicts the premise"
+            "This text is completely unrelated to the premise"
+        - Phase 2: If the top-scoring label is "unrelated" → REJECTED (NOISE).
+          If the top label matches the trade direction (confirms+YES or
+          contradicts+NO) AND score > threshold → APPROVED.
+          Otherwise → REJECTED.
 
         Parameters
         ----------
@@ -663,8 +804,10 @@ class NLPOracle:
         -------
         tuple[bool, float, str]
             (approved, confidence_score, top_headline_snippet)
-            - approved: True if NLP signal is strong enough to validate momentum.
-            - confidence_score: Best entailment/contradiction score found.
+            - approved: True if a relevant headline matched the trade direction
+              with score >= threshold. False if all news was noise/irrelevant
+              or no headline crossed the threshold.
+            - confidence_score: Best relevance score found (0.0 if all noise).
             - top_headline_snippet: The headline that produced the best score.
         """
         if not self._enabled:
@@ -674,7 +817,12 @@ class NLPOracle:
 
         # ── Pipeline entry timing ─────────────────────────────────
         _pipeline_t0 = time.time()
-        target_label = "entailment" if side == "YES" else "contradiction"
+
+        # ── v5.2: Two-phase relevance labels (no more NLI ambiguity) ──
+        # Phase 1: Is the text relevant? (confirms / contradicts / unrelated)
+        # Phase 2: Does the winning label + score cross the threshold?
+        # Unrelated news → REJECTED unconditionally (NOISE).
+        # Related news → check label-direction match + score > threshold.
 
         # Get recent headlines
         headlines = await self.buffer.get_recent()
@@ -683,7 +831,7 @@ class NLPOracle:
                 token_id=token_id,
                 question=market_question,
                 side=side,
-                target_label=target_label,
+                target_label="relevance_check",
                 buffer_count=0,
                 threshold=self._confidence_threshold,
             )
@@ -696,7 +844,7 @@ class NLPOracle:
                 approved=False,
                 best_score=0.0,
                 threshold=self._confidence_threshold,
-                target_label=target_label,
+                target_label="relevance_check",
                 headlines_checked=0,
                 headlines_total=0,
                 elapsed_ms=(time.time() - _pipeline_t0) * 1000,
@@ -708,7 +856,7 @@ class NLPOracle:
             token_id=token_id,
             question=market_question,
             side=side,
-            target_label=target_label,
+            target_label="relevance_check",
             buffer_count=len(headlines),
             threshold=self._confidence_threshold,
         )
@@ -724,7 +872,7 @@ class NLPOracle:
                 approved=False,
                 best_score=0.0,
                 threshold=self._confidence_threshold,
-                target_label=target_label,
+                target_label="relevance_check",
                 headlines_checked=0,
                 headlines_total=len(headlines),
                 elapsed_ms=(time.time() - _pipeline_t0) * 1000,
@@ -733,36 +881,70 @@ class NLPOracle:
 
         best_score = 0.0
         best_headline = ""
+        best_top_label = ""          # v5.2: track the winning label for logging
         headlines_checked = 0
         total_headlines = len(headlines)
 
+        # ── v5.2: Shortcuts for label comparison ──────────────────
+        CONFIRMS = ZeroShotValidator.LABEL_CONFIRMS
+        CONTRADICTS = ZeroShotValidator.LABEL_CONTRADICTS
+        UNRELATED = ZeroShotValidator.LABEL_UNRELATED
+
         for idx, headline in enumerate(headlines):
             try:
-                # Run proper NLI: headline (premise) → market question (hypothesis)
+                # ── v5.2: Two-phase zero-shot relevance check ──────
                 _nli_t0 = time.time()
-                scores = validator.classify_nli(
-                    premise=headline.text,
-                    hypothesis=market_question,
+                relevance = validator.classify_relevance(
+                    text=headline.text,
+                    premise=market_question,
                 )
                 _nli_elapsed = (time.time() - _nli_t0) * 1000
 
-                # ── Log individual classification ──────────────────
+                # Find the winning label (highest score)
+                top_label = max(relevance, key=relevance.get)
+                top_score = relevance[top_label]
+
+                # ── v5.2: Decision logic (two-phase) ───────────────
+                # Phase 1: Is the news irrelevant?
+                if top_label == UNRELATED:
+                    # Noise → unconditional rejection.
+                    # Don't even consider this headline for scoring.
+                    is_relevant = False
+                    rejection_reason = "NOISE"
+                    effective_score = top_score
+                # Phase 2: Does the label match the trade direction?
+                elif top_label == CONFIRMS and side == "YES":
+                    is_relevant = True
+                    rejection_reason = ""
+                    effective_score = top_score
+                elif top_label == CONTRADICTS and side == "NO":
+                    is_relevant = True
+                    rejection_reason = ""
+                    effective_score = top_score
+                else:
+                    # Label doesn't match direction (e.g., "contradicts" + YES,
+                    # "confirms" + NO). Rejected — the news contradicts our bet.
+                    is_relevant = False
+                    rejection_reason = "MISMATCH"
+                    effective_score = top_score
+
+                # ── Log individual classification (v5.2) ───────────
                 nlp_log.headline_classified(
                     idx=idx,
                     total=total_headlines,
                     premise_preview=headline.text,
-                    scores=scores,
-                    target_label=target_label,
+                    scores=relevance,
+                    target_label=top_label,  # v5.2: log actual winning label
                 )
 
                 headlines_checked += 1
 
-                # Get the score for our target label
-                score = scores.get(target_label, 0.0)
-
-                if score > best_score:
-                    best_score = score
+                # Only track as "best" if the headline is relevant AND
+                # the effective score is the highest we've seen.
+                if is_relevant and effective_score > best_score:
+                    best_score = effective_score
                     best_headline = headline.text
+                    best_top_label = top_label
 
             except Exception as e:
                 nlp_log.headline_classification_error(
@@ -777,6 +959,9 @@ class NLPOracle:
                 )
                 continue
 
+        # ── v5.2: Final approval — only if best headline was relevant ──
+        # (irrelevant headlines are never tracked as best, so best_score=0.0
+        #  when all news was noise).
         approved = best_score >= self._confidence_threshold
 
         # ── Dedicated logger: legacy premise_validated ─────────────────
@@ -798,33 +983,44 @@ class NLPOracle:
             approved=approved,
             best_score=best_score,
             threshold=self._confidence_threshold,
-            target_label=target_label,
+            target_label=best_top_label or "unrelated",
             headlines_checked=headlines_checked,
             headlines_total=total_headlines,
             elapsed_ms=_pipeline_elapsed,
         )
 
-        # ── Console logger (compact) ───────────────────────────────────
+        # ── v5.2: Console logger with explicit Top_Label ───────────────
         token_snippet = token_id[:16] if token_id else "?"
         action = "APPROVED" if approved else "REJECTED"
         log_headline = best_headline[:80] if best_headline else "(sin noticias)"
+        top_label_short = (
+            "confirms" if best_top_label == CONFIRMS
+            else "contradicts" if best_top_label == CONTRADICTS
+            else "unrelated" if best_top_label == UNRELATED
+            else best_top_label or "unrelated"
+        )
 
         logger.info(
-            "[NLP_ORACLE] Token=%s | Premise=\"%s\" | Top News: \"%s\" | "
-            "NLP_Score=%.3f (threshold=%.2f) | Action=%s | "
-            "Buffer=%d headlines | checked=%d | side=%s target=%s | ⏱=%.0fms",
+            "[NLP_ORACLE] Token=%s | Top_Label=\"%s\" | Score=%.3f "
+            "(threshold=%.2f) | Action=%s | "
+            "Top News: \"%s\" | Buffer=%d | checked=%d | side=%s | ⏱=%.0fms",
             token_snippet,
-            market_question[:40],
-            log_headline,
+            top_label_short,
             best_score,
             self._confidence_threshold,
             action,
+            log_headline,
             total_headlines,
             headlines_checked,
             side,
-            target_label,
             _pipeline_elapsed,
         )
+
+        # ── v5.2: Cooldown safety — noise rejections do NOT trigger
+        # post-trade cooldowns. The orchestrator's `continue` on nlp_approved=False
+        # leaves the token free for re-evaluation in the next cycle.
+        # Cooldowns are only set by AdaptiveStrategyEngine.mark_trade_executed()
+        # AFTER a successful trade fill — never on rejection.
 
         return (approved, best_score, best_headline)
 

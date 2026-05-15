@@ -892,12 +892,12 @@ class ScoutOrchestrator:
                             token_id=token_id,
                         )
                         if not nlp_approved:
-                            logger.info(
-                                "[NLP_ORACLE] Token=%s | Premise=\"%s\" | Top News: \"%s\" | "
-                                "NLP_Score=%.3f | Action=REJECTED",
+                            # v5.2: NLP oracle already logs Top_Label + Score + Action.
+                            # This debug line just confirms rejection at orchestrator level.
+                            logger.debug(
+                                "[NLP_ORACLE] Token=%s | NLP_Score=%.3f | Action=REJECTED "
+                                "(see nlp_oracle.log for Top_Label detail)",
                                 token_id[:16] if token_id else cid[:16],
-                                sig.question[:40],
-                                nlp_headline[:50] if nlp_headline else "(sin noticias)",
                                 nlp_score,
                             )
                             continue
@@ -1647,21 +1647,19 @@ class ScoutOrchestrator:
                             token_id=token_id,
                         )
                         if not nlp_approved:
-                            logger.info(
-                                "[NLP_ORACLE] Token=%s | Premise=\"%s\" | Top News: \"%s\" | "
-                                "NLP_Score=%.3f | Action=REJECTED",
+                            # v5.2: NLP oracle already logs Top_Label + Score + Action.
+                            # This debug line just confirms rejection at orchestrator level.
+                            logger.debug(
+                                "[NLP_ORACLE] Token=%s | NLP_Score=%.3f | Action=REJECTED "
+                                "(see nlp_oracle.log for Top_Label detail)",
                                 token_id[:16] if token_id else cid[:16],
-                                sig.question[:40],
-                                nlp_headline[:50] if nlp_headline else "(sin noticias)",
                                 nlp_score,
                             )
                             continue
-                        logger.info(
-                            "[NLP_ORACLE] Token=%s | Premise=\"%s\" | Top News: \"%s\" | "
-                            "NLP_Score=%.3f | Action=APPROVED",
+                        # v5.2: NLP oracle already logs definitive Top_Label + Score + Action.
+                        logger.debug(
+                            "[NLP_ORACLE] Token=%s | NLP_Score=%.3f | Action=APPROVED",
                             token_id[:16] if token_id else cid[:16],
-                            sig.question[:40],
-                            nlp_headline[:50] if nlp_headline else "(sin noticias)",
                             nlp_score,
                         )
 
