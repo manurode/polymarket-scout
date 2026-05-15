@@ -825,7 +825,6 @@ class NLPOracle:
                     text=headline.text,
                     premise=premise_stmt,
                 )
-                _nli_elapsed = (time.time() - _nli_t0) * 1000
 
                 ent = nli_scores.get("entailment", 0.0)
                 neut = nli_scores.get("neutral", 0.0)
