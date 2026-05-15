@@ -121,8 +121,8 @@ nlp_oracle:
   # [!] telegram_api_id y telegram_api_hash se leen del .env
   #     (TELEGRAM_API_ID / TELEGRAM_API_HASH). NUNCA en este archivo.
   channels:                        # Canales de Telegram a monitorizar (sin @)
-    - "Tree_News"
-    - "FirstSquawk"
+    - "WatcherGuruChat"
+    - "WalterAds_Bot"
     # - "polymarket_news"
   model: "facebook/bart-large-mnli"  # Modelo NLI Zero-Shot (~1.6GB)
   # Alternativas más ligeras:

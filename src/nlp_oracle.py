@@ -79,8 +79,21 @@ class NewsBuffer:
     async def add(self, headline: NewsHeadline) -> None:
         """Add a headline to the buffer (thread-safe)."""
         async with self._lock:
+            # Check if buffer is at capacity BEFORE adding
+            if len(self._buffer) >= self.max_size:
+                oldest = self._buffer[0]
+                nlp_log.buffer_full(
+                    self.max_size,
+                    oldest.text,
+                )
             self._buffer.append(headline)
             self._total_ingested += 1
+            nlp_log.buffer_added(
+                headline_preview=headline.text,
+                count=len(self._buffer),
+                max_size=self.max_size,
+                ingested_total=self._total_ingested,
+            )
 
     async def get_recent(self) -> list[NewsHeadline]:
         """Return all non-expired headlines (purges expired on read).
@@ -115,8 +128,12 @@ class NewsBuffer:
 
     def _purge_expired(self) -> None:
         """Remove all expired headlines from the front of the deque."""
+        removed = 0
         while self._buffer and self._buffer[0].is_expired(self.ttl_seconds):
             self._buffer.popleft()
+            removed += 1
+        if removed > 0:
+            nlp_log.buffer_purge(removed, len(self._buffer))
 
     @property
     def total_ingested(self) -> int:
@@ -192,17 +209,33 @@ class TelegramNewsStreamer:
             if not self._running:
                 return
             text = event.message.text or ""
+            
+            # ── Extract metadata for raw logging ──────────────────────
+            msg_id = getattr(event.message, "id", 0)
+            has_media = bool(getattr(event.message, "media", None))
+            msg_ts = str(getattr(event.message, "date", ""))
+            channel_name = getattr(
+                getattr(event, "chat", None), "username", ""
+            ) or getattr(getattr(event, "chat", None), "title", "")
+
+            # ── RAW LOG: every message, before filtering ──────────────
+            nlp_log.streamer_message_raw(
+                channel=str(channel_name),
+                msg_id=msg_id,
+                text=text,
+                has_media=has_media,
+                msg_timestamp=msg_ts,
+            )
+
             if not text.strip():
+                nlp_log.streamer_message_filtered("empty_text", msg_id, str(channel_name))
                 return
 
             # Skip very short messages (likely just emojis/reactions)
             if len(text.strip()) < 15:
                 nlp_log.headline_dropped("too_short", text)
+                nlp_log.streamer_message_filtered("too_short", msg_id, str(channel_name), text)
                 return
-
-            channel_name = getattr(
-                getattr(event, "chat", None), "username", ""
-            ) or getattr(getattr(event, "chat", None), "title", "")
 
             headline = NewsHeadline(
                 text=text.strip(),
@@ -319,6 +352,7 @@ class ZeroShotValidator:
 
         nlp_log.model_loading(self.model_name)
         logger.info("ZeroShotValidator: cargando modelo %s ...", self.model_name)
+        _t0 = time.time()
         try:
             import torch
             from transformers import pipeline
@@ -334,12 +368,15 @@ class ZeroShotValidator:
                 ),
             )
             self._loaded = True
+            _elapsed = time.time() - _t0
             device_str = "CPU" if self.device < 0 else f"cuda:{self.device}"
             nlp_log.model_loaded(self.model_name, device_str)
+            nlp_log.model_load_timing(self.model_name, _elapsed, device_str)
             logger.info(
-                "ZeroShotValidator: modelo %s cargado (device=%s)",
+                "ZeroShotValidator: modelo %s cargado (device=%s) en %.1fs",
                 self.model_name,
                 device_str,
+                _elapsed,
             )
         except ImportError as e:
             nlp_log.model_error(self.model_name, str(e))
@@ -549,10 +586,23 @@ class NLPOracle:
         )
 
         self._streamer_task = asyncio.create_task(self._streamer.start())
+        self._buffer_status_task = asyncio.create_task(self._periodic_buffer_status())
         logger.info(
             "NLPOracle: streamer de Telegram iniciado (%d canales)",
             len(self._channels),
         )
+
+    async def _periodic_buffer_status(self) -> None:
+        """Periodically log buffer status for monitoring/debugging."""
+        while True:
+            await asyncio.sleep(60)
+            try:
+                count = await self.buffer.count()
+                oldest = await self.buffer.oldest_age()
+                total = self.buffer.total_ingested
+                nlp_log.buffer_status(count, oldest, total)
+            except Exception:
+                pass
 
     async def stop_streamer(self) -> None:
         """Stop the Telegram streamer gracefully."""
@@ -567,6 +617,14 @@ class NLPOracle:
             except asyncio.CancelledError:
                 pass
             self._streamer_task = None
+
+        if hasattr(self, '_buffer_status_task') and self._buffer_status_task and not self._buffer_status_task.done():
+            self._buffer_status_task.cancel()
+            try:
+                await self._buffer_status_task
+            except asyncio.CancelledError:
+                pass
+            self._buffer_status_task = None
 
     async def _ensure_validator(self) -> ZeroShotValidator:
         """Lazy-load the zero-shot validator on first use."""
@@ -611,16 +669,49 @@ class NLPOracle:
         """
         if not self._enabled:
             # NLP oracle disabled → pass-through (always approve)
+            nlp_log.oracle_disabled(token_id, market_question)
             return (True, 1.0, "")
+
+        # ── Pipeline entry timing ─────────────────────────────────
+        _pipeline_t0 = time.time()
+        target_label = "entailment" if side == "YES" else "contradiction"
 
         # Get recent headlines
         headlines = await self.buffer.get_recent()
         if not headlines:
+            nlp_log.validation_start(
+                token_id=token_id,
+                question=market_question,
+                side=side,
+                target_label=target_label,
+                buffer_count=0,
+                threshold=self._confidence_threshold,
+            )
             nlp_log.premise_skipped_no_buffer(token_id, market_question)
             logger.debug(
                 "[NLP_ORACLE] No headlines in buffer — signal REJECTED by default"
             )
+            nlp_log.validation_complete(
+                token_id=token_id,
+                approved=False,
+                best_score=0.0,
+                threshold=self._confidence_threshold,
+                target_label=target_label,
+                headlines_checked=0,
+                headlines_total=0,
+                elapsed_ms=(time.time() - _pipeline_t0) * 1000,
+            )
             return (False, 0.0, "")
+
+        # ── Log pipeline start ────────────────────────────────────
+        nlp_log.validation_start(
+            token_id=token_id,
+            question=market_question,
+            side=side,
+            target_label=target_label,
+            buffer_count=len(headlines),
+            threshold=self._confidence_threshold,
+        )
 
         # Lazy-load the classifier
         try:
@@ -628,19 +719,43 @@ class NLPOracle:
         except Exception as e:
             nlp_log.premise_error(token_id, market_question, str(e))
             logger.error("[NLP_ORACLE] Error cargando clasificador: %s", e)
+            nlp_log.validation_complete(
+                token_id=token_id,
+                approved=False,
+                best_score=0.0,
+                threshold=self._confidence_threshold,
+                target_label=target_label,
+                headlines_checked=0,
+                headlines_total=len(headlines),
+                elapsed_ms=(time.time() - _pipeline_t0) * 1000,
+            )
             return (False, 0.0, "")
 
         best_score = 0.0
         best_headline = ""
-        target_label = "entailment" if side == "YES" else "contradiction"
+        headlines_checked = 0
+        total_headlines = len(headlines)
 
-        for headline in headlines:
+        for idx, headline in enumerate(headlines):
             try:
                 # Run proper NLI: headline (premise) → market question (hypothesis)
+                _nli_t0 = time.time()
                 scores = validator.classify_nli(
                     premise=headline.text,
                     hypothesis=market_question,
                 )
+                _nli_elapsed = (time.time() - _nli_t0) * 1000
+
+                # ── Log individual classification ──────────────────
+                nlp_log.headline_classified(
+                    idx=idx,
+                    total=total_headlines,
+                    premise_preview=headline.text,
+                    scores=scores,
+                    target_label=target_label,
+                )
+
+                headlines_checked += 1
 
                 # Get the score for our target label
                 score = scores.get(target_label, 0.0)
@@ -650,15 +765,21 @@ class NLPOracle:
                     best_headline = headline.text
 
             except Exception as e:
+                nlp_log.headline_classification_error(
+                    idx=idx,
+                    total=total_headlines,
+                    premise_preview=headline.text,
+                    error=str(e),
+                )
                 logger.debug(
-                    "[NLP_ORACLE] Error clasificando headline: %s",
-                    e,
+                    "[NLP_ORACLE] Error clasificando headline [%d/%d]: %s",
+                    idx + 1, total_headlines, e,
                 )
                 continue
 
         approved = best_score >= self._confidence_threshold
 
-        # ── Dedicated logger ──────────────────────────────────────────
+        # ── Dedicated logger: legacy premise_validated ─────────────────
         nlp_log.premise_validated(
             token_id=token_id,
             question=market_question,
@@ -667,7 +788,20 @@ class NLPOracle:
             threshold=self._confidence_threshold,
             approved=approved,
             top_headline=best_headline,
-            buffer_count=len(headlines),
+            buffer_count=total_headlines,
+        )
+
+        # ── Pipeline complete with timing ─────────────────────────────
+        _pipeline_elapsed = (time.time() - _pipeline_t0) * 1000
+        nlp_log.validation_complete(
+            token_id=token_id,
+            approved=approved,
+            best_score=best_score,
+            threshold=self._confidence_threshold,
+            target_label=target_label,
+            headlines_checked=headlines_checked,
+            headlines_total=total_headlines,
+            elapsed_ms=_pipeline_elapsed,
         )
 
         # ── Console logger (compact) ───────────────────────────────────
@@ -678,16 +812,18 @@ class NLPOracle:
         logger.info(
             "[NLP_ORACLE] Token=%s | Premise=\"%s\" | Top News: \"%s\" | "
             "NLP_Score=%.3f (threshold=%.2f) | Action=%s | "
-            "Buffer=%d headlines | side=%s target=%s",
+            "Buffer=%d headlines | checked=%d | side=%s target=%s | ⏱=%.0fms",
             token_snippet,
             market_question[:40],
             log_headline,
             best_score,
             self._confidence_threshold,
             action,
-            len(headlines),
+            total_headlines,
+            headlines_checked,
             side,
             target_label,
+            _pipeline_elapsed,
         )
 
         return (approved, best_score, best_headline)

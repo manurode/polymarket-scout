@@ -867,6 +867,25 @@ class ScoutOrchestrator:
 
                     # ── KEY 2: NLP Oracle — Confluencia de noticias ────────────
                     if sig.strategy in ("momentum", "momentum_follow"):
+                        # ── Log trigger context ──────────────────────
+                        regime = self.adaptive_engine.market_regimes.get(cid, "")
+                        # Try to get volume spike ratio from pipeline history
+                        vol_spike = 0.0
+                        try:
+                            hist = self.adaptive_engine.pipeline._history.get(cid)
+                            if hist:
+                                vol_spike = hist.volume_spike or 0.0
+                        except Exception:
+                            pass
+                        nlp_log.trigger_context(
+                            token_id=token_id,
+                            strategy=sig.strategy,
+                            side=sig.side,
+                            signal_confidence=sig.confidence,
+                            question=sig.question,
+                            volume_spike_ratio=vol_spike,
+                            market_regime=regime,
+                        )
                         nlp_approved, nlp_score, nlp_headline = await self.nlp_oracle.validate_market_premise(
                             market_question=sig.question,
                             side=sig.side,
@@ -1604,6 +1623,24 @@ class ScoutOrchestrator:
                     # Volume spike (Key 1) is already verified in the pipeline.
                     # NLP confidence > threshold (Key 2) confirms the spike has news backing.
                     if sig.strategy in ("momentum", "momentum_follow"):
+                        # ── Log trigger context ──────────────────────
+                        regime = self.adaptive_engine.market_regimes.get(cid, "")
+                        vol_spike = 0.0
+                        try:
+                            hist = self.adaptive_engine.pipeline._history.get(cid)
+                            if hist:
+                                vol_spike = hist.volume_spike or 0.0
+                        except Exception:
+                            pass
+                        nlp_log.trigger_context(
+                            token_id=token_id,
+                            strategy=sig.strategy,
+                            side=sig.side,
+                            signal_confidence=sig.confidence,
+                            question=sig.question,
+                            volume_spike_ratio=vol_spike,
+                            market_regime=regime,
+                        )
                         nlp_approved, nlp_score, nlp_headline = await self.nlp_oracle.validate_market_premise(
                             market_question=sig.question,
                             side=sig.side,
