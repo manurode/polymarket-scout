@@ -1,22 +1,26 @@
 """
-NLP Oracle — Real-Time Sentiment Validator for Polymarket Scout (v5.2).
+NLP Oracle — Real-Time Sentiment Validator for Polymarket Scout (v5.3).
 
-Zero-cost external context validator using Zero-Shot Classification
-and Telegram news ingestion. Provides a second key (confluencia) for the
-momentum_follow strategy to filter out noise-driven volume spikes.
+Zero-cost external context validator using Native NLI (Natural Language
+Inference) and Telegram news ingestion. Provides a second key (confluencia)
+for the momentum_follow strategy to filter out noise-driven volume spikes.
 
-v5.2 Fix: Replaced NLI pipeline (entailment/neutral/contradiction) with
-explicit two-phase zero-shot relevance labels. The old pipeline treated
-irrelevant news (e.g., "Hantavirus outbreak") as low-confidence contradiction
-for unrelated markets (e.g., "Starmer"), causing false NO trades. The new
-approach forces the model to decide relevance first — "completely unrelated"
-headlines are rejected unconditionally.
+v5.3 Fix (May 2026): Replaced zero-shot relevance labels with native NLI
+sentence-pair inference. The old approach used pipeline("zero-shot-classification")
+with custom labels, which produced identical scores (~0.679) for all markets
+and zero-valued logits internally, causing massive false positives. The new
+approach uses pipeline("text-classification") with explicit premise-hypothesis
+pairs — the standard NLI formulation that bart-large-mnli was trained for:
+  - input = {"text": news_headline, "text_pair": market_statement}
+  - output = {entailment, neutral, contradiction} native scores
+  - Decision: neutral highest → REJECTED (noise); entailment > 0.65 + YES
+    → APPROVED; contradiction > 0.65 + NO → APPROVED
 
 Architecture (3 modules):
   1. NewsBuffer — In-memory deque with TTL-based eviction (15 min default)
   2. TelegramNewsStreamer — Telethon-based async listener for configurable channels
-  3. ZeroShotValidator — HuggingFace zero-shot classification pipeline with
-     explicit relevance labels (bart-large-mnli or configurable)
+  3. ZeroShotValidator — HuggingFace text-classification NLI pipeline with
+     native entailment/neutral/contradiction scores (bart-large-mnli)
 
 Integration:
   NLPOracle.validate_market_premise(market_question, side) →
@@ -369,15 +373,19 @@ class TelegramNewsStreamer:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ZeroShotValidator — HuggingFace NLI pipeline
+# ZeroShotValidator — HuggingFace Native NLI pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ZeroShotValidator:
-    """Zero-shot NLI classifier for market premise validation.
+    """Native NLI classifier for market premise validation (v5.3).
 
-    Uses a HuggingFace transformers pipeline with an NLI model (e.g.,
-    facebook/bart-large-mnli) to determine whether news headlines entail
-    or contradict a market question.
+    Uses a HuggingFace text-classification pipeline with bart-large-mnli
+    to perform Natural Language Inference via sentence pairs:
+      - input:  {"text": news_headline, "text_pair": market_statement}
+      - output: {entailment, neutral, contradiction} native scores
+
+    This replaces the v5.2 zero-shot relevance approach that produced
+    identical scores across all markets due to logit collapse.
 
     The classifier is loaded lazily on first use to avoid slowing down
     application startup.
@@ -385,34 +393,16 @@ class ZeroShotValidator:
     Parameters
     ----------
     model_name : str
-        HuggingFace model name for zero-shot classification / NLI.
+        HuggingFace NLI model name.
         Recommended: "facebook/bart-large-mnli" (accurate, ~1.6GB)
-        Faster alternative: "MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli" (~700MB)
-        Lightweight: "typeform/distilbert-base-uncased-mnli" (~268MB)
     device : int
         Device for inference: -1 for CPU, 0 for GPU.
     """
 
-    # NLI label mapping (model-specific; bart-large-mnli uses these)
+    # NLI label mapping (bart-large-mnli uses these)
     NLI_LABELS = ["entailment", "neutral", "contradiction"]
     # Some models use different casing
     NLI_LABELS_ALT = ["ENTAILMENT", "NEUTRAL", "CONTRADICTION"]
-
-    # ── v5.2: Explicit relevance labels for zero-shot pre-filter ────────
-    # These labels force the model to explicitly decide whether a text is
-    # relevant to the premise BEFORE scoring confirmation/contradiction.
-    # Fixes the "Hantavirus → NO on Starmer" bug where the old NLI pipeline
-    # treated neutral/irrelevant text as low-confidence contradiction.
-    RELEVANCE_LABELS = [
-        "This text confirms the premise",
-        "This text contradicts the premise",
-        "This text is completely unrelated to the premise",
-    ]
-
-    # Shorthand keys for the labels above (used in decision logic)
-    LABEL_CONFIRMS = RELEVANCE_LABELS[0]    # "This text confirms the premise"
-    LABEL_CONTRADICTS = RELEVANCE_LABELS[1]  # "This text contradicts the premise"
-    LABEL_UNRELATED = RELEVANCE_LABELS[2]    # "This text is completely unrelated to the premise"
 
     def __init__(
         self,
@@ -425,12 +415,16 @@ class ZeroShotValidator:
         self._loaded = False
 
     async def load(self) -> None:
-        """Load the HuggingFace pipeline (async-compatible, but internally sync)."""
+        """Load the HuggingFace NLI pipeline (async-compatible, internally sync).
+
+        Uses text-classification pipeline with return_all_scores=True
+        for native NLI sentence-pair inference (v5.3).
+        """
         if self._loaded:
             return
 
         nlp_log.model_loading(self.model_name)
-        logger.info("ZeroShotValidator: cargando modelo %s ...", self.model_name)
+        logger.info("ZeroShotValidator: cargando modelo NLI %s ...", self.model_name)
         _t0 = time.time()
         try:
             import torch
@@ -441,9 +435,10 @@ class ZeroShotValidator:
             self._pipeline = await loop.run_in_executor(
                 None,
                 lambda: pipeline(
-                    "zero-shot-classification",
+                    "text-classification",
                     model=self.model_name,
                     device=self.device,
+                    return_all_scores=True,
                 ),
             )
             self._loaded = True
@@ -469,152 +464,91 @@ class ZeroShotValidator:
             logger.error("ZeroShotValidator: error cargando modelo: %s", e)
             raise
 
-    def classify(self, premise: str, hypothesis: str) -> dict[str, float]:
-        """Run NLI inference: does the premise entail/contradict the hypothesis?
+    def classify_nli_pair(self, text: str, premise: str) -> dict[str, float]:
+        """Native NLI sentence-pair inference (v5.3).
 
-        Parameters
-        ----------
-        premise : str
-            The news headline (ground truth context).
-        hypothesis : str
-            The market question / premise to validate.
+        Uses the text-classification pipeline with premise-hypothesis pairs.
+        This is the standard NLI formulation bart-large-mnli was trained for:
+        input = {"text": news_headline, "text_pair": market_statement}
 
-        Returns
-        -------
-        dict[str, float]
-            Scores for each NLI label, e.g.:
-            {"entailment": 0.82, "neutral": 0.15, "contradiction": 0.03}
-        """
-        if not self._loaded or self._pipeline is None:
-            raise RuntimeError(
-                "ZeroShotValidator: modelo no cargado. Llama a await load() primero."
-            )
-
-        # For NLI models, we pass premise + hypothesis as a single string
-        # formatted for the model's tokenizer
-        result = self._pipeline(
-            premise,
-            candidate_labels=[hypothesis],
-            hypothesis_template="This text is about {}.",
-        )
-
-        # The pipeline returns label→score. But for NLI we need to use a
-        # different approach. Let's use the NLI pipeline directly.
-        # Actually, the zero-shot-classification pipeline with bart-large-mnli
-        # returns scores for how well each candidate label matches the sequence.
-        # For proper NLI, we should use the "text-classification" pipeline
-        # or call tokenizer + model directly.
-
-        # However, the user explicitly asked for pipeline("zero-shot-classification",
-        # model="facebook/bart-large-mnli"), so let's use that approach.
-        # We pass the news as the sequence and the market question as a label.
-        labels = result.get("labels", [])
-        scores = result.get("scores", [])
-
-        # Build a dict mapping label → score
-        score_dict: dict[str, float] = {}
-        for label, score in zip(labels, scores):
-            score_dict[label] = float(score)
-
-        return score_dict
-
-    def classify_nli(self, premise: str, hypothesis: str) -> dict[str, float]:
-        """Run proper NLI: premise entails/contradicts/neutral hypothesis.
-
-        This method uses the raw NLI capability of MNLI-trained models
-        by constructing the input as "premise [SEP] hypothesis" and
-        classifying into entailment/neutral/contradiction.
-
-        Requires a model fine-tuned on MNLI (bart-large-mnli qualifies).
-
-        Returns
-        -------
-        dict[str, float]
-            {"entailment": 0.82, "neutral": 0.15, "contradiction": 0.03}
-        """
-        if not self._loaded or self._pipeline is None:
-            raise RuntimeError("ZeroShotValidator: modelo no cargado.")
-
-        # Use the model directly (not the pipeline wrapper) for NLI
-        # The zero-shot-classification pipeline wraps the model differently.
-        # We need to access the underlying model and tokenizer.
-        model = self._pipeline.model
-        tokenizer = self._pipeline.tokenizer
-
-        import torch
-
-        # Format: [CLS] premise [SEP] hypothesis [SEP]
-        inputs = tokenizer(
-            premise,
-            hypothesis,
-            truncation=True,
-            max_length=512,
-            return_tensors="pt",
-        )
-
-        # Move to correct device if needed
-        if self.device >= 0:
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-
-        with torch.no_grad():
-            outputs = model(**inputs)
-
-        # Get logits for entailment/neutral/contradiction
-        logits = outputs.logits[0]  # shape: (3,)
-
-        # The label order is typically: contradiction, neutral, entailment
-        # for bart-large-mnli (id2label: {0: 'contradiction', 1: 'neutral', 2: 'entailment'})
-        probs = torch.softmax(logits, dim=-1)
-
-        # Map to label names using model's id2label
-        id2label = model.config.id2label
-        result: dict[str, float] = {}
-        for i in range(len(probs)):
-            label = id2label.get(i, f"label_{i}").lower()
-            result[label] = float(probs[i])
-
-        return result
-
-    def classify_relevance(self, text: str, premise: str) -> dict[str, float]:
-        """Zero-shot relevance pre-filter: is the text relevant to the premise?
-
-        Uses the zero-shot-classification pipeline with three explicit labels:
-          - "This text confirms the premise"
-          - "This text contradicts the premise"
-          - "This text is completely unrelated to the premise"
-
-        Unlike the NLI pipeline (which conflates irrelevance with low-confidence
-        contradiction), this forces the model to explicitly identify noise.
+        The model returns native entailment/neutral/contradiction scores,
+        eliminating the logit collapse that plagued the old zero-shot approach.
 
         Parameters
         ----------
         text : str
-            The news headline to evaluate.
+            The news headline (premise / ground truth context).
         premise : str
-            The market question / trading premise.
+            The market statement to validate against (hypothesis),
+            already transformed to an affirmative statement
+            (e.g., "Starmer out by June 30, 2026").
 
         Returns
         -------
         dict[str, float]
-            Scores for each of the three relevance labels.
-            Example:
-            {"This text confirms the premise": 0.05,
-             "This text contradicts the premise": 0.03,
-             "This text is completely unrelated to the premise": 0.92}
+            Native NLI scores:
+            {"entailment": 0.82, "neutral": 0.15, "contradiction": 0.03}
         """
         if not self._loaded or self._pipeline is None:
             raise RuntimeError(
                 "ZeroShotValidator: modelo no cargado. Llama a await load() primero."
             )
 
-        result = self._pipeline(
-            text,
-            candidate_labels=self.RELEVANCE_LABELS,
-        )
+        # NLI sentence-pair input: the standard MNLI format
+        result = self._pipeline({"text": text, "text_pair": premise})
 
-        labels = result.get("labels", [])
-        scores = result.get("scores", [])
-        return {label: float(score) for label, score in zip(labels, scores)}
+        # text-classification with return_all_scores=True returns:
+        #   [[{"label": "ENTAILMENT", "score": 0.82}, {"label": "NEUTRAL", ...}, ...]]
+        # Unwrap and normalize to lowercase
+        score_dict: dict[str, float] = {}
+        entries = result[0] if isinstance(result, list) and isinstance(result[0], list) else result
+        if isinstance(entries, list):
+            for entry in entries:
+                label = entry.get("label", "").lower()
+                score = float(entry.get("score", 0.0))
+                score_dict[label] = score
+        return score_dict
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Premise transformation helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _premise_to_statement(question: str) -> str:
+    """Transform a market question into an affirmative statement for NLI.
+
+    NLI models perform best with declarative statements as hypotheses,
+    not interrogative questions. This strips question marks and leading
+    question words.
+
+    Examples:
+        "Will Starmer be out by June 30, 2026?"
+        → "Starmer be out by June 30, 2026"
+
+        "Is Trump going to win?"
+        → "Trump going to win"
+
+        "BTC hits $200K in 2026"          (already a statement)
+        → "BTC hits $200K in 2026"
+    """
+    q = question.strip()
+    # Remove trailing question mark(s)
+    q = q.rstrip("?").strip()
+    # Strip leading question words
+    question_prefixes = [
+        "Will ", "will ", "Would ", "would ",
+        "Is ", "is ", "Are ", "are ",
+        "Does ", "does ", "Do ", "do ", "Did ", "did ",
+        "Can ", "can ", "Could ", "could ",
+        "Should ", "should ",
+        "Has ", "has ", "Have ", "have ",
+        "Was ", "was ", "Were ", "were ",
+    ]
+    for prefix in question_prefixes:
+        if q.startswith(prefix):
+            q = q[len(prefix):]
+            break
+    return q
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -774,22 +708,24 @@ class NLPOracle:
         side: str = "YES",
         token_id: str = "",
     ) -> tuple[bool, float, str]:
-        """Validate whether recent news supports a market direction (v5.2).
+        """Validate whether recent news supports a market direction (v5.3).
 
         Core method of the NLP Oracle. Takes a market question and the
         momentum direction (YES = price rising, NO = price falling) and
-        checks whether recent Telegram news headlines confirm or contradict
-        the market premise using a two-phase zero-shot relevance filter.
+        checks whether recent Telegram news headlines entail or contradict
+        the market premise using native NLI sentence-pair inference.
 
-        v5.2 Logic (Zero-Shot Relevance, not NLI):
-        - Phase 1: Is the news relevant? Uses 3 explicit labels:
-            "This text confirms the premise"
-            "This text contradicts the premise"
-            "This text is completely unrelated to the premise"
-        - Phase 2: If the top-scoring label is "unrelated" → REJECTED (NOISE).
-          If the top label matches the trade direction (confirms+YES or
-          contradicts+NO) AND score > threshold → APPROVED.
-          Otherwise → REJECTED.
+        v5.3 Logic (Native NLI, not zero-shot relevance):
+        - Transforms the market question into a declarative statement
+          (e.g., "Will Starmer be out?" → "Starmer be out").
+        - For each headline, runs NLI pair: {text: headline, text_pair: premise}
+        - Model returns native entailment/neutral/contradiction scores.
+        - Decision logic per headline:
+            * If neutral is the highest score → noise, skip this headline.
+            * If side==YES and entailment > threshold → candidate for APPROVED.
+            * If side==NO and contradiction > threshold → candidate for APPROVED.
+            * Otherwise → REJECTED for this headline.
+        - Best headline across all checked determines the final result.
 
         Parameters
         ----------
@@ -804,10 +740,9 @@ class NLPOracle:
         -------
         tuple[bool, float, str]
             (approved, confidence_score, top_headline_snippet)
-            - approved: True if a relevant headline matched the trade direction
-              with score >= threshold. False if all news was noise/irrelevant
-              or no headline crossed the threshold.
-            - confidence_score: Best relevance score found (0.0 if all noise).
+            - approved: True if at least one headline's NLI scores passed
+              the threshold and directional check.
+            - confidence_score: Best NLI score found (0.0 if all noise/rejected).
             - top_headline_snippet: The headline that produced the best score.
         """
         if not self._enabled:
@@ -818,11 +753,8 @@ class NLPOracle:
         # ── Pipeline entry timing ─────────────────────────────────
         _pipeline_t0 = time.time()
 
-        # ── v5.2: Two-phase relevance labels (no more NLI ambiguity) ──
-        # Phase 1: Is the text relevant? (confirms / contradicts / unrelated)
-        # Phase 2: Does the winning label + score cross the threshold?
-        # Unrelated news → REJECTED unconditionally (NOISE).
-        # Related news → check label-direction match + score > threshold.
+        # ── v5.3: Transform question to statement for NLI ──────────
+        premise_stmt = _premise_to_statement(market_question)
 
         # Get recent headlines
         headlines = await self.buffer.get_recent()
@@ -831,7 +763,7 @@ class NLPOracle:
                 token_id=token_id,
                 question=market_question,
                 side=side,
-                target_label="relevance_check",
+                target_label="nli",
                 buffer_count=0,
                 threshold=self._confidence_threshold,
             )
@@ -844,7 +776,7 @@ class NLPOracle:
                 approved=False,
                 best_score=0.0,
                 threshold=self._confidence_threshold,
-                target_label="relevance_check",
+                target_label="empty_buffer",
                 headlines_checked=0,
                 headlines_total=0,
                 elapsed_ms=(time.time() - _pipeline_t0) * 1000,
@@ -856,7 +788,7 @@ class NLPOracle:
             token_id=token_id,
             question=market_question,
             side=side,
-            target_label="relevance_check",
+            target_label="nli",
             buffer_count=len(headlines),
             threshold=self._confidence_threshold,
         )
@@ -872,7 +804,7 @@ class NLPOracle:
                 approved=False,
                 best_score=0.0,
                 threshold=self._confidence_threshold,
-                target_label="relevance_check",
+                target_label="model_error",
                 headlines_checked=0,
                 headlines_total=len(headlines),
                 elapsed_ms=(time.time() - _pipeline_t0) * 1000,
@@ -881,70 +813,69 @@ class NLPOracle:
 
         best_score = 0.0
         best_headline = ""
-        best_top_label = ""          # v5.2: track the winning label for logging
+        best_nli_scores: dict[str, float] = {}  # for console logging
         headlines_checked = 0
         total_headlines = len(headlines)
 
-        # ── v5.2: Shortcuts for label comparison ──────────────────
-        CONFIRMS = ZeroShotValidator.LABEL_CONFIRMS
-        CONTRADICTS = ZeroShotValidator.LABEL_CONTRADICTS
-        UNRELATED = ZeroShotValidator.LABEL_UNRELATED
-
         for idx, headline in enumerate(headlines):
             try:
-                # ── v5.2: Two-phase zero-shot relevance check ──────
+                # ── v5.3: Native NLI sentence-pair inference ───────
                 _nli_t0 = time.time()
-                relevance = validator.classify_relevance(
+                nli_scores = validator.classify_nli_pair(
                     text=headline.text,
-                    premise=market_question,
+                    premise=premise_stmt,
                 )
                 _nli_elapsed = (time.time() - _nli_t0) * 1000
 
-                # Find the winning label (highest score)
-                top_label = max(relevance, key=relevance.get)
-                top_score = relevance[top_label]
+                ent = nli_scores.get("entailment", 0.0)
+                neut = nli_scores.get("neutral", 0.0)
+                contra = nli_scores.get("contradiction", 0.0)
 
-                # ── v5.2: Decision logic (two-phase) ───────────────
-                # Phase 1: Is the news irrelevant?
-                if top_label == UNRELATED:
-                    # Noise → unconditional rejection.
-                    # Don't even consider this headline for scoring.
-                    is_relevant = False
-                    rejection_reason = "NOISE"
-                    effective_score = top_score
-                # Phase 2: Does the label match the trade direction?
-                elif top_label == CONFIRMS and side == "YES":
-                    is_relevant = True
-                    rejection_reason = ""
-                    effective_score = top_score
-                elif top_label == CONTRADICTS and side == "NO":
-                    is_relevant = True
-                    rejection_reason = ""
-                    effective_score = top_score
+                # Find which label has the highest score
+                top_label = max(nli_scores, key=nli_scores.get)
+                top_score = nli_scores[top_label]
+
+                # ── v5.3: Decision logic ──────────────────────────
+                # Rule 1: Neutral is highest → noise, unconditional rejection
+                if top_label == "neutral":
+                    is_candidate = False
+                    effective_score = 0.0
+                # Rule 2: YES trigger → check entailment
+                elif side == "YES":
+                    if ent > self._confidence_threshold:
+                        is_candidate = True
+                        effective_score = ent
+                    else:
+                        is_candidate = False
+                        effective_score = ent
+                # Rule 3: NO trigger → check contradiction
+                elif side == "NO":
+                    if contra > self._confidence_threshold:
+                        is_candidate = True
+                        effective_score = contra
+                    else:
+                        is_candidate = False
+                        effective_score = contra
                 else:
-                    # Label doesn't match direction (e.g., "contradicts" + YES,
-                    # "confirms" + NO). Rejected — the news contradicts our bet.
-                    is_relevant = False
-                    rejection_reason = "MISMATCH"
-                    effective_score = top_score
+                    is_candidate = False
+                    effective_score = 0.0
 
-                # ── Log individual classification (v5.2) ───────────
+                # ── Log individual classification ─────────────────
                 nlp_log.headline_classified(
                     idx=idx,
                     total=total_headlines,
                     premise_preview=headline.text,
-                    scores=relevance,
-                    target_label=top_label,  # v5.2: log actual winning label
+                    scores=nli_scores,
+                    target_label=top_label,
                 )
 
                 headlines_checked += 1
 
-                # Only track as "best" if the headline is relevant AND
-                # the effective score is the highest we've seen.
-                if is_relevant and effective_score > best_score:
+                # Track the best candidate across all headlines
+                if is_candidate and effective_score > best_score:
                     best_score = effective_score
                     best_headline = headline.text
-                    best_top_label = top_label
+                    best_nli_scores = nli_scores
 
             except Exception as e:
                 nlp_log.headline_classification_error(
@@ -959,12 +890,10 @@ class NLPOracle:
                 )
                 continue
 
-        # ── v5.2: Final approval — only if best headline was relevant ──
-        # (irrelevant headlines are never tracked as best, so best_score=0.0
-        #  when all news was noise).
+        # ── Final approval ────────────────────────────────────────
         approved = best_score >= self._confidence_threshold
 
-        # ── Dedicated logger: legacy premise_validated ─────────────────
+        # ── Dedicated logger: premise_validated ───────────────────
         nlp_log.premise_validated(
             token_id=token_id,
             question=market_question,
@@ -976,38 +905,39 @@ class NLPOracle:
             buffer_count=total_headlines,
         )
 
-        # ── Pipeline complete with timing ─────────────────────────────
+        # ── Pipeline complete with timing ─────────────────────────
         _pipeline_elapsed = (time.time() - _pipeline_t0) * 1000
         nlp_log.validation_complete(
             token_id=token_id,
             approved=approved,
             best_score=best_score,
             threshold=self._confidence_threshold,
-            target_label=best_top_label or "unrelated",
+            target_label=(
+                "entailment" if side == "YES"
+                else "contradiction" if side == "NO"
+                else "nli"
+            ),
             headlines_checked=headlines_checked,
             headlines_total=total_headlines,
             elapsed_ms=_pipeline_elapsed,
         )
 
-        # ── v5.2: Console logger with explicit Top_Label ───────────────
+        # ── v5.3: Console logger with native NLI scores ───────────
         token_snippet = token_id[:16] if token_id else "?"
         action = "APPROVED" if approved else "REJECTED"
         log_headline = best_headline[:80] if best_headline else "(sin noticias)"
-        top_label_short = (
-            "confirms" if best_top_label == CONFIRMS
-            else "contradicts" if best_top_label == CONTRADICTS
-            else "unrelated" if best_top_label == UNRELATED
-            else best_top_label or "unrelated"
-        )
+        best_ent = best_nli_scores.get("entailment", 0.0)
+        best_neut = best_nli_scores.get("neutral", 0.0)
+        best_contra = best_nli_scores.get("contradiction", 0.0)
 
         logger.info(
-            "[NLP_ORACLE] Token=%s | Top_Label=\"%s\" | Score=%.3f "
-            "(threshold=%.2f) | Action=%s | "
+            "[NLP_ORACLE] Token=%s | ent=%.3f neut=%.3f contra=%.3f | "
+            "Action=%s | "
             "Top News: \"%s\" | Buffer=%d | checked=%d | side=%s | ⏱=%.0fms",
             token_snippet,
-            top_label_short,
-            best_score,
-            self._confidence_threshold,
+            best_ent,
+            best_neut,
+            best_contra,
             action,
             log_headline,
             total_headlines,
@@ -1016,7 +946,7 @@ class NLPOracle:
             _pipeline_elapsed,
         )
 
-        # ── v5.2: Cooldown safety — noise rejections do NOT trigger
+        # ── Cooldown safety: noise rejections do NOT trigger
         # post-trade cooldowns. The orchestrator's `continue` on nlp_approved=False
         # leaves the token free for re-evaluation in the next cycle.
         # Cooldowns are only set by AdaptiveStrategyEngine.mark_trade_executed()

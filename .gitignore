@@ -8,4 +8,5 @@ data/polymarket.db-wal
 data/history/
 .env
 *.log
-.session
+*.session
+*.session-journal
