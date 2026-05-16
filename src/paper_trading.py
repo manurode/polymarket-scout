@@ -907,8 +907,18 @@ class PaperTradingEngine:
 
                     prev_mark = pos.mark
                     pos.mark = valid_bid
-                    pos.pnl = round((pos.mark - pos.entry) * pos.size, 2)
-                    pos.pnl_pct = round((pos.pnl / pos.size) * 100, 2) if pos.size > 0 else 0.0
+                    # ── v5.6 FIX: PnL correcto para opciones binarias ──
+                    # El cálculo (mark - entry) * size asume que 'size' son
+                    # unidades, pero 'size' son USD invertidos.
+                    # Fórmula correcta: size * (mark/entry - 1)
+                    # Ej: entry=0.50, mark=0.45, size=$150 → PnL = 150*(0.45/0.50-1) = -$15.00 (correcto)
+                    #    Antes: (0.45-0.50)*150 = -$7.50 (subestimaba pérdidas 2x)
+                    if pos.entry > 0:
+                        pos.pnl = round(pos.size * (pos.mark / pos.entry - 1.0), 2)
+                        pos.pnl_pct = round((pos.mark / pos.entry - 1.0) * 100, 2)
+                    else:
+                        pos.pnl = 0.0
+                        pos.pnl_pct = 0.0
                     stats["positions_updated"] += 1
 
                     logger.debug(
@@ -954,8 +964,15 @@ class PaperTradingEngine:
 
                     prev_mark = pos.mark
                     pos.mark = exit_value_no
-                    pos.pnl = round((pos.mark - pos.entry) * pos.size, 2)
-                    pos.pnl_pct = round((pos.pnl / pos.size) * 100, 2) if pos.size > 0 else 0.0
+                    # ── v5.6 FIX: PnL correcto para opciones binarias (NO side) ──
+                    # Misma fórmula: size * (mark/entry - 1) usando precios NO.
+                    # mark = exit_value_no (1 - vwap_ask), entry = precio NO original.
+                    if pos.entry > 0:
+                        pos.pnl = round(pos.size * (pos.mark / pos.entry - 1.0), 2)
+                        pos.pnl_pct = round((pos.mark / pos.entry - 1.0) * 100, 2)
+                    else:
+                        pos.pnl = 0.0
+                        pos.pnl_pct = 0.0
                     stats["positions_updated"] += 1
 
                     logger.debug(
@@ -1172,6 +1189,27 @@ class PaperTradingEngine:
                 logger.warning("PaperTrade: fondos insuficientes (%s < %s)", self.wallet.usdc_free, size)
                 return None
 
+            # ── v5.6 INVENTORY SPAM LOCK ──────────────────────────────
+            # Máximo 1 posición direccional por token_id.
+            # Evita que se abran múltiples posiciones sobre el mismo mercado
+            # en el mismo ciclo (ej. 7 posiciones en SpaceX).
+            if strategy != "market_making" and token_id:
+                existing_directional = [
+                    p for p in self._positions
+                    if p.token_id == token_id
+                    and p.closed_at is None
+                    and p.strategy != "market_making"
+                ]
+                if existing_directional:
+                    logger.warning(
+                        "🚫 INVENTORY SPAM LOCK | Token=%s Strategy=%s | "
+                        "Reason: %d directional positions already open on this token. "
+                        "Max 1 directional slot per market. Abortando.",
+                        token_id[:16], strategy,
+                        len(existing_directional),
+                    )
+                    return None
+
             self._position_counter += 1
             pos = VirtualPosition(
                 id=self._position_counter,
@@ -1261,17 +1299,15 @@ class PaperTradingEngine:
                 price = round(max(0.001, min(0.999, price)), 6)
 
             # ── Calcular P&L ──────────────────────────────────────────────
-            # YES: pnl = (precio_cierre - precio_entrada) * size
-            # NO:  pnl = (mark_NO_cierre - entry_NO) * size
-            #      donde entry_NO = 1 - ask_YES_apertura
-            #      y    mark_NO   = 1 - ask_YES_actual  (ya almacenado en pos.mark)
-            if pos.side == "YES":
-                pnl = (price - pos.entry) * pos.size
-            else:  # NO — ambos precios ya están expresados en términos NO
-                pnl = (price - pos.entry) * pos.size
+            # ── v5.6 FIX: PnL correcto para opciones binarias ──
+            # Fórmula: size * (price/entry - 1), no (price - entry) * size
+            if pos.entry > 0:
+                pnl = pos.size * (price / pos.entry - 1.0)
+            else:
+                pnl = 0.0
 
             pos.pnl = round(pnl, 2)
-            pos.pnl_pct = round((pnl / pos.size) * 100, 2) if pos.size > 0 else 0.0
+            pos.pnl_pct = round((price / pos.entry - 1.0) * 100, 2) if (pos.size > 0 and pos.entry > 0) else 0.0
             pos.closed_at = time.time()
             pos.close_reason = reason
             pos.mark = price
@@ -1443,16 +1479,14 @@ class PaperTradingEngine:
                         pos.mark = max(0.01, min(0.99, pos.mark * (1 - shock)))
 
                 # ── Recalcular P&L no realizado ───────────────────────────────
-                if pos.side == "YES":
-                    # Long YES: ganamos si el precio sube
-                    pos.pnl = round((pos.mark - pos.entry) * pos.size, 2)
+                # ── v5.6 FIX: PnL correcto para opciones binarias ──
+                # Fórmula: size * (mark/entry - 1), no (mark - entry) * size
+                if pos.entry > 0:
+                    pos.pnl = round(pos.size * (pos.mark / pos.entry - 1.0), 2)
                 else:
-                    # Long NO: compramos NO a entry_NO = (1 - ask_YES_en_apertura)
-                    # Ganamos si el mark_NO actual (1 - ask_YES_ahora) > entry_NO
-                    # pnl = (mark_NO - entry_NO) * size
-                    pos.pnl = round((pos.mark - pos.entry) * pos.size, 2)
+                    pos.pnl = 0.0
 
-                pos.pnl_pct = round((pos.pnl / pos.size) * 100, 2) if pos.size > 0 else 0.0
+                pos.pnl_pct = round((pos.mark / pos.entry - 1.0) * 100, 2) if (pos.size > 0 and pos.entry > 0) else 0.0
 
                 logger.debug(
                     "MTM P&L #%d [%s] side=%s mark=%.4f entry=%.4f "
