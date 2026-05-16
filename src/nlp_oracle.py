@@ -197,7 +197,12 @@ class TelegramNewsStreamer:
         self._resolved_channels: int = 0
 
     async def start(self) -> None:
-        """Connect to Telegram and start listening for messages."""
+        """Connect to Telegram and start listening for messages.
+
+        v5.6: Includes auto-reconnect loop with exponential backoff.
+        If the connection drops (network issue, Telegram restart, FloodWait),
+        the streamer will reconnect automatically without manual intervention.
+        """
         try:
             from telethon import TelegramClient, events
         except ImportError:
@@ -214,101 +219,159 @@ class TelegramNewsStreamer:
             ", ".join(self.channels),
         )
 
-        self._client = TelegramClient(self.session_name, self.api_id, self.api_hash)
+        # ── v5.6: Auto-reconnect loop ───────────────────────────────
+        reconnect_attempt = 0
+        max_reconnect_delay = 120  # máximo 2 minutos entre intentos
 
-        @self._client.on(events.NewMessage(chats=self.channels))
-        async def handler(event: events.NewMessage.Event) -> None:
-            """Push new messages into the shared NewsBuffer."""
-            if not self._running:
-                return
-            text = event.message.text or ""
-            
-            # ── Extract metadata for raw logging ──────────────────────
-            msg_id = getattr(event.message, "id", 0)
-            has_media = bool(getattr(event.message, "media", None))
-            msg_ts = str(getattr(event.message, "date", ""))
-            channel_name = getattr(
-                getattr(event, "chat", None), "username", ""
-            ) or getattr(getattr(event, "chat", None), "title", "")
+        while self._running:
+            try:
+                # Re-create client on each reconnect (avoids stale state)
+                self._client = TelegramClient(
+                    self.session_name, self.api_id, self.api_hash
+                )
 
-            # ── RAW LOG: every message, before filtering ──────────────
-            nlp_log.streamer_message_raw(
-                channel=str(channel_name),
-                msg_id=msg_id,
-                text=text,
-                has_media=has_media,
-                msg_timestamp=msg_ts,
-            )
+                @self._client.on(events.NewMessage(chats=self.channels))
+                async def handler(event: events.NewMessage.Event) -> None:
+                    """Push new messages into the shared NewsBuffer."""
+                    try:
+                        if not self._running:
+                            return
+                        text = event.message.text or ""
 
-            if not text.strip():
-                nlp_log.streamer_message_filtered("empty_text", msg_id, str(channel_name))
-                return
+                        # ── Extract metadata for raw logging ──
+                        msg_id = getattr(event.message, "id", 0)
+                        has_media = bool(getattr(event.message, "media", None))
+                        msg_ts = str(getattr(event.message, "date", ""))
+                        channel_name = getattr(
+                            getattr(event, "chat", None), "username", ""
+                        ) or getattr(getattr(event, "chat", None), "title", "")
 
-            # Skip very short messages (likely just emojis/reactions)
-            if len(text.strip()) < 15:
-                nlp_log.headline_dropped("too_short", text)
-                nlp_log.streamer_message_filtered("too_short", msg_id, str(channel_name), text)
-                return
+                        # ── RAW LOG: every message, before filtering ──
+                        nlp_log.streamer_message_raw(
+                            channel=str(channel_name),
+                            msg_id=msg_id,
+                            text=text,
+                            has_media=has_media,
+                            msg_timestamp=msg_ts,
+                        )
 
-            headline = NewsHeadline(
-                text=text.strip(),
-                source=str(channel_name),
-            )
-            await self.buffer.add(headline)
-            self._msg_count += 1
+                        if not text.strip():
+                            nlp_log.streamer_message_filtered("empty_text", msg_id, str(channel_name))
+                            return
 
-            nlp_log.headline_ingested(str(channel_name), text.strip())
-            logger.info(
-                "[NLP_RECEIVE] Ingestado: \"%s...\" de Canal=%s",
-                text.strip().replace("\n", " ")[:50],
-                channel_name or "???",
-            )
+                        # Skip very short messages
+                        if len(text.strip()) < 15:
+                            nlp_log.headline_dropped("too_short", text)
+                            nlp_log.streamer_message_filtered("too_short", msg_id, str(channel_name), text)
+                            return
 
-        try:
-            await self._client.start()
-            logger.info(
-                "TelegramNewsStreamer: conectado y escuchando %d canales",
-                len(self.channels),
-            )
+                        headline = NewsHeadline(
+                            text=text.strip(),
+                            source=str(channel_name),
+                        )
+                        await self.buffer.add(headline)
+                        self._msg_count += 1
 
-            # ── Resolve channels and report status ──────────────────────
-            resolved = 0
-            for ch in self.channels:
-                try:
-                    entity = await self._client.get_entity(ch)
-                    etype = getattr(entity, "__class__", type(entity)).__name__
-                    nlp_log.streamer_channel_resolved(ch, True, etype)
-                    logger.info(
-                        "TelegramNewsStreamer: canal '%s' resuelto → %s",
-                        ch, etype,
-                    )
-                    resolved += 1
-                except Exception as e:
-                    nlp_log.streamer_channel_resolved(ch, False)
-                    logger.warning(
-                        "TelegramNewsStreamer: canal '%s' NO resuelto: %s",
-                        ch, e,
-                    )
+                        nlp_log.headline_ingested(str(channel_name), text.strip())
+                        logger.info(
+                            "[NLP_RECEIVE] Ingestado: \"%s...\" de Canal=%s",
+                            text.strip().replace("\n", " ")[:50],
+                            channel_name or "???",
+                        )
+                    except Exception as handler_err:
+                        logger.error(
+                            "TelegramNewsStreamer: error en handler: %s", handler_err
+                        )
 
-            self._resolved_channels = resolved
-            nlp_log.streamer_connected(self.channels, resolved)
+                await self._client.start()
+                logger.info(
+                    "TelegramNewsStreamer: conectado y escuchando %d canales",
+                    len(self.channels),
+                )
 
-            # ── v5.1 DIAGNOSTIC: verificar si realmente podemos recibir msgs ──
-            await self._diagnose_channel_access()
+                # ── Resolve channels and report status ──
+                resolved = 0
+                for ch in self.channels:
+                    try:
+                        entity = await self._client.get_entity(ch)
+                        etype = getattr(entity, "__class__", type(entity)).__name__
+                        nlp_log.streamer_channel_resolved(ch, True, etype)
+                        logger.info(
+                            "TelegramNewsStreamer: canal '%s' resuelto → %s",
+                            ch, etype,
+                        )
+                        resolved += 1
+                    except Exception as e:
+                        nlp_log.streamer_channel_resolved(ch, False)
+                        logger.warning(
+                            "TelegramNewsStreamer: canal '%s' NO resuelto: %s",
+                            ch, e,
+                        )
 
-            # Run until stopped
-            await self._client.run_until_disconnected()
-        except Exception as e:
-            error_msg = str(e)
-            logger.error("TelegramNewsStreamer: error de conexión: %s", error_msg)
-            nlp_log.streamer_error(error_msg)
+                self._resolved_channels = resolved
+                nlp_log.streamer_connected(self.channels, resolved)
 
-            # Detect auth-specific errors
-            if "API_ID" in error_msg.upper() or "AUTH" in error_msg.upper():
-                nlp_log.streamer_auth_needed()
-        finally:
-            nlp_log.streamer_disconnected()
-            logger.info("TelegramNewsStreamer: desconectado")
+                # ── v5.1 DIAGNOSTIC ──
+                await self._diagnose_channel_access()
+
+                # Reset reconnect counter on successful connection
+                reconnect_attempt = 0
+
+                # Run until stopped or disconnected
+                await self._client.run_until_disconnected()
+
+            except asyncio.CancelledError:
+                self._running = False
+                break
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(
+                    "TelegramNewsStreamer: error de conexión (intento %d): %s",
+                    reconnect_attempt + 1, error_msg,
+                )
+                nlp_log.streamer_error(
+                    f"Reconnect attempt #{reconnect_attempt + 1}: {error_msg}"
+                )
+
+                # Detect auth-specific errors
+                if "API_ID" in error_msg.upper() or "AUTH" in error_msg.upper():
+                    nlp_log.streamer_auth_needed()
+
+                # Detect FloodWait (Telegram rate limit) — honor the wait
+                if "FLOOD_WAIT" in error_msg.upper() or "flood" in error_msg.lower():
+                    import re
+                    wait_match = re.search(r'(\d+)', error_msg)
+                    if wait_match:
+                        wait_seconds = int(wait_match.group(1))
+                        logger.warning(
+                            "TelegramNewsStreamer: FloodWait %ds — esperando...",
+                            wait_seconds,
+                        )
+                        await asyncio.sleep(min(wait_seconds, 300))
+
+            finally:
+                # Clean up the old client
+                if self._client is not None:
+                    try:
+                        await self._client.disconnect()
+                    except Exception:
+                        pass
+
+                nlp_log.streamer_disconnected()
+                logger.info("TelegramNewsStreamer: desconectado")
+
+            # ── Reconnect with exponential backoff (if still running) ──
+            if self._running:
+                reconnect_attempt += 1
+                delay = min(
+                    max_reconnect_delay,
+                    2.0 * (2 ** min(reconnect_attempt - 1, 5)),
+                )
+                logger.info(
+                    "TelegramNewsStreamer: reconectando en %.0fs (intento %d)...",
+                    delay, reconnect_attempt,
+                )
+                await asyncio.sleep(delay)
 
     async def stop(self) -> None:
         """Disconnect the Telegram client."""
@@ -746,12 +809,44 @@ class NLPOracle:
             - top_headline_snippet: The headline that produced the best score.
         """
         if not self._enabled:
-            # NLP oracle disabled → pass-through (always approve)
+            # 🚫 FAIL-CLOSED (v5.6): NLP oracle disabled → REJECT ALL momentum signals.
+            # Ningún trade direccional puede pasar sin confirmación explícita del NLP.
+            # Si el oráculo está apagado (por crash, mala configuración, o intencionalmente),
+            # se rechaza todo — no se permite operar a ciegas.
             nlp_log.oracle_disabled(token_id, market_question)
-            return (True, 1.0, "")
+            nlp_log.premise_skipped_no_buffer(token_id, market_question)
+            logger.warning(
+                "[NLP_ORACLE] Token=%s | Action=REJECTED (FAIL-CLOSED) | "
+                "Reason=NLP Oracle disabled — momentum_follow signals blocked",
+                token_id[:16] if token_id else "?",
+            )
+            return (False, 0.0, "")
 
         # ── Pipeline entry timing ─────────────────────────────────
         _pipeline_t0 = time.time()
+
+        # ── v5.6 FAIL-CLOSED: Streamer health gate ─────────────────
+        # Si el oráculo está enabled pero el streamer NO está conectado
+        # ni recibiendo mensajes, rechazar todas las señales.
+        # Esto evita operar con datos stale cuando Telethon se cae.
+        streamer_alive = (
+            self._streamer is not None
+            and self._streamer._running
+            and self._streamer._client is not None
+            and getattr(self._streamer._client, 'is_connected', lambda: False)()
+        )
+        if not streamer_alive:
+            nlp_log.premise_skipped_no_buffer(token_id, market_question)
+            logger.warning(
+                "[NLP_ORACLE] Token=%s | Action=REJECTED (FAIL-CLOSED) | "
+                "Reason=Telegram streamer NOT connected — "
+                "running=%s client=%s connected=%s",
+                token_id[:16] if token_id else "?",
+                self._streamer._running if self._streamer else False,
+                self._streamer._client is not None if self._streamer else False,
+                getattr(self._streamer._client, 'is_connected', lambda: False)() if self._streamer and self._streamer._client else False,
+            )
+            return (False, 0.0, "")
 
         # ── v5.3: Transform question to statement for NLI ──────────
         premise_stmt = _premise_to_statement(market_question)
