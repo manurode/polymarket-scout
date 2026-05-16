@@ -40,7 +40,7 @@ RECONNECT_DELAY_BASE = 1.0   # delay inicial para exponential backoff
 RECONNECT_DELAY_MAX = 30.0   # delay máximo de reconexión
 GAP_TIMEOUT = 300            # segundos sin delta por mercado → forzar RECONCILING (5 min)
 RECONCILE_COOLDOWN = 60     # segundos entre intentos de reconciliación automática
-WATCHDOG_TIMEOUT = 60       # segundos sin NINGÚN delta global → forzar reconexión WS
+WATCHDOG_TIMEOUT = 5        # segundos sin NINGÚN delta global → forzar reconexión WS + CANCEL_ALL_QUOTES (v5.6: 5s, era 60s)
 
 # Capacidad del buffer circular de deltas durante reconciliación
 DELTA_BUFFER_CAPACITY = 1000
@@ -129,6 +129,7 @@ class WebSocketManager:
         self.on_trade: Callable | None = None
         self.on_price: Callable | None = None
         self.on_state_change: Callable | None = None  # (token_id, old_state, new_state)
+        self.on_data_gap: Callable | None = None  # v5.6: callback cuando WS pierde datos > WATCHDOG_TIMEOUT
 
         # Market channel is PUBLIC — no auth needed for orderbook data
         # User channel (trading) uses API keys loaded from .env
@@ -474,16 +475,26 @@ class WebSocketManager:
 
             now = time.monotonic()
 
-            # ── WATCHDOG: 60s sin NINGÚN delta global → reconexión forzada ──
+            # ── WATCHDOG: 5s sin NINGÚN delta global → CANCEL_ALL_QUOTES + reconexión ──
             if self._connected and self._books:
                 if self._last_any_delta_time > 0:
                     global_age = now - self._last_any_delta_time
                     if global_age > WATCHDOG_TIMEOUT:
                         logger.warning(
-                            "⏱️ WATCHDOG: %.0fs sin deltas globales (>%ds) — "
-                            "forzando reconexión del WebSocket...",
+                            "⏱️ WATCHDOG: %.1fs sin deltas globales (>%ds) — "
+                            "ejecutando CANCEL_ALL_QUOTES + reconexión forzada...",
                             global_age, WATCHDOG_TIMEOUT,
                         )
+                        # ── v5.6: CANCEL ALL MM QUOTES on data gap ──
+                        # Si el WS pierde datos, el MM está expuesto con
+                        # precios stale. Cancelar todas las quotes activas
+                        # inmediatamente para evitar operar a ciegas.
+                        if self.on_data_gap:
+                            try:
+                                self.on_data_gap(global_age)
+                            except Exception as e:
+                                logger.error("Error en on_data_gap callback: %s", e)
+
                         self._connected = False
                         if self._ws and not self._ws.closed:
                             try:

@@ -239,6 +239,7 @@ class ScoutOrchestrator:
         # Wire WS callbacks → BookAnalyzer & TradeAggregator
         self.ws_manager.on_book_delta = self._on_ws_book
         self.ws_manager.on_price = self._on_ws_price
+        self.ws_manager.on_data_gap = self._on_ws_data_gap  # v5.6: CANCEL_ALL_QUOTES on data gap
 
         # ── 7. Registrar health checks ────────────────────────
         self.degradation.register_health_check(
@@ -1853,6 +1854,41 @@ class ScoutOrchestrator:
             history.prices = list(micro_prices)[-history.max_history:]
             synced += 1
         return synced
+
+    def _on_ws_data_gap(self, gap_seconds: float) -> None:
+        """v5.6: Callback cuando el WebSocket pierde datos > WATCHDOG_TIMEOUT.
+
+        Cancela TODAS las quotes activas del Market Maker inmediatamente
+        para no quedarse expuesto con precios stale (caducados).
+        """
+        logger.critical(
+            "🚨 WS DATA GAP: %.1fs sin datos CLOB — "
+            "ejecutando CANCEL_ALL_QUOTES para proteger al MM de datos stale",
+            gap_seconds,
+        )
+        trading_log.log_event(
+            event_type="ws_data_gap",
+            gap_seconds=gap_seconds,
+            action="cancel_all_quotes",
+        )
+        # ── Cancelar todas las quotes pendientes ──
+        cancelled_count = 0
+        if self.paper_trading and hasattr(self.paper_trading, '_pending_quotes'):
+            cancelled_count = len(self.paper_trading._pending_quotes)
+            self.paper_trading._pending_quotes.clear()
+            logger.warning(
+                "WS DATA GAP: %d quotes activas CANCELADAS preventivamente",
+                cancelled_count,
+            )
+        # ── También cancelar TP limit orders (dependen de datos L2) ──
+        if self.paper_trading and hasattr(self.paper_trading, '_tp_limit_orders'):
+            tp_cancelled = len(self.paper_trading._tp_limit_orders)
+            self.paper_trading._tp_limit_orders.clear()
+            if tp_cancelled > 0:
+                logger.warning(
+                    "WS DATA GAP: %d TP limit orders CANCELADAS preventivamente",
+                    tp_cancelled,
+                )
 
     def _on_ws_book(self, asset_id: str, data: dict) -> None:
         """Callback: WS book event -> BookAnalyzer + Cross Engine fill simulation.
