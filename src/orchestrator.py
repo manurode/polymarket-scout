@@ -1866,10 +1866,9 @@ class ScoutOrchestrator:
             "ejecutando CANCEL_ALL_QUOTES para proteger al MM de datos stale",
             gap_seconds,
         )
-        trading_log.log_event(
-            event_type="ws_data_gap",
-            gap_seconds=gap_seconds,
-            action="cancel_all_quotes",
+        trading_log.error(
+            "ws_data_gap",
+            f"gap={gap_seconds:.1f}s action=cancel_all_quotes",
         )
         # ── Cancelar todas las quotes pendientes ──
         cancelled_count = 0

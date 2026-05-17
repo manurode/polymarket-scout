@@ -3,13 +3,13 @@
     "market_making": {
       "name": "market_making",
       "wins": 224,
-      "losses": 154,
-      "total_pnl": 6966.740520784271,
+      "losses": 155,
+      "total_pnl": 6944.836441770221,
       "avg_win": 41.33253134513908,
-      "avg_loss": 14.881470782642102,
-      "win_rate": 0.5925925925925926,
-      "confidence": 0.7123035019067742,
-      "last_updated": 1778760784.256271
+      "avg_loss": 14.926777932522151,
+      "win_rate": 0.5910290237467019,
+      "confidence": 0.71237434264257,
+      "last_updated": 1779007685.7524664
     },
     "momentum_follow": {
       "name": "momentum_follow",
@@ -96,10 +96,10 @@
     },
     "momentum_follow": {
       "strategy": "momentum_follow",
-      "momentum_threshold": 0.004287177620000002,
+      "momentum_threshold": 0.002,
       "mean_rev_deviation": 0.05,
       "volume_spike_ratio": 2.5,
-      "min_confidence": 0.10717944050000006,
+      "min_confidence": 0.05,
       "enabled": false
     }
   }
